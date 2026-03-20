@@ -12,7 +12,7 @@ namespace Elsevier.DownloadArticleMetadata
     {
         private static int _retryCount = 5;
 
-        private static readonly string propertiesFile = "../../../../../config";
+        private static readonly string propertiesFile = "../.env";
 
         private static IDatabase db;
 

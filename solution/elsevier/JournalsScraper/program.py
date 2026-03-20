@@ -23,7 +23,7 @@ def read_config(path) -> configparser.SectionProxy:
     return config['SECTION']
 
 
-config = read_config('solution/config')
+config = read_config('../.env')
 db = Postgress(
     server=config['POSTGRES_SERVER'], 
     database=config['POSTGRES_DB'],

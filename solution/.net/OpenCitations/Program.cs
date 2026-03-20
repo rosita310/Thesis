@@ -20,7 +20,7 @@ namespace dblp.loader
     class Program
     {
         private static string schema = "opencitations_dump";
-        private static string propertiesFile = "solution/config";
+        private static string propertiesFile = "../.env";
 
 
         [Obsolete]

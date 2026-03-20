@@ -1,9 +1,9 @@
 # Solution
 
-## Configfile
+## .env file
 
-In deze directory moet een file met de naam 'config' staan.  
-De opzet van de file kun je vinden in 'config-example'.  
+In deze directory moet een file met de naam '.env' staan.  
+De opzet van de file kun je vinden in 'env-example'.  
 Vervang de waardes (inclusief de '<' en '>').
 
 ## Folder structure:
@@ -15,7 +15,7 @@ Vervang de waardes (inclusief de '<' en '>').
 <b>  ├ Database:</b> Separate library to handle database interaction.
 <b>  ├ DblpLoader:</b> Software to load the DBLP XML file.
 <b>  ├ Elsevier.ParseOutput:</b> Software to parse scraped JSON files from Elsevier.
-<b>  └ Helper:</b> Library to read the properties from the config file.
+<b>  └ Helper:</b> Library to read the properties from the .env file.
 <b>├ acm:</b> Python scipts to download and parse the editorial boards from ACM.
 <b>├ analysis:</b> Please skip :) (Tried what was possible with R).
 <b>├ core_scraper:</b> Software to scrape data from CORE.

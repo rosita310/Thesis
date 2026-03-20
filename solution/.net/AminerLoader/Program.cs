@@ -13,7 +13,7 @@ namespace Aminer
     { 
 
         private static string schemaName = "aminer";
-        private static string propertiesFile = "solution/config";
+        private static string propertiesFile = "../.env";
 
         static void Main(string[] args)
         {
