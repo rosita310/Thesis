@@ -13,7 +13,7 @@ namespace Elsevier.ParseOutput
     class Program
     {
         private static string schema = "elsevier";
-        private static string propertiesFile = "solution/config";
+        private static string propertiesFile = "../.env";
 
         static async Task Main(string[] args)
         {

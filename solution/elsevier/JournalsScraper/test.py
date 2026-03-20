@@ -6,7 +6,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
 
 
-config = program.read_config('solution/config')
+config = program.read_config('../.env')
 db = database.Postgress(
     server=config['POSTGRES_SERVER'], 
     database=config['POSTGRES_DB'],

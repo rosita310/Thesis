@@ -13,7 +13,7 @@ def read_config(path) -> configparser.SectionProxy:
     config.read_string(config_string)
     return config['SECTION']
 
-config = read_config('./solution/config')
+config = read_config('../.env')
 
 # Directory with HTML pages
 output_dir = os.path.join(config["RAW_DATA"], config["ACM_EDITORIAL_BOARD_HTML_SUBDIR"])

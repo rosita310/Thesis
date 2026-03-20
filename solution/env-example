@@ -1,3 +1,9 @@
+# This file should be copied and renamed to .env
+# The variables should be replaced accordingly (including '<' and '>')
+# Save the file within the same directory as this example
+
+# File with environment variables
+
 #
 # Database properties
 #

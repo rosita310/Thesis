@@ -17,7 +17,7 @@ namespace dblp.loader
     class Program
     {
         private static string schema = "dblp_dump";
-        private static string propertiesFile = "solution/config";
+        private static string propertiesFile = "../.env";
 
 
         [Obsolete]
