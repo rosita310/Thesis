@@ -9,3 +9,4 @@ geckodriver.log
 .ionide
 .fake
 solution/.env
+venv
