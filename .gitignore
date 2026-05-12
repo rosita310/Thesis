@@ -11,3 +11,4 @@ geckodriver.log
 solution/.env
 venv
 logs
+/solution/SelfReview/Springer/data
