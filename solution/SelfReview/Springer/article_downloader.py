@@ -286,8 +286,8 @@ def extract_article_data(html: bytes) -> dict:
     data['affiliations'] = affiliations
 
     # --- Open access ---
-    # Present as <span class="u-color-open-access"> on open access articles
-    data['open_access'] = bool(soup.select_one('span.u-color-open-access'))
+    # Present as <a data-test="open-access"> on open access articles.
+    data['open_access'] = bool(soup.select_one('[data-test="open-access"]'))
 
     # --- Article type, volume, pages (from <meta> tags in <head>) ---
     def meta(name: str) -> str | None:
