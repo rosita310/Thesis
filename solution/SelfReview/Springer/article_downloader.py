@@ -11,6 +11,7 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from database import Postgress
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -194,25 +195,21 @@ def parse_year(date_str: str) -> int | None:
     return None
 
 
-def extract_dates(html: bytes) -> dict:
+def extract_article_data(html: bytes) -> dict:
     """
-    Extract dates from an article page.
+    Extract all metadata from an article page.
 
-    Dates are in:
-      <li class="c-bibliographic-information__list-item">
-        Received
-        15 October 2025
-      </li>
+    Dates come from <li class="c-bibliographic-information__list-item"> elements.
+    All other fields come from <meta> tags or specific HTML elements.
 
-    Known labels: Received, Accepted, Published, Version of record, Issue date, DOI.
-
+    Date labels: Received, Accepted, Published, Version of record, Issue date, DOI.
     If Received/Accepted/Published are missing, the first available date is stored
-    as fallback so we can still identify which articles lack submission data.
+    as fallback so missing data is easily identified in the database.
     """
     soup = BeautifulSoup(html, 'html.parser')
-    items = soup.select('li.c-bibliographic-information__list-item')
 
-    dates = {
+    # --- Dates ---
+    data = {
         'received': None,
         'accepted': None,
         'published': None,
@@ -222,7 +219,7 @@ def extract_dates(html: bytes) -> dict:
 
     known_labels = {'received', 'accepted', 'published', 'version of record', 'doi'}
 
-    for item in items:
+    for item in soup.select('li.c-bibliographic-information__list-item'):
         p = item.find('p')
         if not p:
             continue
@@ -234,6 +231,8 @@ def extract_dates(html: bytes) -> dict:
         if not label_raw:
             continue
         label = label_raw.strip().lower()
+        if not label:
+            continue
 
         # Use the machine-readable datetime attribute (e.g. "2026-03-24") from the
         # <time> element rather than the human-readable text ("24 March 2026").
@@ -245,17 +244,66 @@ def extract_dates(html: bytes) -> dict:
             continue
 
         if label == 'received':
-            dates['received'] = value
+            data['received'] = value
         elif label == 'accepted':
-            dates['accepted'] = value
+            data['accepted'] = value
         elif label == 'published':
-            dates['published'] = value
-        elif label not in known_labels and dates['fallback_date_label'] is None:
-            # Store the first unknown date field as fallback (e.g. "Issue date")
-            dates['fallback_date_label'] = label_raw.strip()
-            dates['fallback_date_value'] = value
+            data['published'] = value
+        elif label not in known_labels and data['fallback_date_label'] is None:
+            data['fallback_date_label'] = label_raw.strip()
+            data['fallback_date_value'] = value
 
-    return dates
+    # --- Authors ---
+    # <a data-test="author-name">Name</a>
+    # dict.fromkeys() removes duplicates while preserving order
+    data['authors'] = list(dict.fromkeys(
+        el.get_text(strip=True)
+        for el in soup.select('a[data-test="author-name"]')
+    ))
+
+    # --- Affiliations with linked authors ---
+    # Structure in HTML:
+    #   <ol class="c-article-author-affiliation__list">
+    #     <li>
+    #       <p class="c-article-author-affiliation__address">Institution, Country</p>
+    #       <p class="c-article-author-affiliation__authors-list">Name1, Name2 & Name3</p>
+    #     </li>
+    #   </ol>
+    affiliations = []
+    for li in soup.select('ol.c-article-author-affiliation__list > li'):
+        institution_el = li.find('p', class_='c-article-author-affiliation__address')
+        authors_el = li.find('p', class_='c-article-author-affiliation__authors-list')
+        if not institution_el:
+            continue
+        institution = institution_el.get_text(strip=True)
+        # Parse "Name1, Name2 & Name3" → ["Name1", "Name2", "Name3"]
+        if authors_el:
+            raw = authors_el.get_text(strip=True).replace(' & ', ', ')
+            authors_at_aff = [a.strip() for a in raw.split(',') if a.strip()]
+        else:
+            authors_at_aff = []
+        affiliations.append({'institution': institution, 'authors': authors_at_aff})
+    data['affiliations'] = affiliations
+
+    # --- Open access ---
+    # Present as <span class="u-color-open-access"> on open access articles
+    data['open_access'] = bool(soup.select_one('span.u-color-open-access'))
+
+    # --- Article type, volume, pages (from <meta> tags in <head>) ---
+    def meta(name: str) -> str | None:
+        el = soup.find('meta', attrs={'name': name})
+        return el['content'].strip() if el and el.get('content') else None
+
+    data['article_type'] = meta('citation_article_type')
+    data['volume'] = meta('citation_volume')
+    data['first_page'] = meta('citation_firstpage')
+    data['last_page'] = meta('citation_lastpage')
+    data['issn'] = meta('citation_issn')
+
+    # --- Date of retrieval ---
+    data['retrieved_at'] = datetime.now().isoformat()
+
+    return data
 
 
 def save_json(data: dict, journal_id: str, doi: str) -> None:
@@ -335,15 +383,15 @@ def process_journal(session: requests.Session, journal_id: str, name: str) -> No
             if not content:
                 continue
 
-            dates = extract_dates(content)
-            if dates['received']:
+            article_data = extract_article_data(content)
+            if article_data['received']:
                 received_count += 1
 
             data = {
                 'doi': doi,
                 'title': stub['title'],
                 'journal_id': journal_id,
-                **dates
+                **article_data
             }
             save_json(data, journal_id, doi)
             total += 1
@@ -388,7 +436,7 @@ def main():
                 logging.error(f"BLOCKED by Springer: {e}")
                 logging.error("Stopping the run to avoid saving corrupt data. Resume later.")
                 break
-            break # for testing, only first journal is scraped
+            break # Remove this break to process all journals in a real run. It's here to limit scope during testing.
     except KeyboardInterrupt:
         logging.info("Interrupted by user (Ctrl+C). Progress is saved — safe to resume.")
 
