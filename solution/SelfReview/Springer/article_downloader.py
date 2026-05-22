@@ -63,8 +63,7 @@ def fetch_with_retry(session: requests.Session, url: str) -> bytes | None:
     Fetch a URL with retries and exponential backoff on failure.
 
     Handles 429 (rate limited) with a long wait before retrying.
-    Raises BlockedException if Springer appears to have blocked us,
-    so the caller can stop the run rather than silently saving bad data.
+    Handles 403 and block/CAPTCHA pages by raising BlockedException immediately.
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -74,6 +73,9 @@ def fetch_with_retry(session: requests.Session, url: str) -> bytes | None:
                 logging.warning(f"Rate limited (429). Waiting {RATE_LIMIT_WAIT}s before retry.")
                 time.sleep(RATE_LIMIT_WAIT)
                 continue
+
+            if response.status_code == 403:
+                raise BlockedException(f"Springer returned 403 Forbidden for {url}")
 
             response.raise_for_status()
 
@@ -129,7 +131,12 @@ def is_blocked(content: bytes) -> bool:
 
 
 class BlockedException(Exception):
-    """Raised when Springer detects automated access."""
+    """
+    Raised when Springer serves a block or CAPTCHA page instead of the
+    requested article. This typically happens when our scraping traffic
+    has been flagged, so the response is HTTP 200 but the body does not
+    contain the expected article content (see is_blocked).
+    """
     pass
 
 
