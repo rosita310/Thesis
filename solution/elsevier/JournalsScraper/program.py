@@ -175,19 +175,25 @@ def get_journals(content) -> List[Dict]:
             if not anchor: continue
             
             href = anchor.get('href', '')
-            display_name = anchor.get_text(strip=True)
+            
+            # --- STRUCTURAL TITLE EXTRACTION ---
+            # Try to grab the first span inside the link
+            first_span = anchor.find('span')
+            
+            if first_span:
+                display_name = first_span.get_text(strip=True)
+            else:
+                # Fallback: if there are no spans, grab just the first direct text element
+                # instead of pulling text from all children combined.
+                display_name = next(anchor.stripped_strings, '').strip()
 
             # --- ISSN EXTRACTION LOGIC ---
             issn = "Needs Manual Visit" 
             
-            # Pattern for ScienceDirect ISSNs (8 digits at the end)
-            # Example: .../journal/23760605
             sd_match = re.search(r'journal/(\d{8})', href)
-            
             if sd_match:
                 issn = format_issn(sd_match.group(1))
             else:
-                # We have to visit the site at a later point to find the ISSN
                 logging.info(f"External site detected for {display_name}: {href}")
 
             result.append({
