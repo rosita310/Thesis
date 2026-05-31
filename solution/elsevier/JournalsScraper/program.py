@@ -113,7 +113,7 @@ def renew_tor_ip():
 
 def get_page(page_number: int):
     logging.info(f'Getting page {page_number} via Selenium Headless')
-    url = f"https://www.elsevier.com/products/journals?query=&page={page_number}&subjectArea=physical-sciences-and-engineering%2Fcomputer-science&sortBy=relevance"
+    url = f"https://www.elsevier.com/products/journals?query=&page={page_number}&accessType=open-access&subjectArea=physical-sciences-and-engineering%2Fcomputer-science&sortBy=relevance"
     session = requests.session()
 
     # Setup Chrome Options for Headless Mode

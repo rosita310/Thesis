@@ -10,8 +10,12 @@ namespace Elsevier.DownloadArticleMetadata
 {
     class JournalScraper : IDisposable
     {
+        int pagesToScrape = 1; // For now, we will only scrape the first page of results for each journal. We can increase this later if we want more articles.
+
         private IWebDriver _driver;
         private string _outputDirectory;
+
+        private Random _random = new Random();
 
         public JournalScraper(string outputDirectory)
         {
@@ -75,25 +79,61 @@ namespace Elsevier.DownloadArticleMetadata
             List<string> articleSubLinks = new List<string>();
             int offset = 0;
             int show = 25; // Has to be either 25, 50 or 100
+            // We will only do one page for now, but we can loop through them if we want to get more articles.
+            int page = 1;
 
-            Boolean go = true;
-
-            while (go)
+            while (page <= pagesToScrape)
             {
                 var url = $"https://www.sciencedirect.com/search?pub={journalName.Replace(" ", "%20")}&show={show}&sortBy=date&offset={offset}&articleTypes=FLA";
                 _driver.Navigate().GoToUrl(url);
-                //_driver.Manage().Timeouts().PageLoad = new TimeSpan(0, 0, 10);
-                Thread.Sleep(5000);
+                // CAPTCHA WAITER 
+                bool pageReady = false;
+                int maxWaitAttempts = 60; // 60 attempts * 2 seconds = 2 minutes max wait per journal
+                int attempts = 0;
+
                 HtmlDocument doc = new HtmlDocument();
-                doc.LoadHtml(_driver.PageSource);
+                while (!pageReady && attempts < maxWaitAttempts)
+                {
+                    doc.LoadHtml(_driver.PageSource);
+        
+                    // 1. Check if the Captcha Wiggle box or Challenge elements exist
+                    bool hasCaptcha = doc.DocumentNode.SelectSingleNode("//div[@id='captcha-box']|//iframe[contains(@src, 'arkose')]|//div[contains(@id, 'px-container')]") != null 
+                          || _driver.PageSource.Contains("captcha-box") 
+                          || _driver.Title.Contains("Access Denied")
+                          || _driver.Title.Contains("Pardon Our Interruption");
+
+                    // 2. Check if the actual data has successfully loaded instead
+                    var tempArticles = doc.DocumentNode.SelectNodes("//a[contains(@class, 'result-list-title-link')]");
+                    bool hasData = tempArticles != null && tempArticles.Count > 0;
+
+                    if (hasCaptcha)
+                    {
+                        // Play a sound to alert you
+                        Console.Beep(800, 300); 
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"[ALERT] Captcha detected for '{journalName}'! Please solve it in the browser window now...");
+                        Console.ResetColor();
+            
+                        Thread.Sleep(3000); // Wait 3 seconds before checking again to give you time
+                        attempts++;
+                    }
+                    else if (hasData)
+                    {
+                        // Data is here! We can safely proceed.
+                        pageReady = true;
+                    }
+                    else
+                    {
+                        // The page might just be loading slowly normally
+                        Thread.Sleep(2000);
+                        attempts++;
+                    }
+                }
                 var articles = doc.DocumentNode.SelectNodes("//a[contains(@class, 'result-list-title-link')]");
 
                 if (articles is null || articles.Count == 0)
                 {
                     Console.WriteLine("Got no results, so I assume I got everything.");
-                    // Temporary debug: Save the page to see if it's a CAPTCHA
-                    File.WriteAllText("debug_page.html", _driver.PageSource);
-                    Console.WriteLine("Check debug_page.html to see if we were blocked.");
                     break;
                 }
                 Console.WriteLine($"Found {articles.Count} article(s)");
@@ -103,7 +143,8 @@ namespace Elsevier.DownloadArticleMetadata
                     articleSubLinks.Add(link);
                 }
                 offset = offset + show;
-                go = false;
+                page++;
+                Thread.Sleep(1000 + _random.Next(3000)); // Don't send requests too quickly, add some variance.
             }
             return articleSubLinks;
         }
@@ -117,21 +158,48 @@ namespace Elsevier.DownloadArticleMetadata
 
         private IWebDriver CreateNewDriver()
         {
-            Console.WriteLine("Create new webdriver using Selenium Manager");
+            Console.WriteLine("Initializing stealth WebDriver context...");
     
-            ChromeOptions options = new ChromeOptions();
-            options.AddArgument("--headless=new"); 
-            // Look more human.
-            options.AddArgument("--disable-blink-features=AutomationControlled");
+            ChromeOptions options = new ChromeOptions(); 
+    
+            // 1. Core Automation Cloaking
+         options.AddArgument("--disable-blink-features=AutomationControlled");
             options.AddExcludedArgument("enable-automation");
             options.AddAdditionalOption("useAutomationExtension", false);
+    
+            // 2. Clear Network Fingerprint Anomalies (The Triggers)
+            // Firewalls look for specific command-line flags that only bots use
+            options.AddArgument("--disable-infobars");
+            options.AddArgument("--disable-browser-side-navigation");
+            options.AddArgument("--disable-gpu"); // Helps normalize the canvas fingerprinting footprint
+    
+            // 3. Set a highly realistic human screen footprint
             options.AddArgument("--window-size=1920,1080");
-            options.AddArgument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            options.AddArgument("--start-maximized");
 
-            IWebDriver driver = new ChromeDriver(options);
+            // 4. Force a highly authentic, native Chrome 148 User-Agent string
+            // A generic string or missing minor version triggers immediate firewall dropping
+            options.AddArgument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36");
 
-            // Use JavaScript to remove the 'webdriver' flag entirely after launch
-            ((IJavaScriptExecutor)driver).ExecuteScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+            // 5. Isolated Project Profile Path Setup
+            string projectFolder = AppDomain.CurrentDomain.BaseDirectory;
+            string customProfilePath = Path.Combine(projectFolder, "ChromeThesisProfile");
+            options.AddArgument($"--user-data-dir={customProfilePath}");
+
+            // 6. Instantiate the Driver with Extended Startup Timeout
+            ChromeDriverService service = ChromeDriverService.CreateDefaultService();
+            IWebDriver driver = new ChromeDriver(service, options, TimeSpan.FromSeconds(90));
+
+            // 7. Dynamic Webdriver Property Nullification
+            try
+            {
+                ((IJavaScriptExecutor)driver).ExecuteScript(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});" +
+                    "window.chrome = { runtime: {} };" + // Emulate native Chrome runtime properties
+                    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});" // Normalize language arrays
+                );
+            }
+            catch { /* Safe fallback */ }
     
             driver.Manage().Timeouts().ImplicitWait = TimeSpan.FromSeconds(30);
             driver.Manage().Timeouts().PageLoad = TimeSpan.FromSeconds(30);

@@ -12,7 +12,7 @@ namespace Elsevier.DownloadArticleMetadata
     {
         private static int _retryCount = 5;
 
-        private static readonly string propertiesFile = "../../../../../config.env";
+        private static readonly string propertiesFile = GetConfigPath();
 
         private static IDatabase db;
 
@@ -135,6 +135,26 @@ namespace Elsevier.DownloadArticleMetadata
             string title = row["title"].ToString();
 
             return (id, title);
+        }
+
+        private static string GetConfigPath()
+        {
+            // Start at the folder where the application is currently executing
+            DirectoryInfo currentDir = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
+
+            // Walk up the folder tree until we find the "solution" folder
+            while (currentDir != null && currentDir.Name != "solution")
+            {
+                currentDir = currentDir.Parent;
+            }
+
+            if (currentDir == null)
+            {
+                throw new DirectoryNotFoundException("Could not find the 'solution' directory in the path hierarchy.");
+            }
+
+            // Combine the path of the solution folder with the config file name
+            return Path.Combine(currentDir.FullName, "config.env");
         }
     }
 }
