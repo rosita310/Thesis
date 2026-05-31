@@ -12,7 +12,7 @@ namespace Elsevier.DownloadArticleMetadata
     {
         private static int _retryCount = 5;
 
-        private static readonly string propertiesFile = "../.env";
+        private static readonly string propertiesFile = GetConfigPath();
 
         private static IDatabase db;
 
@@ -30,6 +30,7 @@ namespace Elsevier.DownloadArticleMetadata
 
             db = DatabaseFactory.GetDatabase(DatabaseType.Postgres, user, password, database, server);
 
+            InitializeQueue();
 
             JournalScraper js = new JournalScraper(savedir);
             js.RefreshBrowser();
@@ -66,6 +67,57 @@ namespace Elsevier.DownloadArticleMetadata
             Console.WriteLine("Done");
         }
 
+        private static void InitializeQueue()
+        {
+            Console.WriteLine("Syncing journal queue...");
+
+            // Fetch journals from the Python scraper's table
+            DataTable journalsFromSource = db.GetData("SELECT title FROM elsevier.journals");
+            if (journalsFromSource.Rows.Count == 0) return;
+
+            // Check if the queue table exists and get existing titles
+            HashSet<string> existingTitles = new HashSet<string>();
+            try 
+            {
+                DataTable existingQueue = db.GetData("SELECT title FROM elsevier.article_metadata_input");
+                foreach (DataRow row in existingQueue.Rows) 
+                    existingTitles.Add(row["title"].ToString());
+            }
+            catch { /* Table doesn't exist yet, GetData will throw an exception */ }
+
+            // Prepare only the NEW journals
+            DataTable syncTable = new DataTable();
+            syncTable.Columns.Add("title", typeof(string));
+            syncTable.Columns.Add("status", typeof(string));
+
+            foreach (DataRow sourceRow in journalsFromSource.Rows)
+            {
+                string title = sourceRow["title"].ToString();
+                if (!existingTitles.Contains(title))
+                    syncTable.Rows.Add(title, "TODO");
+            }
+
+            if (syncTable.Rows.Count > 0)
+            {
+                // Use WriteToDb to create/update the table
+                // This will create 'title' and 'status' columns.
+                db.WriteToDb("elsevier", "article_metadata_input", syncTable);
+
+                // Ensure the 'id' SERIAL column exists
+                // Even though GetData expects a result, it will still execute this command.
+                try 
+                {
+                    // IF NOT EXISTS is vital so we don't error out on the second run
+                    db.GetData("ALTER TABLE elsevier.article_metadata_input ADD COLUMN IF NOT EXISTS id SERIAL PRIMARY KEY");
+                } 
+                catch (Exception ex) 
+                { 
+                    Console.WriteLine("Note: ID column already present or handled. Exception:"); 
+                    Console.WriteLine(ex.ToString());
+                }
+            }
+        }
+
         static (long, string) GetJournal()
         {
             string sql = "UPDATE elsevier.article_metadata_input " +
@@ -79,10 +131,30 @@ namespace Elsevier.DownloadArticleMetadata
             DataTable dt = db.GetData(sql);
             if (dt.Rows.Count == 0) { return (0, ""); }
             DataRow row = dt.Rows[0];
-            long id = (long)row["id"];
+            long id = Convert.ToInt64(row["id"]);
             string title = row["title"].ToString();
 
             return (id, title);
+        }
+
+        private static string GetConfigPath()
+        {
+            // Start at the folder where the application is currently executing
+            DirectoryInfo currentDir = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
+
+            // Walk up the folder tree until we find the "solution" folder
+            while (currentDir != null && currentDir.Name != "solution")
+            {
+                currentDir = currentDir.Parent;
+            }
+
+            if (currentDir == null)
+            {
+                throw new DirectoryNotFoundException("Could not find the 'solution' directory in the path hierarchy.");
+            }
+
+            // Combine the path of the solution folder with the config file name
+            return Path.Combine(currentDir.FullName, "config.env");
         }
     }
 }

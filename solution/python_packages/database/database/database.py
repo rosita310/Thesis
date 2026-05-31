@@ -168,7 +168,7 @@ class Postgress(Generic):
 
     def __init__(self, server, database, user, password):
         self.connection_string = (
-            "DRIVER={PostgreSQL ODBC Driver(UNICODE)};"
+            "DRIVER={PostgreSQL Unicode(x64)};"
             f"Server={server};"
             "Port=5432;"
             f"Database={database};"
