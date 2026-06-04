@@ -19,18 +19,52 @@ BASE_URL = "https://link.springer.com"
 OUTPUT_DIR = "data"
 MIN_YEAR = 2020
 
+# Browser identity shared by the requests fast path and the Selenium fallback,
+# so both look like the same client to Springer.
+USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/124.0.0.0 Safari/537.36'
+)
+
 # CSV file listing journals to skip (journal_id, name).
 # Add a journal here if you know it never publishes received dates.
 # The file is created automatically with a header if it does not exist.
 SKIP_JOURNALS_FILE = "skip_journals.csv"
 
+# Per-journal progress file (JSON). Records, per journal_id, the last fully
+# completed article-list page, cumulative counts, the status (in_progress/done),
+# and the MIN_YEAR that a "done" status reflects. This lets a resumed run skip
+# completed journals entirely and continue an interrupted journal from the next
+# page instead of re-fetching every list page from page 1.
+#
+# Iterative-scrape workflow: when you lower MIN_YEAR (e.g. 2020 -> 2010) to grab
+# older articles, flip the relevant journals' "status" from "done" back to
+# "in_progress" by hand but KEEP their "last_page". Because Springer lists newest
+# first, the older articles you now want live on the later pages, so the run will
+# continue at last_page + 1 straight into the new data without re-fetching what
+# you already have. The "min_year" field tells you which threshold each "done"
+# reflects.
+PROGRESS_FILE = "progress.json"
+
+# Persistent Chrome profile for the Selenium fallback. Reusing a profile lets a
+# session that has cleared a CAPTCHA stay trusted across runs. Safe to delete.
+CHROME_PROFILE_DIR = ".chrome_profile"
+
 # Maximum number of articles to download per journal.
 # Set to a low number (e.g. 5) for testing, None for a full production run.
 MAX_ARTICLES_PER_JOURNAL = None
 
-# Random delay range between requests to appear more human-like (seconds)
-REQUEST_DELAY_MIN = 1.5
-REQUEST_DELAY_MAX = 3.5
+# Random delay range between requests to appear more human-like (seconds).
+# Kept low for throughput; the adaptive backoff below widens it automatically
+# whenever Springer starts blocking, then decays it back once requests succeed.
+REQUEST_DELAY_MIN = 0.25
+REQUEST_DELAY_MAX = 1.0
+# Adaptive backoff: the delay is multiplied by this factor each time we are
+# blocked, capped at MAX_DELAY_MULTIPLIER, and decayed back toward 1.0 on success.
+DELAY_BACKOFF_FACTOR = 2.0
+DELAY_DECAY_FACTOR = 0.9
+MAX_DELAY_MULTIPLIER = 8.0
 # Extra wait time when a 429 Too Many Requests is received (seconds)
 RATE_LIMIT_WAIT = 60
 # Maximum retries per request before giving up
@@ -48,11 +82,7 @@ def read_config(path) -> dict:
 def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
-        ),
+        'User-Agent': USER_AGENT,
         'Accept-Language': 'en-US,en;q=0.9',
     })
     return session
@@ -140,7 +170,127 @@ class BlockedException(Exception):
     pass
 
 
-def get_article_links(session: requests.Session, journal_id: str, page: int) -> tuple[list[dict], bool]:
+class Fetcher:
+    """
+    Hybrid fetcher: fast `requests` path with a Selenium browser fallback.
+
+    Normal fetches go through a `requests.Session` (fast). When Springer serves
+    a block/CAPTCHA page (BlockedException), the fetcher escalates to a *visible*
+    Chrome window via Selenium, navigates to the URL, and — if a CAPTCHA is shown
+    — pauses for the operator to solve it by hand before continuing. After the
+    block clears, the browser's cookies are copied back into the requests session
+    so subsequent fetches return to the fast path.
+
+    Also owns the inter-request delay, applying adaptive backoff: the delay widens
+    on every block and decays back toward the baseline as requests succeed.
+    """
+
+    def __init__(self):
+        self.session = make_session()
+        self.driver = None  # lazily created on first block
+        self.delay_multiplier = 1.0
+
+    def fetch(self, url: str) -> bytes | None:
+        """Fetch a URL, escalating to the browser fallback if blocked."""
+        try:
+            content = fetch_with_retry(self.session, url)
+            self._on_success()
+            return content
+        except BlockedException as e:
+            logging.warning(f"Blocked on fast path: {e}. Escalating to browser.")
+            self._on_block()
+            return self._fetch_with_browser(url)
+
+    def sleep(self) -> None:
+        """Sleep a randomised, adaptively-scaled delay between requests."""
+        base = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
+        time.sleep(base * self.delay_multiplier)
+
+    def close(self) -> None:
+        """Close the browser if one was opened."""
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+    def _on_success(self) -> None:
+        # Decay the delay back toward the baseline after a clean fetch.
+        if self.delay_multiplier > 1.0:
+            self.delay_multiplier = max(1.0, self.delay_multiplier * DELAY_DECAY_FACTOR)
+
+    def _on_block(self) -> None:
+        self.delay_multiplier = min(MAX_DELAY_MULTIPLIER, self.delay_multiplier * DELAY_BACKOFF_FACTOR)
+
+    def _ensure_driver(self) -> None:
+        """Lazily start a visible Chrome. Selenium is imported only when needed."""
+        if self.driver is not None:
+            return
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+        except ImportError as e:
+            raise BlockedException(
+                "Blocked by Springer and the Selenium fallback is unavailable. "
+                "Install it with: pip install selenium"
+            ) from e
+
+        options = Options()
+        options.add_argument(f"--user-data-dir={os.path.abspath(CHROME_PROFILE_DIR)}")
+        options.add_argument(f"--user-agent={USER_AGENT}")
+        # Light de-automation tweaks; the operator solves the CAPTCHA regardless.
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        # Selenium Manager (built into Selenium 4.6+) downloads the matching driver.
+        self.driver = webdriver.Chrome(options=options)
+
+    def _fetch_with_browser(self, url: str) -> bytes | None:
+        """
+        Open the URL in Chrome, pausing for a manual CAPTCHA solve if needed.
+
+        If the block cannot be solved (e.g. a hard IP ban), the operator can quit
+        the whole run cleanly by typing 'q' at the prompt, pressing Ctrl+C, or
+        simply closing the Chrome window — all of these raise KeyboardInterrupt,
+        which main() handles gracefully. Progress is saved per page, so a later
+        resume picks up safely.
+        """
+        self._ensure_driver()
+        try:
+            self.driver.get(url)
+            while is_blocked(self.driver.page_source.encode('utf-8', 'ignore')):
+                logging.warning("CAPTCHA / block page detected in the Chrome window.")
+                answer = input(
+                    f"\n>>> Solve the CAPTCHA in the Chrome window for:\n    {url}\n"
+                    f"    Press ENTER to continue, or type 'q' + ENTER to quit "
+                    f"(e.g. on an IP ban): "
+                )
+                if answer.strip().lower() in ('q', 'quit'):
+                    raise KeyboardInterrupt("Aborted by operator at CAPTCHA prompt.")
+                # The page may have navigated after solving; reload to be sure.
+                self.driver.get(url)
+        except Exception as e:
+            # KeyboardInterrupt (Ctrl+C / 'q') is a BaseException and passes through.
+            # Anything else here means the browser/session is gone (window closed) —
+            # treat that as a clean abort rather than crashing the run.
+            logging.warning(f"Browser unavailable during manual solve ({e}). Aborting run.")
+            raise KeyboardInterrupt("Chrome window closed or session lost.") from e
+
+        self._sync_cookies()
+        logging.info("Block cleared — resuming via the fast requests path.")
+        return self.driver.page_source.encode('utf-8', 'ignore')
+
+    def _sync_cookies(self) -> None:
+        """Copy the browser's cookies into the requests session."""
+        for c in self.driver.get_cookies():
+            self.session.cookies.set(
+                c['name'], c['value'],
+                domain=c.get('domain'), path=c.get('path', '/'),
+            )
+
+
+def get_article_links(fetcher: 'Fetcher', journal_id: str, page: int) -> tuple[list[dict], bool]:
     """
     Fetch one page of a journal's article list and return article stubs.
 
@@ -158,7 +308,7 @@ def get_article_links(session: requests.Session, journal_id: str, page: int) -> 
     """
     url = f"{BASE_URL}/journal/{journal_id}/articles?page={page}"
     logging.info(f"  Fetching article list page {page}: {url}")
-    content = fetch_with_retry(session, url)
+    content = fetcher.fetch(url)
     if not content:
         return [], True
 
@@ -330,6 +480,25 @@ def already_downloaded(journal_id: str, doi: str) -> bool:
     return os.path.exists(os.path.join(OUTPUT_DIR, journal_id, filename))
 
 
+def load_progress() -> dict:
+    """Load the per-journal progress map from PROGRESS_FILE (empty if absent)."""
+    if not os.path.exists(PROGRESS_FILE):
+        return {}
+    with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def save_progress(progress: dict) -> None:
+    """
+    Persist the progress map atomically (write to a temp file, then replace),
+    so an interruption mid-write can never corrupt the existing progress file.
+    """
+    tmp = PROGRESS_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(progress, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROGRESS_FILE)
+
+
 def load_skip_journals() -> set[str]:
     """
     Read journal IDs to skip from SKIP_JOURNALS_FILE.
@@ -364,18 +533,41 @@ def suggest_skip(journal_id: str, name: str) -> None:
         writer.writerow({'journal_id': journal_id, 'name': name})
 
 
-def process_journal(session: requests.Session, journal_id: str, name: str) -> None:
-    logging.info(f"Processing journal [{journal_id}] {name}")
-    page = 1
-    total = 0
-    received_count = 0
+def record_progress(progress: dict, journal_id: str, page: int, total: int,
+                    received_count: int, status: str) -> None:
+    """Update and persist the progress entry for one journal after a page."""
+    progress[journal_id] = {
+        'status': status,                      # 'in_progress' or 'done'
+        'last_page': page,                     # last fully completed list page
+        'articles_saved': total,               # cumulative articles saved
+        'received_count': received_count,      # cumulative articles with a received date
+        'min_year': MIN_YEAR,                  # threshold this progress reflects
+        'updated_at': datetime.now().isoformat(),
+    }
+    save_progress(progress)
+
+
+def process_journal(fetcher: Fetcher, journal_id: str, name: str, progress: dict) -> None:
+    # Resume from where a previous run left off. last_page is the last *fully
+    # completed* page, so we continue at the next one; cumulative counts carry over.
+    record = progress.get(journal_id, {})
+    page = record.get('last_page', 0) + 1
+    total = record.get('articles_saved', 0)
+    received_count = record.get('received_count', 0)
+
+    if page > 1:
+        logging.info(f"Resuming journal [{journal_id}] {name} from page {page} ({total} already saved).")
+    else:
+        logging.info(f"Processing journal [{journal_id}] {name}")
 
     while True:
-        article_stubs, stop = get_article_links(session, journal_id, page)
+        article_stubs, stop = get_article_links(fetcher, journal_id, page)
 
         for stub in article_stubs:
             if MAX_ARTICLES_PER_JOURNAL is not None and total >= MAX_ARTICLES_PER_JOURNAL:
                 logging.info(f"  Reached MAX_ARTICLES_PER_JOURNAL ({MAX_ARTICLES_PER_JOURNAL}) — stopping.")
+                # Mark the previous page as the last completed one (this page is partial).
+                record_progress(progress, journal_id, page - 1, total, received_count, 'in_progress')
                 return
 
             doi = stub['doi']
@@ -386,7 +578,7 @@ def process_journal(session: requests.Session, journal_id: str, name: str) -> No
 
             article_url = f"{BASE_URL}/article/{doi}"
             logging.info(f"    Fetching article: {article_url}")
-            content = fetch_with_retry(session, article_url)
+            content = fetcher.fetch(article_url)
             if not content:
                 continue
 
@@ -402,13 +594,18 @@ def process_journal(session: requests.Session, journal_id: str, name: str) -> No
             }
             save_json(data, journal_id, doi)
             total += 1
-            time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+            fetcher.sleep()
 
-        if stop or not article_stubs:
+        done = stop or not article_stubs
+        # Persist after every completed page so a block loses at most one page.
+        record_progress(progress, journal_id, page, total, received_count,
+                         'done' if done else 'in_progress')
+
+        if done:
             break
 
         page += 1
-        time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+        fetcher.sleep()
 
     logging.info(f"  Done. {total} articles saved for journal [{journal_id}] ({received_count} with received date).")
 
@@ -430,22 +627,32 @@ def main():
     logging.info(f"Found {len(journals)} journals to process.")
 
     skip_ids = load_skip_journals()
-    session = make_session()
+    progress = load_progress()
+    fetcher = Fetcher()
 
     try:
         for journal in journals:
-            if journal['journal_id'] in skip_ids:
-                logging.info(f"Skipping journal [{journal['journal_id']}] {journal['name']} (in skip list).")
+            journal_id = journal['journal_id']
+            if journal_id in skip_ids:
+                logging.info(f"Skipping journal [{journal_id}] {journal['name']} (in skip list).")
+                continue
+            if progress.get(journal_id, {}).get('status') == 'done':
+                logging.info(
+                    f"Skipping completed journal [{journal_id}] {journal['name']} "
+                    f"(done at min_year={progress[journal_id].get('min_year')})."
+                )
                 continue
             try:
-                process_journal(session, journal['journal_id'], journal['name'])
+                process_journal(fetcher, journal_id, journal['name'], progress)
             except BlockedException as e:
                 logging.error(f"BLOCKED by Springer: {e}")
-                logging.error("Stopping the run to avoid saving corrupt data. Resume later.")
+                logging.error("Stopping the run to avoid saving corrupt data. Progress is saved — resume later.")
                 break
             #break # Remove this break to process all journals in a real run. It's here to limit scope during testing.
     except KeyboardInterrupt:
         logging.info("Interrupted by user (Ctrl+C). Progress is saved — safe to resume.")
+    finally:
+        fetcher.close()
 
     logging.info("All journals processed.")
 
