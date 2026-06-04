@@ -219,10 +219,31 @@ class Fetcher:
         time.sleep(base * self.delay_multiplier)
 
     def close(self) -> None:
-        """Close the browser if one was opened."""
-        if self.driver is not None:
+        """
+        Close the browser if one was opened.
+
+        If the operator already closed the Chrome window by hand, chromedriver is
+        gone and the graceful quit() retries against a dead local port, logging
+        noisy urllib3 warnings. We suppress that chatter and, as a fallback, kill
+        the chromedriver subprocess directly (no network needed).
+        """
+        if self.driver is None:
+            return
+
+        urllib3_logger = logging.getLogger('urllib3')
+        prev_level = urllib3_logger.level
+        urllib3_logger.setLevel(logging.ERROR)  # hide retry warnings during teardown
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        finally:
+            urllib3_logger.setLevel(prev_level)
+            # Belt and suspenders: ensure the chromedriver process is terminated.
             try:
-                self.driver.quit()
+                proc = getattr(getattr(self.driver, 'service', None), 'process', None)
+                if proc is not None:
+                    proc.kill()
             except Exception:
                 pass
             self.driver = None
@@ -363,10 +384,8 @@ def get_article_links(fetcher: 'Fetcher', journal_id: str, page: int) -> tuple[l
         doi = anchor.get('data-track-label', '').strip()
         title = anchor.get_text(strip=True)
 
-        # Publication date is in the last span.c-meta__item, e.g. "19 March 2026"
-        date_spans = card.select('span.c-meta__item')
-        pub_date_str = date_spans[-1].get_text(strip=True) if date_spans else ''
-        pub_year = parse_year(pub_date_str)
+        # The date span is identified by its month name (its position varies).
+        pub_year = extract_card_year(card)
 
         if pub_year is not None and pub_year < MIN_YEAR:
             logging.info(f"  Reached article from {pub_year} — stopping pagination for this journal.")
@@ -379,12 +398,41 @@ def get_article_links(fetcher: 'Fetcher', journal_id: str, page: int) -> tuple[l
     return articles, stop
 
 
+MONTH_NAMES = {
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+}
+
+
 def parse_year(date_str: str) -> int | None:
-    """Extract the four-digit year from a date string like '19 March 2026'."""
+    """Extract a plausible four-digit year (1900–2100) from a date string."""
     parts = date_str.strip().split()
     for part in reversed(parts):
-        if part.isdigit() and len(part) == 4:
+        if part.isdigit() and len(part) == 4 and 1900 <= int(part) <= 2100:
             return int(part)
+    return None
+
+
+def extract_card_year(card) -> int | None:
+    """
+    Return the publication year shown on a listing card.
+
+    The card has several <span class="c-meta__item"> elements in an order that is
+    NOT fixed, e.g. ['Original Article', '29 November 2019', 'Pages: 64 - 72'].
+    The date is identified by its month name, so we never mistake a page range
+    like 'Pages: 2018 - 2025' for a year. Falls back to any plausible 4-digit year.
+    """
+    spans = [s.get_text(strip=True) for s in card.select('span.c-meta__item')]
+    for txt in spans:
+        low = txt.lower()
+        if any(month in low for month in MONTH_NAMES):
+            year = parse_year(txt)
+            if year is not None:
+                return year
+    for txt in spans:
+        year = parse_year(txt)
+        if year is not None:
+            return year
     return None
 
 
@@ -411,6 +459,11 @@ def extract_article_data(html: bytes) -> dict:
     }
 
     known_labels = {'received', 'accepted', 'published', 'version of record', 'doi'}
+
+    # Remember the first non-primary date (e.g. "Issue Date") but only promote it
+    # to the fallback if none of received/accepted/published turn up (see below).
+    first_other_label = None
+    first_other_value = None
 
     for item in soup.select('li.c-bibliographic-information__list-item'):
         p = item.find('p')
@@ -442,9 +495,15 @@ def extract_article_data(html: bytes) -> dict:
             data['accepted'] = value
         elif label == 'published':
             data['published'] = value
-        elif label not in known_labels and data['fallback_date_label'] is None:
-            data['fallback_date_label'] = label_raw.strip()
-            data['fallback_date_value'] = value
+        elif label not in known_labels and first_other_label is None:
+            first_other_label = label_raw.strip()
+            first_other_value = value
+
+    # Only record a fallback date when NONE of the three primary dates were found,
+    # so it flags genuinely missing data instead of duplicating e.g. an issue date.
+    if not (data['received'] or data['accepted'] or data['published']):
+        data['fallback_date_label'] = first_other_label
+        data['fallback_date_value'] = first_other_value
 
     # --- Authors ---
     # <a data-test="author-name">Name</a>
