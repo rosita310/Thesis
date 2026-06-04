@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 BASE_URL = "https://link.springer.com"
 OUTPUT_DIR = "data"
-MIN_YEAR = 2000
+MIN_YEAR = 2020
 
 # CSV file listing journals to skip (journal_id, name).
 # Add a journal here if you know it never publishes received dates.
@@ -26,7 +26,7 @@ SKIP_JOURNALS_FILE = "skip_journals.csv"
 
 # Maximum number of articles to download per journal.
 # Set to a low number (e.g. 5) for testing, None for a full production run.
-MAX_ARTICLES_PER_JOURNAL = 5
+MAX_ARTICLES_PER_JOURNAL = None
 
 # Random delay range between requests to appear more human-like (seconds)
 REQUEST_DELAY_MIN = 1.5
@@ -443,7 +443,7 @@ def main():
                 logging.error(f"BLOCKED by Springer: {e}")
                 logging.error("Stopping the run to avoid saving corrupt data. Resume later.")
                 break
-            break # Remove this break to process all journals in a real run. It's here to limit scope during testing.
+            #break # Remove this break to process all journals in a real run. It's here to limit scope during testing.
     except KeyboardInterrupt:
         logging.info("Interrupted by user (Ctrl+C). Progress is saved — safe to resume.")
 
