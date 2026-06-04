@@ -69,6 +69,14 @@ de látere pagina's; de run hervat op `last_page + 1` en gaat direct door met de
 zonder al opgehaalde pagina's opnieuw te bezoeken. Het `min_year`-veld laat zien tot welke
 drempel elke `done` is voltooid.
 
+**Grenspagina wordt automatisch opnieuw bezocht**: op de pagina waar de stop valt, worden
+alleen de artikelen ván of ná `MIN_YEAR` verwerkt; de oudere helft op diezelfde pagina
+wordt overgeslagen. Daarom telt die grenspagina níét als "volledig voltooid": `last_page`
+wijst naar de laatste vólledig verwerkte pagina (één eerder). Bij een volgende iteratie
+(lagere `MIN_YEAR`) hervat de run dus op de grenspagina zelf, slaat `already_downloaded()`
+de al opgeslagen helft over, en pikt de nu-binnen-bereik oudere helft alsnog op. Zo gaat
+geen enkel artikel op de grenspagina verloren.
+
 ### Formaat van opgeslagen JSON
 ```json
 {

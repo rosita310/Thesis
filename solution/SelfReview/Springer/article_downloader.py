@@ -559,14 +559,21 @@ def extract_article_data(html: bytes) -> dict:
 
 
 def save_json(data: dict, journal_id: str, doi: str) -> None:
-    """Save article metadata as a JSON file in data/{journal_id}/{doi}.json."""
+    """Save article metadata as a JSON file in data/{journal_id}/{doi}.json.
+
+    Written atomically (temp file + os.replace) so an interruption mid-write can
+    never leave a truncated .json that already_downloaded() would mistake for a
+    completed article and never re-fetch.
+    """
     # Replace slashes in DOI with underscores to make a valid filename
     filename = doi.replace('/', '_') + '.json'
     directory = os.path.join(OUTPUT_DIR, journal_id)
     os.makedirs(directory, exist_ok=True)
     filepath = os.path.join(directory, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
+    tmp = filepath + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, filepath)
 
 
 def already_downloaded(journal_id: str, doi: str) -> bool:
@@ -692,8 +699,16 @@ def process_journal(fetcher: Fetcher, journal_id: str, name: str, progress: dict
             fetcher.sleep()
 
         done = stop or not article_stubs
-        # Persist after every completed page so a block loses at most one page.
-        record_progress(progress, journal_id, page, total, received_count,
+        # When we stop (boundary reached or empty page), the current page was only
+        # PARTIALLY processed: articles older than MIN_YEAR on it were intentionally
+        # skipped. So record the *previous* page as the last fully completed one.
+        # That way a later iteration that lowers MIN_YEAR (and flips this journal
+        # back to 'in_progress') resumes by re-fetching this boundary page and picks
+        # up the now-in-range older articles — already_downloaded() skips the half
+        # already saved — instead of jumping past them. A fully in-range page (not
+        # done) is complete, so we record it as-is.
+        completed_page = page - 1 if done else page
+        record_progress(progress, journal_id, completed_page, total, received_count,
                          'done' if done else 'in_progress')
 
         if done:
