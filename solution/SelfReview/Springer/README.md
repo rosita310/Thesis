@@ -1,4 +1,4 @@
-# Springer Scraper
+# Springer Scraper — Aanpak
 
 ## Doel
 Publicatiedata verzamelen van artikelen in Springer Computer Science journals om de publication-lag (tijd tussen indiening en acceptatie) te analyseren als indicator voor mogelijke self-review fraude.
@@ -119,9 +119,12 @@ Door alleen de benodigde velden op te slaan blijft de totale schijfruimte ruim o
 - **Taal**: Python 3.9 (`requests`, `BeautifulSoup4`)
 - **Database**: PostgreSQL via gedeelde `Postgress`/`Saver` library (pyodbc)
 - **Selenium**: alleen als fallback bij een block/CAPTCHA (niet voor normale fetches —
-  Springer-pagina's zijn server-side rendered). Gewone `selenium` met de ingebouwde
-  Selenium Manager (haalt zelf de juiste chromedriver op); lazy geïmporteerd, dus alleen
-  nodig zodra er daadwerkelijk geblokkeerd wordt. Installeren: `pip install selenium`.
+  Springer-pagina's zijn server-side rendered); lazy geïmporteerd, dus alleen nodig zodra
+  er daadwerkelijk geblokkeerd wordt. **Vereist Selenium ≥ 4.6** zodat de ingebouwde
+  Selenium Manager zelf de juiste chromedriver ophaalt: `pip install -U selenium`.
+  Bij een oudere Selenium zonder Selenium Manager valt het script terug op
+  `webdriver-manager` als die geïnstalleerd is (`pip install webdriver-manager`); anders
+  stopt het netjes met een installatie-instructie en blijft de voortgang bewaard.
   Een hard IP-block lost de browser niet op — val dan terug op de schone hervatting
   (progress + opnieuw starten vanaf een ander netwerk/VPN).
 - **Tussenopslag**: minimale JSON-bestanden per artikel — biedt robuustheid zonder opslagprobleem

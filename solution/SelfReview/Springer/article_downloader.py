@@ -243,8 +243,32 @@ class Fetcher:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
-        # Selenium Manager (built into Selenium 4.6+) downloads the matching driver.
-        self.driver = webdriver.Chrome(options=options)
+
+        # Strategy 1: let Selenium find the driver itself. Works when Selenium
+        # Manager is present (Selenium >= 4.6) or chromedriver is already on PATH.
+        try:
+            self.driver = webdriver.Chrome(options=options)
+            return
+        except Exception as e1:
+            logging.warning(f"Chrome startup via Selenium's own driver lookup failed ({e1}).")
+
+        # Strategy 2: let webdriver-manager download a matching chromedriver.
+        try:
+            from selenium.webdriver.chrome.service import Service
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+            logging.info("Started Chrome using webdriver-manager.")
+            return
+        except Exception as e2:
+            raise BlockedException(
+                "Could not start Chrome for the Selenium fallback. Easiest fix is to "
+                "upgrade Selenium so its built-in driver manager handles this:\n"
+                "    pip install -U selenium\n"
+                "Alternatively install webdriver-manager:\n"
+                "    pip install webdriver-manager\n"
+                f"(underlying error: {e2})"
+            ) from e2
 
     def _fetch_with_browser(self, url: str) -> bytes | None:
         """

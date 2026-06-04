@@ -12,3 +12,4 @@ solution/.env
 venv
 logs
 /solution/SelfReview/Springer/data
+/solution/SelfReview/Springer/progress.json
