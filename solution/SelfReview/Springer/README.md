@@ -49,6 +49,11 @@ springer/
   backoff (×2 per block, gedempt bij succes) zodat het script vertraagt zodra Springer
   begint te blokkeren en weer versnelt als het rustig is.
 - 429-afhandeling (60s wacht) en CAPTCHA/block-detectie blijven behouden.
+- **Block-detectie is content-bewust**: een pagina geldt pas als geblokkeerd als de
+  echte content ontbreekt (geen artikelkaarten / citation-metadata) én er een volledige
+  block-tekst aanwezig is. Losse woorden als "captcha" worden níét gematcht, omdat die
+  legitiem in artikeltitels voorkomen (bijv. een paper getiteld "...Color Constancy
+  CAPTCHA") — anders zou zo'n titel ten onrechte als block worden gezien.
 - Journals zonder received-datum worden automatisch toegevoegd aan `skip_journals.csv`
 
 ### Voortgang bijhouden — `progress.json`

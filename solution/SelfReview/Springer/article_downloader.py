@@ -131,31 +131,43 @@ def is_blocked(content: bytes) -> bool:
     """
     Return True if the response looks like a CAPTCHA or block page.
 
-    Springer returns HTTP 200 for these pages, so we check for the absence
-    of expected content rather than relying on the status code.
+    Springer returns HTTP 200 for soft-block/challenge pages, so we cannot rely
+    on the status code alone.
 
-    Note: avoid overly broad terms like "robot" (appears in <meta name="robots">
-    on every page) or "automated" (appears in legitimate content).
+    IMPORTANT — content false positives: do NOT match bare words like "captcha",
+    "robot" or "blocked" anywhere in the page. Article *titles* legitimately
+    contain such words (e.g. a real paper titled "Proposal and Evaluation for
+    Color Constancy CAPTCHA"), which would otherwise be misread as a block.
+    Instead we first confirm the page carries genuine content, and only then look
+    for full block-page UI strings.
     """
     text = content.decode('utf-8', errors='ignore').lower()
 
-    # Specific phrases that only appear on block/CAPTCHA pages
+    # Positive content signals. A real listing page carries article cards; a real
+    # article page carries citation metadata. If either is present, the page is
+    # genuine content and never a block — no matter what words appear in a title.
+    if 'app-card-open' in text or 'citation_title' in text:
+        return False
+
+    # No expected content. A real Springer page always carries its site header;
+    # bot-challenge / WAF pages typically do not.
+    if 'springer' not in text:
+        logging.warning("Block detected: 'springer' not found in response body.")
+        return True
+
+    # Full UI strings that appear on block/challenge pages (never in a title).
     block_signals = [
-        'captcha',
-        'access denied',
         'you have been blocked',
         'automated access to this service',
         'detected unusual traffic',
+        'verify you are a human',
+        'verifying you are human',
+        'why have i been blocked',
     ]
     for signal in block_signals:
         if signal in text:
             logging.warning(f"Block signal detected: '{signal}'")
             return True
-
-    # A valid Springer page always contains its site header
-    if 'springer' not in text:
-        logging.warning("Block detected: 'springer' not found in response body.")
-        return True
 
     return False
 
