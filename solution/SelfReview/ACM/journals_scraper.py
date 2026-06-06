@@ -95,7 +95,7 @@ def parse_journals(html: str) -> list[dict]:
 def main():
     
     script_dir = Path(__file__).resolve().parent
-    config_path = script_dir / '..' / '..' / 'config.env'
+    config_path = script_dir / '..' / '..' / '.env'
     absolute_config_path = config_path.resolve()
     config = read_config(absolute_config_path)
 
