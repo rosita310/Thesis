@@ -12,3 +12,4 @@ solution/.env
 venv
 
 /solution/SelfReview/ACM/data
+/solution/SelfReview/ACM/progress.json
