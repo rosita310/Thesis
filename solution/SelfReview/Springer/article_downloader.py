@@ -58,8 +58,8 @@ MAX_ARTICLES_PER_JOURNAL = None
 # Random delay range between requests to appear more human-like (seconds).
 # Kept low for throughput; the adaptive backoff below widens it automatically
 # whenever Springer starts blocking, then decays it back once requests succeed.
-REQUEST_DELAY_MIN = 0.25
-REQUEST_DELAY_MAX = 1.0
+REQUEST_DELAY_MIN = 0.1
+REQUEST_DELAY_MAX = 0.5
 # Adaptive backoff: the delay is multiplied by this factor each time we are
 # blocked, capped at MAX_DELAY_MULTIPLIER, and decayed back toward 1.0 on success.
 DELAY_BACKOFF_FACTOR = 2.0
