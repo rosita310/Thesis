@@ -10,3 +10,5 @@ geckodriver.log
 .fake
 solution/.env
 venv
+
+/solution/SelfReview/ACM/data
