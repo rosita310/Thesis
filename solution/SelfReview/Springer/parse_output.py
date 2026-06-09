@@ -46,7 +46,7 @@ def setup_logging() -> None:
 # Config
 # ---------------------------------------------------------------------------
 
-def read_config(path) -> dict:
+def read_config(path) -> configparser.SectionProxy:
     with open(path, 'r') as f:
         config_string = '[SECTION]\n' + f.read()
     config = configparser.ConfigParser()
@@ -75,6 +75,7 @@ def ensure_schema_and_tables(db: Postgress) -> None:
             fallback_date_value DATE,
             open_access         BOOLEAN,
             article_type        TEXT,
+            review_days         INTEGER,
             volume              INTEGER,
             first_page          INTEGER,
             last_page           INTEGER,
@@ -149,19 +150,22 @@ def parse_file(path: str) -> tuple[dict, list[dict], list[dict], list[dict]]:
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
 
-    doi = data.get('doi')
+    doi        = data.get('doi')
     journal_id = data.get('journal_id')
+    received   = parse_date(data.get('received'))
+    accepted   = parse_date(data.get('accepted'))
 
     article = {
         'doi':                  str_or_none(doi),
         'journal_id':           str_or_none(journal_id),
         'title':                str_or_none(data.get('title')),
-        'received':             parse_date(data.get('received')),
-        'accepted':             parse_date(data.get('accepted')),
+        'received':             received,
+        'accepted':             accepted,
         'published':            parse_date(data.get('published')),
         'fallback_date_label':  str_or_none(data.get('fallback_date_label')),
         'fallback_date_value':  parse_date(data.get('fallback_date_value')),
         'open_access':          parse_bool(data.get('open_access')),
+        'review_days':          (accepted - received).days if received and accepted else None,
         'article_type':         str_or_none(data.get('article_type')),
         'volume':               parse_int(data.get('volume')),
         'first_page':           parse_int(data.get('first_page')),
