@@ -21,7 +21,7 @@ BASE_DOMAIN = "https://dl.acm.org"
 
 # --- CONFIGURATION ---
 MAX_JOURNALS = 5             # Limit journals per session
-MIN_PUBLICATION_YEAR = 2018  # The scraper will stop when it hits an article published before this year
+MIN_PUBLICATION_YEAR = 2020  # The scraper will stop when it hits an article published before this year
 MAX_WAIT_TIME_SECONDS = 126  # Max time to wait for manual captcha solve
 
 def read_config(path) -> dict:
@@ -38,16 +38,31 @@ def get_debugging_driver():
     return webdriver.Chrome(service=service, options=chrome_options)
 
 def wait_for_human_and_page(driver, expected_selector, description):
+    """
+    Checks if the expected element is present. 
+    If a dead link indicator is found, returns 'skip' to bypass the article.
+    Otherwise, assumes a block/captcha and waits exponentially for human intervention.
+    """
     wait_time = 2
     total_waited = 0
-    time.sleep(2) 
+    time.sleep(2)  # Baseline wait for network/rendering stability
 
     while total_waited <= MAX_WAIT_TIME_SECONDS:
-        elements = driver.find_elements(*expected_selector)
-        if elements:
+        # 1. Check if the page loaded successfully (Success Target)
+        if driver.find_elements(*expected_selector):
             logging.info(f"Page validated: {description} found.")
             return True
-            
+
+        # 2. Check for ACM's 'Dead Link' page layout
+        # We look for any anchor pointing back to a Table of Contents (/toc/) with the text 'View Issue'
+        dead_link_buttons = driver.find_elements(
+            By.XPATH, "//a[contains(@href, '/toc/') and (contains(text(), 'View Issue') or contains(., 'View Issue'))]"
+        )
+        if dead_link_buttons:
+            logging.warning("Detected ACM empty/placeholder page ('View Issue' button present). Skipping this article.")
+            return "skip"
+
+        # 3. If neither is found, assume we might be blocked by a captcha and wait
         logging.warning(f"Blocked or loading! Waiting {wait_time}s for human to solve captcha/verify page...")
         time.sleep(wait_time)
         total_waited += wait_time
@@ -100,7 +115,7 @@ def extract_issue_data(html_source):
     containers = soup.find_all('div', class_='issue-item-container')
     for container in containers:
         heading = container.find('div', class_='issue-heading')
-        if heading and (not heading.get_text(strip=True).lower() == 'editorial'):
+        if heading and (not heading.get_text(strip=True).lower() == 'editorial') and (not heading.get_text(strip=True).lower() == 'correction'):
             abs_btn = container.find('a', attrs={'data-title': 'Abstract'}) or container.find('a', attrs={'aria-label': 'Abstract'})
             if abs_btn and abs_btn.get('href'):
                 abstract_links.append(urljoin(BASE_DOMAIN, abs_btn.get('href')))
@@ -254,9 +269,15 @@ def main():
                     logging.info(f"  -> Browsing Abstract: {abstract_link}")
                     driver.get(abstract_link)
                                         
-                    if not wait_for_human_and_page(driver, (By.CLASS_NAME, "core-published"), "Abstract Content (core-published)"):
-                        return
+                    # Capture the validation response status
+                    page_status = wait_for_human_and_page(driver, (By.CLASS_NAME, "core-published"), "Abstract Content (core-published)")
                     
+                    if page_status == "skip":
+                        continue  # Cleanly bypass this specific article and move to the next one
+                    elif not page_status:
+                        return    # Hard exit on unresolvable captcha timeout
+                    
+                    # Page is completely valid! Proceed with parsing...
                     article_data = extract_article_data(driver.page_source, abstract_link, journal_title)
                     issue_articles_data.append(article_data)
                     
@@ -265,7 +286,7 @@ def main():
                     if pub_year and pub_year < MIN_PUBLICATION_YEAR:
                         logging.warning(f"Hit article from {pub_year}. Reached our cutoff limit of {MIN_PUBLICATION_YEAR}.")
                         reached_target_year = True
-                        break # Stop processing articles in this issue
+                        break 
                     
                     time.sleep(2)
                 
