@@ -260,4 +260,39 @@ class Postgress(Generic):
         qm = ", ".join(["?"] * len(data[0]))
         query = f"INSERT INTO \"{schema_name}\".\"{table_name}\" ({columns}) VALUES ({qm})"
         self.execute_many(query, db_data)
-    
+
+    def insert_atomic(self, batches: list) -> None:
+        """Insert multiple (schema, table, rows) batches in one transaction.
+
+        All batches are committed together — if any insert fails the entire
+        operation is rolled back, leaving the database in a consistent state.
+
+        Args:
+            batches: List of (schema_name, table_name, rows) tuples where rows
+                     is a list of dicts. Empty row lists are silently skipped.
+        
+        Example:
+            db.insert_atomic([
+                ("springer", "articles", [{"doi": "10.1007/s00001", "title": "Example"}]),
+                ("springer", "authors",  [{"doi": "10.1007/s00001", "name": "Jane Doe"}]),
+            ])
+        """
+        conn = self.get_connection()
+        conn.autocommit = False
+        try:
+            cursor = conn.cursor()
+            for schema_name, table_name, rows in batches:
+                if not rows:
+                    continue
+                columns = list(rows[0].keys())
+                col_sql      = ", ".join(f'"{c}"' for c in columns)
+                placeholders = ", ".join(["?"] * len(columns))
+                query = f'INSERT INTO "{schema_name}"."{table_name}" ({col_sql}) VALUES ({placeholders})'
+                cursor.executemany(query, [tuple(row[c] for c in columns) for row in rows])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        
