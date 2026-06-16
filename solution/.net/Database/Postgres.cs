@@ -24,7 +24,7 @@ namespace Database
 
         private NpgsqlConnection GetConnection()
         {
-            string connectionString = $"Host={_server};Username={_user};Password={_password};Database={_database};ssl mode=Require";
+            string connectionString = $"Host={_server};Username={_user};Password={_password};Database={_database};ssl mode=Disable;Trust Server Certificate=true;";
             NpgsqlConnection connection = new NpgsqlConnection(connectionString);
             return connection;
         }

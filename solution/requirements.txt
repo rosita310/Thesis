@@ -92,6 +92,7 @@ trio==0.19.0
 trio-websocket==0.9.2
 typing-extensions==3.10.0.2
 urllib3==1.26.7
+webdriver-manager==4.0.2
 Werkzeug==2.0.2
 wsproto==1.0.0
 zipp==3.6.0
