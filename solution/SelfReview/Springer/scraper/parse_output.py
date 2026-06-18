@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from datetime import date, datetime
+import sys
 
 from database import Postgress
 
@@ -47,11 +48,16 @@ def setup_logging() -> None:
 # ---------------------------------------------------------------------------
 
 def read_config(path) -> configparser.SectionProxy:
-    with open(path, 'r') as f:
-        config_string = '[SECTION]\n' + f.read()
+    if not os.path.exists(path):
+        sys.exit(
+            f"\nERROR: no .env found at {path}\n"
+            f"Copy code/env-example to code/.env and fill in the POSTGRES_* values.\n"
+        )
+    with open(path, "r") as f:
+        config_string = "[SECTION]\n" + f.read()
     config = configparser.ConfigParser()
     config.read_string(config_string)
-    return config['SECTION']
+    return config["SECTION"]
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +291,7 @@ def flush(
 def main():
     setup_logging()
 
-    config = read_config('../../.env')
+    config = read_config('../../../.env')
     db = Postgress(
         server=config['POSTGRES_SERVER'],
         database=config['POSTGRES_DB'],

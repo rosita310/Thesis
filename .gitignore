@@ -11,6 +11,6 @@ geckodriver.log
 solution/.env
 venv
 logs
-/solution/SelfReview/Springer/data
-/solution/SelfReview/Springer/progress.json
-/solution/SelfReview/Springer/.chrome_profile
+/solution/SelfReview/Springer/scraper/data
+/solution/SelfReview/Springer/scraper/progress.json
+/solution/SelfReview/Springer/scraper/.chrome_profile
