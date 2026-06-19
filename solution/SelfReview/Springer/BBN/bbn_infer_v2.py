@@ -1,7 +1,7 @@
 """
 BBN V2 inference for the self-review case study (SQ1.1) -- per-gap plate model.
 
-The latent node is F = is_genuine in {genuine, not_genuine} (presumption of
+The latent node is G = is_genuine in {genuine, not_genuine} (presumption of
 innocence: the named state is innocence; we escalate cases whose genuineness is
 implausibly low). Reads bbn_baselines/bbn_v2_baseline_<journal>.json (from
 bbn_extract_v2.py) and, for each investigated author, multiplies the per-gap

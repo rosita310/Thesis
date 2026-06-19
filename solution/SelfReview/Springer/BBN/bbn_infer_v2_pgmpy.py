@@ -1,9 +1,9 @@
 """
 pgmpy cross-check of the hand-rolled V2 inference.
 
-Builds the SAME per-author Bayesian network in pgmpy -- F = is_genuine as the
+Builds the SAME per-author Bayesian network in pgmpy -- G = is_genuine as the
 latent root, one observed gap node per gap, each gap's CPT being the journal-
-specific genuine column for F=genuine and the alpha-mixture for F=not_genuine --
+specific genuine column for G=genuine and the alpha-mixture for G=not_genuine --
 runs exact VariableElimination, and prints the pgmpy posterior P(genuine) beside
 the hand-rolled one. They should agree to ~1e-9.
 
@@ -44,7 +44,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Build the per-author network and query P(F=genuine | all gaps)
+# Build the per-author network and query P(G=genuine | all gaps)
 # ---------------------------------------------------------------------------
 
 def not_genuine_column(genuine, alpha):
@@ -55,29 +55,29 @@ def not_genuine_column(genuine, alpha):
 def pgmpy_query(genuine_columns, observed_bins, alpha, prior_genuine, bins):
     """genuine_columns: list of P(b|genuine) dicts (one per gap); observed_bins: their z-bins."""
     model = BN()
-    model.add_node("F")
-    # F = is_genuine; state order [genuine, not_genuine]
-    cpds = [TabularCPD("F", 2, [[prior_genuine], [1 - prior_genuine]],
-                       state_names={"F": ["genuine", "not_genuine"]})]
+    model.add_node("G")
+    # G = is_genuine; state order [genuine, not_genuine]
+    cpds = [TabularCPD("G", 2, [[prior_genuine], [1 - prior_genuine]],
+                       state_names={"G": ["genuine", "not_genuine"]})]
     for i, genuine in enumerate(genuine_columns):
         ng = not_genuine_column(genuine, alpha)
         node = f"g{i}"
-        model.add_edge("F", node)
-        # rows = gap bins (in `bins` order); columns = F states [genuine, not_genuine]
+        model.add_edge("G", node)
+        # rows = gap bins (in `bins` order); columns = G states [genuine, not_genuine]
         values = [[genuine[b], ng[b]] for b in bins]
         cpds.append(TabularCPD(node, len(bins), values,
-                               evidence=["F"], evidence_card=[2],
-                               state_names={node: bins, "F": ["genuine", "not_genuine"]}))
+                               evidence=["G"], evidence_card=[2],
+                               state_names={node: bins, "G": ["genuine", "not_genuine"]}))
     model.add_cpds(*cpds)
     model.check_model()
 
     infer = VariableElimination(model)
     evidence = {f"g{i}": b for i, b in enumerate(observed_bins)}
     try:
-        q = infer.query(["F"], evidence=evidence, show_progress=False)
+        q = infer.query(["G"], evidence=evidence, show_progress=False)
     except TypeError:                       # older pgmpy without show_progress
-        q = infer.query(["F"], evidence=evidence)
-    return float(q.values[q.state_names["F"].index("genuine")])
+        q = infer.query(["G"], evidence=evidence)
+    return float(q.values[q.state_names["G"].index("genuine")])
 
 
 def hand_one_author(genuine_columns, observed_bins, alpha, prior_genuine, bins):
