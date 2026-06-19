@@ -2,16 +2,18 @@
 BBN V2 baseline extraction for the self-review case study (SQ1.1).
 
 V2 model = per-gap (plate) network. For each gap an author has, the network
-instantiates one gap node whose parents are (is_fraudster, article_type, pages).
+instantiates one gap node whose parents are (is_genuine, article_type, pages).
 Gaps are the conditionally-independent unit of evidence (fixes V1's
 double-counting), and each gap is judged by its OWN journal's CPT.
 
 This script produces the data both halves of V2 need:
 
-  1. The JOURNAL-SPECIFIC honest baseline  P(gap-bin | type, pages)  for every
-     journal, from that journal's own papers (suspects excluded). This is the
-     `is_fraudster = false` row of the tied gap-CPT; the `= true` row is built
-     at inference time as the alpha-mixture  alpha*manip + (1-alpha)*honest.
+  1. The JOURNAL-SPECIFIC genuine baseline  P(gap-bin | type, pages)  for every
+     journal, from that journal's own papers -- the peer distribution, suspects
+     excluded, taken as P(gap | genuine) since manipulators are a negligible
+     fraction of the peer group. This is the `is_genuine = true` row of the tied
+     gap-CPT; the `= false` (not genuine) row is built at inference time as the
+     alpha-mixture  alpha*manip + (1-alpha)*genuine.
 
   2. Each investigated author's FULL list of gaps across all journals, with each
      gap's within-journal z, z-bin, article-type bin and pages bin -- the
@@ -63,9 +65,9 @@ GAP_FLOOR_DAYS = 0.5
 MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to define z
 
 # z-bins, refined on the fast (left) tail so the model has resolution where
-# fraud lives. Edges are upper z-thresholds, fastest first; easy to retune.
+# manipulation lives. Edges are upper z-thresholds, fastest first; easy to retune.
 # `mild_fast` lets a systematically (not just extremely) fast author accumulate
-# evidence. The slow side stays coarse — fraud never makes a review slower.
+# evidence. The slow side stays coarse — manipulation never makes a review slower.
 Z_EDGES = [(-4.0, "very_extreme"), (-2.0, "extreme"), (-1.0, "mild_fast"), (float("inf"), "typical")]
 Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme"]
 def bin_z(z):
@@ -190,23 +192,23 @@ def main():
     print(f"Usable gaps: {len(papers)} (0-day floored: {zero_gaps}; negative excluded: {neg_gaps}); "
           f"journals with z reference: {len(journal_ref)}")
 
-    # --- pooled honest z distribution (to judge / retune the bin edges) ----
-    honest_z = [p["z"] for p in papers.values()
-                if p["z"] is not None
-                and not any(n in SUSPECTS for n in doi_to_authors.get(p["doi"], ()))]
-    if honest_z:
-        q = statistics.quantiles(honest_z, n=100, method="inclusive")
+    # --- pooled genuine-baseline z distribution (to judge / retune bin edges) ----
+    genuine_z = [p["z"] for p in papers.values()
+                 if p["z"] is not None
+                 and not any(n in SUSPECTS for n in doi_to_authors.get(p["doi"], ()))]
+    if genuine_z:
+        q = statistics.quantiles(genuine_z, n=100, method="inclusive")
         pct = {p: q[p - 1] for p in (1, 2, 5, 10, 15, 25, 50)}
-        print("Pooled honest z percentiles: "
+        print("Pooled genuine z percentiles: "
               + ", ".join(f"p{p}={v:+.2f}" for p, v in pct.items()))
         pooled_bins = defaultdict(int)
-        for z in honest_z:
+        for z in genuine_z:
             pooled_bins[bin_z(z)] += 1
-        n = len(honest_z)
-        print("Pooled honest bin shares:   "
+        n = len(genuine_z)
+        print("Pooled genuine bin shares:    "
               + ", ".join(f"{b}={pooled_bins[b]/n:.4f}" for b in Z_BINS))
 
-    # --- JOURNAL-SPECIFIC honest baseline  P(z-bin | type, pages) ----------
+    # --- JOURNAL-SPECIFIC genuine baseline  P(z-bin | genuine, type, pages) ----------
     # counts[journal_id][stratum_key][z_bin]; suspect-authored papers excluded.
     counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for p in papers.values():
@@ -245,7 +247,7 @@ def main():
                               "gaps": gaps}
 
     # --- report ------------------------------------------------------------
-    print(f"\n=== Honest baseline for the outlier's journal {JOURNAL_ID} "
+    print(f"\n=== Genuine baseline for the outlier's journal {JOURNAL_ID} "
           f"(counts; suspects excluded) ===")
     jb = journals_out.get(JOURNAL_ID, {}).get("baseline_counts", {})
     for sk in sorted(jb):

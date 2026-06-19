@@ -1,14 +1,14 @@
 """
 pgmpy cross-check of the hand-rolled V2 inference.
 
-Builds the SAME per-author Bayesian network in pgmpy -- F = is_fraudster as the
+Builds the SAME per-author Bayesian network in pgmpy -- F = is_genuine as the
 latent root, one observed gap node per gap, each gap's CPT being the journal-
-specific honest column for F=false and the alpha-mixture for F=true -- runs exact
-VariableElimination, and prints the pgmpy posterior beside the hand-rolled one.
-They should agree to ~1e-9.
+specific genuine column for F=genuine and the alpha-mixture for F=not_genuine --
+runs exact VariableElimination, and prints the pgmpy posterior P(genuine) beside
+the hand-rolled one. They should agree to ~1e-9.
 
 This validates the claim that bbn_infer_v2.py's closed form
-    posterior_odds = prior_odds * PRODUCT_gaps LR(gap)
+    posterior_odds(genuine) = prior_odds(genuine) * PRODUCT_gaps LR(gap)
 IS exact Bayesian-network inference on this structure (a naive-Bayes polytree),
 not an approximation.
 
@@ -44,29 +44,30 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Build the per-author network and query P(F=true | all gaps)
+# Build the per-author network and query P(F=genuine | all gaps)
 # ---------------------------------------------------------------------------
 
-def fraud_column(honest, alpha):
-    """alpha-mixture fraud column for one gap: alpha*manip + (1-alpha)*honest."""
-    return {b: alpha * v2.MANIP_DIST[b] + (1 - alpha) * honest[b] for b in honest}
+def not_genuine_column(genuine, alpha):
+    """alpha-mixture not-genuine column for one gap: alpha*manip + (1-alpha)*genuine."""
+    return {b: alpha * v2.MANIP_DIST[b] + (1 - alpha) * genuine[b] for b in genuine}
 
 
-def pgmpy_query(honest_columns, observed_bins, alpha, prior, bins):
-    """honest_columns: list of honest dicts (one per gap); observed_bins: their z-bins."""
+def pgmpy_query(genuine_columns, observed_bins, alpha, prior_genuine, bins):
+    """genuine_columns: list of P(b|genuine) dicts (one per gap); observed_bins: their z-bins."""
     model = BN()
     model.add_node("F")
-    cpds = [TabularCPD("F", 2, [[1 - prior], [prior]],
-                       state_names={"F": ["false", "true"]})]
-    for i, honest in enumerate(honest_columns):
-        fraud = fraud_column(honest, alpha)
+    # F = is_genuine; state order [genuine, not_genuine]
+    cpds = [TabularCPD("F", 2, [[prior_genuine], [1 - prior_genuine]],
+                       state_names={"F": ["genuine", "not_genuine"]})]
+    for i, genuine in enumerate(genuine_columns):
+        ng = not_genuine_column(genuine, alpha)
         node = f"g{i}"
         model.add_edge("F", node)
-        # rows = gap bins (in `bins` order); columns = F states [false, true]
-        values = [[honest[b], fraud[b]] for b in bins]
+        # rows = gap bins (in `bins` order); columns = F states [genuine, not_genuine]
+        values = [[genuine[b], ng[b]] for b in bins]
         cpds.append(TabularCPD(node, len(bins), values,
                                evidence=["F"], evidence_card=[2],
-                               state_names={node: bins, "F": ["false", "true"]}))
+                               state_names={node: bins, "F": ["genuine", "not_genuine"]}))
     model.add_cpds(*cpds)
     model.check_model()
 
@@ -76,14 +77,15 @@ def pgmpy_query(honest_columns, observed_bins, alpha, prior, bins):
         q = infer.query(["F"], evidence=evidence, show_progress=False)
     except TypeError:                       # older pgmpy without show_progress
         q = infer.query(["F"], evidence=evidence)
-    return float(q.values[q.state_names["F"].index("true")])
+    return float(q.values[q.state_names["F"].index("genuine")])
 
 
-def hand_one_author(honest_columns, observed_bins, alpha, prior, bins):
-    """Hand-rolled posterior using the same LR formula as bbn_infer_v2."""
-    odds = prior / (1 - prior)
-    for honest, b in zip(honest_columns, observed_bins):
-        odds *= (1 - alpha) + alpha * v2.MANIP_DIST[b] / honest[b]
+def hand_one_author(genuine_columns, observed_bins, alpha, prior_genuine, bins):
+    """Hand-rolled P(genuine) using the same LR formula as bbn_infer_v2."""
+    odds = prior_genuine / (1 - prior_genuine)
+    for genuine, b in zip(genuine_columns, observed_bins):
+        ng = alpha * v2.MANIP_DIST[b] + (1 - alpha) * genuine[b]
+        odds *= genuine[b] / ng
     return odds / (1 + odds)
 
 
@@ -93,13 +95,13 @@ def hand_one_author(honest_columns, observed_bins, alpha, prior, bins):
 
 def selftest():
     bins = ["typical", "mild_fast", "extreme", "very_extreme"]
-    honest = {"typical": 0.90, "mild_fast": 0.06, "extreme": 0.03, "very_extreme": 0.01}
-    alpha, prior = 0.10, 0.05
-    cols = [honest, honest]                 # two gaps
-    obs = ["very_extreme", "typical"]       # one extreme, one normal
-    hand = hand_one_author(cols, obs, alpha, prior, bins)
-    pg = pgmpy_query(cols, obs, alpha, prior, bins)
-    print(f"SELFTEST  hand={hand:.9f}  pgmpy={pg:.9f}  |diff|={abs(hand-pg):.2e}  "
+    genuine = {"typical": 0.90, "mild_fast": 0.06, "extreme": 0.03, "very_extreme": 0.01}
+    alpha, prior_genuine = 0.10, 0.95
+    cols = [genuine, genuine]               # two gaps
+    obs = ["very_extreme", "typical"]       # one suspicious, one normal
+    hand = hand_one_author(cols, obs, alpha, prior_genuine, bins)
+    pg = pgmpy_query(cols, obs, alpha, prior_genuine, bins)
+    print(f"SELFTEST  P(genuine): hand={hand:.9f}  pgmpy={pg:.9f}  |diff|={abs(hand-pg):.2e}  "
           f"-> {'MATCH' if abs(hand - pg) < 1e-6 else 'MISMATCH'}")
 
 
@@ -121,19 +123,20 @@ def main():
     journals = data["journals"]
     suspects = data["suspects"]
     pooled = v2.build_pooled(journals, bins)
-    alpha, prior = v2.ALPHA, v2.PRIOR_FRAUD
+    alpha, prior_genuine = v2.ALPHA, v2.PRIOR_GENUINE
 
-    print(f"Cross-check vs pgmpy ({BN.__name__}) | alpha={alpha} prior={prior}\n")
+    print(f"Cross-check vs pgmpy ({BN.__name__}) | P(genuine) | alpha={alpha} prior={prior_genuine}\n")
     print(f"  {'author':<22} {'hand':>11} {'pgmpy':>11} {'|diff|':>10}")
     maxdiff = 0.0
     for name, s in suspects.items():
         if not s["gaps"]:
             continue
-        cols = [v2.honest_dist(journals, pooled, bins, g["journal_id"],
-                               g["type_bin"], g["pages_bin"])[0] for g in s["gaps"]]
+        cols = [v2.genuine_dist(journals, pooled, bins, g["journal_id"],
+                                g["type_bin"], g["pages_bin"])[0] for g in s["gaps"]]
         obs = [g["z_bin"] for g in s["gaps"]]
-        hand = hand_one_author(cols, obs, alpha, prior, bins)
-        pg = pgmpy_query(cols, obs, alpha, prior, bins)
+        # hand side uses the actual module function, so this validates the real code path
+        hand, _ = v2.author_posterior(s["gaps"], journals, pooled, bins, alpha, prior_genuine)
+        pg = pgmpy_query(cols, obs, alpha, prior_genuine, bins)
         maxdiff = max(maxdiff, abs(hand - pg))
         print(f"  {name:<22} {hand:>11.6f} {pg:>11.6f} {abs(hand - pg):>10.2e}")
     print(f"\n  max |diff| = {maxdiff:.2e}  -> "

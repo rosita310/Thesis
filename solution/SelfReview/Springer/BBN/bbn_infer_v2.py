@@ -1,26 +1,34 @@
 """
 BBN V2 inference for the self-review case study (SQ1.1) -- per-gap plate model.
 
-Reads bbn_baselines/bbn_v2_baseline_<journal>.json (from bbn_extract_v2.py) and,
-for each investigated author, multiplies the per-gap likelihood ratios:
+The latent node is F = is_genuine in {genuine, not_genuine} (presumption of
+innocence: the named state is innocence; we escalate cases whose genuineness is
+implausibly low). Reads bbn_baselines/bbn_v2_baseline_<journal>.json (from
+bbn_extract_v2.py) and, for each investigated author, multiplies the per-gap
+likelihood ratios:
 
-    posterior_odds = prior_odds * PRODUCT_over_gaps  LR(gap_i)
+    posterior_odds(genuine) = prior_odds(genuine) * PRODUCT_over_gaps  LR(gap_i)
 
-    LR(gap) = P(b | fraud, journal, type, pages) / P(b | honest, journal, type, pages)
-            = (1 - alpha) + alpha * P(b | manipulated) / P(b | honest, journal, type, pages)
+    LR(gap) = P(b | genuine, journal, type, pages) / P(b | not_genuine, journal, type, pages)
+            = genuine_b / ( alpha * P(b | manipulated) + (1 - alpha) * genuine_b )
 
-where b is the gap's z-bin. The honest term is the JOURNAL-SPECIFIC empirical
-baseline (each gap judged by its own journal). The fraud term is the
-alpha-mixture: with prob alpha the paper was manipulated (-> near-instant review,
-MANIP_DIST), otherwise it behaves like an honest paper in that journal.
+where b is the gap's z-bin. The genuine term genuine_b is the JOURNAL-SPECIFIC
+empirical baseline -- a genuine author's gaps follow the peer distribution (each
+gap judged by its own journal). The not_genuine branch is the alpha-mixture: a
+fraction alpha of an author's papers are manipulated (-> near-instant review,
+MANIP_DIST), the rest behave genuinely. An incriminating (fast) gap therefore
+yields LR < 1 and *lowers* genuineness.
 
 Only alpha and MANIP_DIST are elicited; the type/pages influence is entirely in
-the empirical honest denominator.
+the empirical genuine baseline.
 
-Honest-baseline back-off ladder (so no hard zeros, and pages=unknown is treated
+Genuine-baseline back-off ladder (so no hard zeros, and pages=unknown is treated
 as missing rather than a category):
     journal type+pages  ->  journal type (pages marginal)  ->  pooled type
 all Laplace-smoothed.
+
+Output is P(is_genuine | evidence); investigation priority = lowest genuineness
+first. This is a ranking to support manual review, never an accusation.
 
 Run from this directory (BBN/) with the project venv:
     python bbn_infer_v2.py
@@ -39,16 +47,18 @@ from collections import defaultdict
 JOURNAL_ID = "10623"
 IN_PATH = os.path.join(os.path.dirname(__file__), "bbn_baselines", f"bbn_v2_baseline_{JOURNAL_ID}.json")
 
-PRIOR_FRAUD = 0.05
-PRIOR_SWEEP = [0.01, 0.02, 0.05, 0.10, 0.20]
+# Prior probability that an author is genuine (high, by presumption of innocence).
+PRIOR_GENUINE = 0.95
+PRIOR_GENUINE_SWEEP = [0.99, 0.98, 0.95, 0.90, 0.80]
 
-ALPHA = 0.10                              # fraction of papers a fraudster manipulates
+ALPHA = 0.10                              # fraction of a non-genuine author's papers that are manipulated
 ALPHA_SWEEP = [0.02, 0.05, 0.10, 0.25, 0.50]
 
-# What a manipulated paper's gap looks like. Most mass on the extreme bins
-# (self-review is usually a big speedup); mild_fast is now armed above the ~0.13
-# honest rate so a chronically slightly-fast author accumulates evidence (at the
-# cost of specificity vs an efficient honest author). Keys must match z_bins; sums to 1.
+# What a manipulated paper's gap looks like (the not_genuine component). Most mass
+# on the extreme bins (self-review is usually a big speedup); mild_fast is armed
+# above the ~0.13 genuine rate so a chronically slightly-fast author still loses
+# genuineness (at the cost of specificity vs an efficient genuine author).
+# Keys must match z_bins; sums to 1.
 MANIP_DIST = {"typical": 0.0, "mild_fast": 0.25, "extreme": 0.25, "very_extreme": 0.50}
 
 LAPLACE = 0.5
@@ -63,7 +73,7 @@ def confidence_band(n_gaps):
 
 
 # ---------------------------------------------------------------------------
-# Honest baseline with back-off
+# Genuine baseline with back-off  (= P(gap | genuine, journal, type, pages))
 # ---------------------------------------------------------------------------
 
 def smooth(counts, bins):
@@ -82,8 +92,8 @@ def build_pooled(journals, bins):
     return pooled
 
 
-def honest_dist(journals, pooled, bins, jid, tbin, pbin):
-    """Return (smoothed distribution, level-label) via the back-off ladder."""
+def genuine_dist(journals, pooled, bins, jid, tbin, pbin):
+    """Return (smoothed P(bin | genuine, journal, type, pages), level-label) via back-off."""
     jbase = journals.get(jid, {}).get("baseline_counts", {})
 
     # level 1: journal-specific type+pages (only if pages known)
@@ -106,24 +116,26 @@ def honest_dist(journals, pooled, bins, jid, tbin, pbin):
 
 
 # ---------------------------------------------------------------------------
-# Inference
+# Inference  (in genuine-space: LR favours genuine when < 1 it lowers it)
 # ---------------------------------------------------------------------------
 
-def gap_lr(gap, honest, alpha):
+def gap_lr(gap, gdist, alpha):
+    """P(b | genuine) / P(b | not_genuine); < 1 for a suspiciously fast gap."""
     b = gap["z_bin"]
-    denom = honest[b]
-    return (1 - alpha) + alpha * MANIP_DIST[b] / denom
+    g = gdist[b]
+    not_genuine = alpha * MANIP_DIST[b] + (1 - alpha) * g
+    return g / not_genuine
 
 
-def author_posterior(gaps, journals, pooled, bins, alpha, prior, want_detail=False):
-    odds = prior / (1 - prior)
+def author_posterior(gaps, journals, pooled, bins, alpha, prior_genuine, want_detail=False):
+    odds = prior_genuine / (1 - prior_genuine)
     detail = []
     for g in gaps:
-        honest, level = honest_dist(journals, pooled, bins, g["journal_id"], g["type_bin"], g["pages_bin"])
-        lr = gap_lr(g, honest, alpha)
+        gdist, level = genuine_dist(journals, pooled, bins, g["journal_id"], g["type_bin"], g["pages_bin"])
+        lr = gap_lr(g, gdist, alpha)
         odds *= lr
         if want_detail:
-            detail.append((g, lr, level, honest[g["z_bin"]]))
+            detail.append((g, lr, level, gdist[g["z_bin"]]))
     return odds / (1 + odds), detail
 
 
@@ -142,19 +154,20 @@ def main():
     suspects = data["suspects"]
     pooled = build_pooled(journals, bins)
 
-    print(f"Model: {data['model']} | alpha={ALPHA} | prior={PRIOR_FRAUD} | MANIP_DIST={MANIP_DIST}")
+    print(f"Model: {data['model']} | alpha={ALPHA} | prior P(genuine)={PRIOR_GENUINE} | MANIP_DIST={MANIP_DIST}")
 
     # --- detailed per-gap breakdown at the default settings ---------------
-    print(f"\n=== PER-GAP CONTRIBUTIONS (alpha={ALPHA}, prior={PRIOR_FRAUD}) ===")
+    print(f"\n=== PER-GAP CONTRIBUTIONS (alpha={ALPHA}, prior P(genuine)={PRIOR_GENUINE}) ===")
+    print("  (LR<1 lowers genuineness; a genuine author's gaps match the peer baseline)")
     results = []
     for name, s in suspects.items():
-        post, detail = author_posterior(s["gaps"], journals, pooled, bins, ALPHA, PRIOR_FRAUD, True)
+        post, detail = author_posterior(s["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, True)
         results.append((name, post, s["n_gaps"]))
-        print(f"\n  {name!r}  ->  P(fraud) = {post:.3f}   "
+        print(f"\n  {name!r}  ->  P(genuine) = {post:.3f}   "
               f"(n_gaps={s['n_gaps']}, confidence={confidence_band(s['n_gaps'])})")
-        for g, lr, level, p_honest in detail[:6]:
+        for g, lr, level, p_genuine in detail[:6]:
             print(f"     z={g['z']:>7} {g['z_bin']:<12} j={g['journal_id']:<7} "
-                  f"honest_p={p_honest:.4f} [{level:<17}]  LR={lr:>7.2f}")
+                  f"genuine_p={p_genuine:.4f} [{level:<17}]  LR={lr:>6.3f}")
         if len(detail) > 6:
             extra = detail[6:]
             prod = 1.0
@@ -162,28 +175,28 @@ def main():
                 prod *= lr
             print(f"     ... (+{len(extra)} more gaps, combined LR={prod:.3f})")
 
-    print("\n=== RANKING (investigation priority; NOT a guilt ordering) ===")
-    print("  (identical incriminating gap shared by all; rank reflects how much")
-    print("   clean record exonerates each, plus how much record exists at all)")
-    for name, post, n in sorted(results, key=lambda r: -r[1]):
-        print(f"  {post:.3f}  {name:<22} n_gaps={n:<3} confidence={confidence_band(n)}")
+    print("\n=== INVESTIGATION PRIORITY (lowest genuineness first; NOT a guilt ordering) ===")
+    print("  (identical suspicious gap shared by all; rank reflects how much clean")
+    print("   record restores genuineness, plus how much record exists at all)")
+    for name, post, n in sorted(results, key=lambda r: r[1]):
+        print(f"  P(genuine)={post:.3f}  {name:<22} n_gaps={n:<3} confidence={confidence_band(n)}")
 
     # --- sweeps -----------------------------------------------------------
     names = [r[0] for r in results]
     short = {n: n.split()[-1] for n in names}
 
-    print(f"\n=== ALPHA SENSITIVITY (prior={PRIOR_FRAUD}) ===")
+    print(f"\n=== ALPHA SENSITIVITY  (P(genuine), prior={PRIOR_GENUINE}) ===")
     print("  alpha  " + "  ".join(f"{short[n]:>11}" for n in names))
     for a in ALPHA_SWEEP:
         line = f"  {a:<6}"
         for n in names:
-            p, _ = author_posterior(suspects[n]["gaps"], journals, pooled, bins, a, PRIOR_FRAUD)
+            p, _ = author_posterior(suspects[n]["gaps"], journals, pooled, bins, a, PRIOR_GENUINE)
             line += f"  {p:>11.3f}"
         print(line)
 
-    print(f"\n=== PRIOR SENSITIVITY (alpha={ALPHA}) ===")
-    print("  prior  " + "  ".join(f"{short[n]:>11}" for n in names))
-    for pr in PRIOR_SWEEP:
+    print(f"\n=== PRIOR SENSITIVITY  (P(genuine), alpha={ALPHA}) ===")
+    print("  P(gen)0 " + "  ".join(f"{short[n]:>11}" for n in names))
+    for pr in PRIOR_GENUINE_SWEEP:
         line = f"  {pr:<6}"
         for n in names:
             p, _ = author_posterior(suspects[n]["gaps"], journals, pooled, bins, ALPHA, pr)
