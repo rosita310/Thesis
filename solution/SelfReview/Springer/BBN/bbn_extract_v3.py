@@ -15,9 +15,12 @@ evidence). What changed in V3:
 
   * DATA-DERIVED Z-EDGES (stappenplan "Vooraf B"). The fixed z = -1/-2/-4 cuts are
     replaced by the pooled percentiles of the standardized log-gap z over all
-    journals: very_extreme <= p1 < extreme <= p5 < mild_fast <= p15 < typical.
-    The edges actually used are written to config.z_edges so `infer` stays in
-    sync automatically (it reads the precomputed z_bin, never re-bins).
+    journals:
+        ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
+        < mild_fast <= p15 < typical.
+    The extra p0.1 cut keeps tail magnitude (a z=-9 corpus outlier is not lumped
+    with a z~-2.9 p1 gap). The edges actually used are written to config.z_edges
+    so `infer` stays in sync automatically (it reads the precomputed z_bin).
 
   * NO baseline exclusion here. The baseline counts include every usable paper;
     leave-one-AUTHOR exclusion is applied at inference time (so each author is
@@ -65,15 +68,28 @@ MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to d
 # Vooraf B: z-bin edges are the pooled percentiles of the standardized log-gap z.
 # Edges are upper z-thresholds, fastest first. Refined on the fast (left) tail so
 # the model has resolution where manipulation lives; the slow side stays coarse
-# (manipulation never makes a review slower).
-Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme"]
-PCT_EDGES = [(1, "very_extreme"), (5, "extreme"), (15, "mild_fast")]  # percentile -> bin
+# (manipulation never makes a review slower). The deep tail is split with an extra
+# p0.1 cut (`ultra_extreme`) so a corpus-level outlier (e.g. z=-9) is no longer
+# lumped with a merely-p1 gap (z~-2.9) -- the single coarse bin discarded magnitude.
+Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme", "ultra_extreme"]
+PCT_EDGES = [(0.1, "ultra_extreme"), (1, "very_extreme"), (5, "extreme"), (15, "mild_fast")]
 
 
-def build_z_edges(pooled_z):
+def percentile(sorted_vals, pct):
+    """Linear-interpolated percentile (pct in [0,100]) on an ascending list."""
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    k = (n - 1) * (pct / 100.0)
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return sorted_vals[int(k)]
+    return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
+
+
+def build_z_edges(sorted_z):
     """Derive [(z_threshold, label), ..., (inf, 'typical')] from pooled percentiles."""
-    q = statistics.quantiles(pooled_z, n=100, method="inclusive")  # q[k-1] = k-th pct
-    edges = [(q[p - 1], label) for p, label in PCT_EDGES]
+    edges = [(percentile(sorted_z, pct), label) for pct, label in PCT_EDGES]
     edges.append((float("inf"), "typical"))
     return edges
 
@@ -215,14 +231,14 @@ def main():
         p["pages_bin"] = pages_bin(p["pages"])
 
     # --- Vooraf B: derive z-edges from pooled standardized z ----------------
-    pooled_z = [p["z"] for p in papers.values() if p["z"] is not None]
-    if not pooled_z:
+    sorted_z = sorted(p["z"] for p in papers.values() if p["z"] is not None)
+    if not sorted_z:
         raise SystemExit("No usable z values; cannot derive bin edges.")
-    z_edges = build_z_edges(pooled_z)
+    z_edges = build_z_edges(sorted_z)
     bin_z = make_bin_z(z_edges)
 
-    q = statistics.quantiles(pooled_z, n=100, method="inclusive")
-    percentiles = {f"p{p}": round(q[p - 1], 4) for p in (1, 2, 5, 10, 15, 25, 50)}
+    percentiles = {f"p{p}": round(percentile(sorted_z, p), 4)
+                   for p in (0.1, 0.5, 1, 2, 5, 10, 15, 25, 50)}
 
     for p in papers.values():
         p["z_bin"] = bin_z(p["z"]) if p["z"] is not None else None

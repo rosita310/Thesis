@@ -59,21 +59,18 @@ PRIOR_GENUINE_SWEEP = [0.99, 0.98, 0.95, 0.90, 0.80]
 ALPHA = 0.10                              # fraction of a non-genuine author's papers that are manipulated
 ALPHA_SWEEP = [0.02, 0.05, 0.10, 0.25, 0.50]
 
-# What a manipulated paper's gap looks like (the not_genuine component). Keys must
-# match z_bins; sums to 1. typical=0 is what makes LR_typical = 1/(1-alpha).
-MANIP_DIST = {"typical": 0.0, "mild_fast": 0.25, "extreme": 0.25, "very_extreme": 0.50}
+# What a manipulated paper's gap looks like (the not_genuine component) -- the one
+# elicited piece. Keys must match z_bins; sums to 1. Mass concentrates on the deep
+# tail (manipulation -> near-instant review); mild_fast is kept above its ~0.10
+# genuine rate so chronic-mild behavior still accumulates. typical=0 makes
+# LR_typical = 1/(1-alpha). Sensitivity is reported via the alpha sweep.
+MANIP_DIST = {"typical": 0.0, "mild_fast": 0.15, "extreme": 0.20,
+              "very_extreme": 0.25, "ultra_extreme": 0.40}
 
 LAPLACE = 0.5
 MIN_STRATUM = 30                          # papers needed (post-exclusion) to trust a journal stratum
-SHORTLIST_THRESHOLD = 0.50                # P(genuine) below this -> reported shortlist + full onderbouwing
+SHORTLIST_THRESHOLD = 0.50                # P(genuine) below this -> reported shortlist + full evidence breakdown
 SWEEP_PRINT_CAP = 12                      # cap printed sensitivity rows
-
-
-def confidence_band(n_gaps):
-    """How much record we have to contextualize the verdict (NOT strength of guilt)."""
-    if n_gaps <= 2:  return "low"
-    if n_gaps <= 9:  return "medium"
-    return "high"
 
 
 def sigmoid(log_odds):
@@ -211,8 +208,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR_GENUINE):
             "name": name, "p_genuine": post, "log10_odds": log_odds / math.log(10),
             "n_gaps": len(gaps), "n_nontypical": nontyp,
             "n_journals": len({g["journal_id"] for g in gaps}),
-            "lowest_z": worst["z"], "lowest_bin": worst["z_bin"],
-            "confidence": confidence_band(len(gaps)), "gaps": gaps,
+            "lowest_z": worst["z"], "lowest_bin": worst["z_bin"], "gaps": gaps,
         })
     rows.sort(key=lambda r: r["log10_odds"])   # weight of evidence: orders even when P underflows
     return rows, journals, pooled, bins
@@ -252,7 +248,7 @@ def main():
     # p_genuine is written with full precision so tiny posteriors never read 0.
     rank_path = os.path.join(OUT_DIR, "bbn_v3_ranking.csv")
     cols = ["name", "p_genuine", "log10_odds", "n_gaps", "n_nontypical", "n_journals",
-            "lowest_z", "lowest_bin", "confidence"]
+            "lowest_z", "lowest_bin"]
     with open(rank_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -263,7 +259,7 @@ def main():
             w.writerow({c: out[c] for c in cols})
     print(f"Wrote {rank_path}")
 
-    # --- shortlist JSON (full per-gap onderbouwing) -----------------------
+    # --- shortlist JSON (full per-gap evidence breakdown) -----------------
     shortlist_out = []
     for r in shortlist:
         _, _, detail = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, True)
@@ -272,7 +268,7 @@ def main():
             "name": r["name"], "p_genuine": r["p_genuine"],
             "log10_odds": round(r["log10_odds"], 3),
             "n_gaps": r["n_gaps"], "n_nontypical": r["n_nontypical"],
-            "n_journals": r["n_journals"], "confidence": r["confidence"],
+            "n_journals": r["n_journals"],
             "gaps": detail,
         })
     sl_path = os.path.join(OUT_DIR, "bbn_v3_shortlist.json")
@@ -283,7 +279,7 @@ def main():
                   f, ensure_ascii=False, indent=2)
     print(f"Wrote {sl_path}")
 
-    # --- console: shortlist ranking + a sample onderbouwing ---------------
+    # --- console: shortlist ranking + a sample evidence breakdown ---------
     print("\n=== INVESTIGATION PRIORITY (lowest genuineness first; NOT a guilt ordering) ===")
     print("  (WoE = log10 posterior-odds of genuine; more negative = stronger evidence against."
           " P can underflow but WoE stays ordered. Absolute values are overconfident with large n"
@@ -291,12 +287,11 @@ def main():
     for r in shortlist:
         print(f"  P(genuine)={fmt_p(r['p_genuine']):>9}  WoE={r['log10_odds']:>7.2f}  {r['name']:<28} "
               f"n_gaps={r['n_gaps']:<3} non-typ={r['n_nontypical']:<3} "
-              f"j={r['n_journals']:<2} worst_z={r['lowest_z']:>7} [{r['lowest_bin']}] "
-              f"conf={r['confidence']}")
+              f"j={r['n_journals']:<2} worst_z={r['lowest_z']:>7} [{r['lowest_bin']}]")
 
     if shortlist_out:
         top = shortlist_out[0]
-        print(f"\n=== ONDERBOUWING (lowest-scoring author: {top['name']!r}) ===")
+        print(f"\n=== EVIDENCE BREAKDOWN (lowest-scoring author: {top['name']!r}) ===")
         print("  (LR<1 lowers genuineness; a genuine author's gaps match the peer baseline)")
         for d in top["gaps"][:10]:
             print(f"     z={d['z']:>7} {d['z_bin']:<12} j={d['journal_id']:<7} "
@@ -336,24 +331,27 @@ def _approx(a, b, tol=1e-4):
 
 
 def selftest():
-    bins = ["typical", "mild_fast", "extreme", "very_extreme"]
+    bins = ["typical", "mild_fast", "extreme", "very_extreme", "ultra_extreme"]
     # Journal J1: author papers are INCLUDED in the baseline (as extract emits them);
     # leave-one-author exclusion subtracts them back out at scoring time.
     journals = {
         "J1": {"baseline_counts": {
-            "normal_type|normal": {"typical": 80, "mild_fast": 10, "extreme": 6, "very_extreme": 4},
-            "fast_type|short":    {"typical": 20, "mild_fast": 5,  "extreme": 3, "very_extreme": 2},
+            "normal_type|normal": {"typical": 80, "mild_fast": 10, "extreme": 6,
+                                   "very_extreme": 3, "ultra_extreme": 1},
+            "fast_type|short":    {"typical": 18, "mild_fast": 5, "extreme": 3,
+                                   "very_extreme": 2, "ultra_extreme": 2},
         }},
     }
     pooled = build_pooled(journals, bins)
     P = lambda g, a=ALPHA, pr=PRIOR_GENUINE: score_author(g, journals, pooled, bins, a, pr)[0]
 
-    A = [{"journal_id": "J1", "type_bin": "normal_type", "pages_bin": "normal",
-          "z_bin": "very_extreme", "z": -5.0, "doi": "A1"}]
-    C = [{"journal_id": "J1", "type_bin": "normal_type", "pages_bin": "normal",
-          "z_bin": "typical", "z": 0.2, "doi": "C1"}]
-    D = [{"journal_id": "J1", "type_bin": "fast_type", "pages_bin": "short",
-          "z_bin": "extreme", "z": -3.0, "doi": "D1"}]
+    def gap(zb, z, doi, t="normal_type", p="normal"):
+        return {"journal_id": "J1", "type_bin": t, "pages_bin": p, "z_bin": zb, "z": z, "doi": doi}
+
+    A = [gap("very_extreme", -5.0, "A1")]
+    C = [gap("typical", 0.2, "C1")]
+    D = [gap("extreme", -3.0, "D1", t="fast_type", p="short")]
+    E = [gap("ultra_extreme", -9.0, "E1")]
 
     ok = True
     def check(name, cond):
@@ -361,41 +359,51 @@ def selftest():
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
         ok = ok and cond
 
-    # 1. leave-one-author posterior for the single very_extreme paper (hand-computed)
-    #    LOO: very_extreme 4->3, total 99>=30 -> level1; smooth total 99+2=101
-    #    genuine_p=(3+.5)/101=.0346535; not_g=.1*.5+.9*g=.0811881; LR=.426832
-    #    odds=19*.426832=8.10981; P=8.10981/9.10981=.890228
+    # 1. leave-one-author posterior for a single very_extreme paper (hand-computed,
+    #    5 bins, MANIP very_extreme=0.25). LOO: ve 3->2, total 99>=30 -> level1;
+    #    smooth denom 99+0.5*5=101.5; g=(2+.5)/101.5=.0246305;
+    #    not_g=.1*.25+.9*g=.0471675; LR=.522197; odds=19*LR=9.92174; P=.908438
     pA = P(A)
-    check(f"LOO very_extreme posterior == 0.8902  (got {pA:.6f})", _approx(pA, 0.890228))
+    check(f"LOO very_extreme posterior == 0.9084  (got {pA:.6f})", _approx(pA, 0.908438))
 
     # 2. without exclusion the same author looks MORE genuine
-    #    (recompute the gap with an empty own-list = no leave-one-author)
-    g0, lvl0 = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", [])
+    #    g=(3+.5)/(100+2.5)=.0341463; not_g=.025+.9*g=.0557317; LR=.612691; P=.920895
+    g0, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", [])
     lr0 = gap_lr("very_extreme", g0, ALPHA)
     odds0 = (PRIOR_GENUINE / (1 - PRIOR_GENUINE)) * lr0
     p_noloo = odds0 / (1 + odds0)
-    check(f"no-exclusion posterior == 0.9032  (got {p_noloo:.6f})", _approx(p_noloo, 0.903234))
+    check(f"no-exclusion posterior == 0.9209  (got {p_noloo:.6f})", _approx(p_noloo, 0.920895))
     check("leave-one-author LOWERS genuineness for the anomaly", pA < p_noloo)
 
-    # 3. LR_typical == 1/(1-alpha) exactly, independent of counts/back-off
+    # 3. finer tail separates magnitude: an ultra_extreme gap is far more incriminating
+    #    than a very_extreme one in the SAME stratum (the whole point of the p0.1 cut).
+    g_ve, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", A)
+    g_ue, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", E)
+    lr_ve = gap_lr("very_extreme", g_ve, ALPHA)
+    lr_ue = gap_lr("ultra_extreme", g_ue, ALPHA)
+    check(f"LR_ultra ({lr_ue:.3f}) < LR_very_extreme ({lr_ve:.3f})", lr_ue < lr_ve)
+    check(f"ultra_extreme author scored more suspicious than very_extreme  "
+          f"(P {P(E):.3f} < {P(A):.3f})", P(E) < P(A))
+
+    # 4. LR_typical == 1/(1-alpha) exactly, independent of counts/back-off
     gt, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", C)
     lrt = gap_lr("typical", gt, ALPHA)
     check(f"LR_typical == 1/(1-alpha)=1.11111  (got {lrt:.8f})", _approx(lrt, 1 / (1 - ALPHA), 1e-9))
 
-    # 4. a typical-only author is NOT a candidate; an anomalous one is
-    data = {"papers": {"A1": A[0], "C1": C[0], "D1": D[0]},
-            "author_index": {"AuthA": ["A1"], "AuthC": ["C1"], "AuthD": ["D1"]}}
+    # 5. a typical-only author is NOT a candidate; anomalous ones are
+    data = {"papers": {"A1": A[0], "C1": C[0], "D1": D[0], "E1": E[0]},
+            "author_index": {"AuthA": ["A1"], "AuthC": ["C1"], "AuthD": ["D1"], "AuthE": ["E1"]}}
     cand = {n for n, _ in iter_candidates(data)}
-    check("candidate set = {AuthA, AuthD} (typical-only AuthC excluded)",
-          cand == {"AuthA", "AuthD"})
+    check("candidate set = {AuthA, AuthD, AuthE} (typical-only AuthC excluded)",
+          cand == {"AuthA", "AuthD", "AuthE"})
 
-    # 5. full back-off chain with post-exclusion threshold:
+    # 6. full back-off chain with post-exclusion threshold:
     #    D's fast_type|short has 30; minus D's paper -> 29 < 30 -> journal:type (29) < 30
     #    -> pooled:type (final fallback)
     _, lvlD = genuine_dist(journals, pooled, bins, "J1", "fast_type", "short", D)
     check(f"back-off falls through to pooled:type  (got {lvlD})", lvlD == "pooled:type")
 
-    # 6. ranking orders ascending by P(genuine)
+    # 7. ranking orders ascending by P(genuine) (= ascending weight of evidence)
     rows, *_ = rank_corpus({"config": {"z_bins": bins}, "journals": journals,
                             "papers": data["papers"], "author_index": data["author_index"]})
     ps = [r["p_genuine"] for r in rows]
