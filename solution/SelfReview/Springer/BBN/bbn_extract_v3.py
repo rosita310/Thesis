@@ -8,12 +8,17 @@ evidence). What changed in V3:
   * AUTHOR-CENTRIC, CORPUS-WIDE OUTPUT. No longer bound to 3 hardcoded suspects.
     We emit, once and deduplicated, everything the inference needs to score ANY
     author:
-        journals     -- per-journal genuine baseline counts P(z-bin | type, pages)
-        papers       -- one entry per usable DOI (journal, gap, z, z_bin, bins)
-        author_index -- name -> [doi, ...]  (cross-journal)
-        suspects     -- the original 3 names, kept only as a validation anchor.
+        journals      -- per-journal genuine baseline counts P(z-bin | type, pages)
+        papers        -- one entry per usable DOI (journal, gap, z, z_bin, bins)
+        author_index  -- identity -> [doi, ...]  (cross-journal)
+        author_labels -- identity -> representative display name
+        
+    Author identity is the hybrid ORCID-or-name key (Punt 4): a row's ORCID if
+    springer.author_orcid has one, propagated to that author's ORCID-less rows
+    when the name maps to exactly one ORCID, else the name string. Falls back to
+    name-only identities if springer.author_orcid is absent.
 
-  * DATA-DERIVED Z-EDGES (stappenplan "Vooraf B"). The fixed z = -1/-2/-4 cuts are
+  * DATA-DERIVED Z-EDGES. The fixed z = -1/-2/-4 cuts are
     replaced by the pooled percentiles of the standardized log-gap z over all
     journals:
         ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
@@ -44,7 +49,7 @@ import math
 import os
 import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 # ---------------------------------------------------------------------------
@@ -52,14 +57,6 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 
 SCHEMA = "springer"
-
-# Original case-study co-authors. No longer drive extraction; kept as a labeled
-# subset so downstream validation can find them quickly.
-SUSPECTS = {
-    "R. Radheshwar",
-    "Dibyendu Roy",
-    "Pantelimon Stănică",
-}
 
 HIGH_GAP_CUTOFF_DAYS = 924
 GAP_FLOOR_DAYS = 0.5
@@ -163,14 +160,7 @@ def main():
     args = parser.parse_args()
 
     # DB import kept inside main() so the pure helpers stay importable without pyodbc.
-    try:
-        from database import Postgress
-    except ImportError:
-        sys.path.insert(
-            0,
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "python_packages", "database")),
-        )
-        from database import Postgress
+    from database import Postgress
 
     config = read_config(ENV_PATH)
     db = Postgress(
@@ -190,11 +180,27 @@ def main():
         FROM "{SCHEMA}"."authors"
     """)
 
-    doi_to_authors = defaultdict(list)
     name_to_dois = defaultdict(set)
     for r in author_rows:
-        doi_to_authors[r["doi"]].append(r["name"])
         name_to_dois[r["name"]].add(r["doi"])
+
+    # --- ORCID identity (Punt 4): hybrid key = ORCID where known, else name -----
+    # Load the DBLP->springer ORCID map (springer.author_orcid) if present. A row's
+    # identity = its own ORCID; if it has none but its name maps to exactly ONE
+    # ORCID corpus-wide, propagate that ORCID (consolidate the person's record);
+    # otherwise fall back to the name string.
+    row_orcid, name_orcids = {}, defaultdict(set)
+    if db.table_exists(SCHEMA, "author_orcid"):
+        for r in db.execute_query_result(
+                f'SELECT doi, springer_name, orcid FROM "{SCHEMA}"."author_orcid" '
+                f"WHERE orcid IS NOT NULL AND orcid <> ''"):
+            row_orcid[(r["doi"], r["springer_name"])] = r["orcid"]
+            name_orcids[r["springer_name"]].add(r["orcid"])
+    name_unique_orcid = {n: next(iter(s)) for n, s in name_orcids.items() if len(s) == 1}
+    all_orcids = {o for s in name_orcids.values() for o in s}
+
+    def identity_of(doi, name):
+        return row_orcid.get((doi, name)) or name_unique_orcid.get(name) or name
 
     # --- pass 1: per-paper transform + per-journal reference ----------------
     papers = {}
@@ -230,7 +236,7 @@ def main():
         p["z"] = (p["t"] - ref[0]) / ref[1] if ref else None
         p["pages_bin"] = pages_bin(p["pages"])
 
-    # --- Vooraf B: derive z-edges from pooled standardized z ----------------
+    # --- derive z-edges from pooled standardized z ----------------
     sorted_z = sorted(p["z"] for p in papers.values() if p["z"] is not None)
     if not sorted_z:
         raise SystemExit("No usable z values; cannot derive bin edges.")
@@ -289,20 +295,29 @@ def main():
             "article_type": p["article_type"],
         }
 
-    author_index = {}
-    for name, dois in name_to_dois.items():
-        kept = sorted(d for d in dois if d in papers_out)
-        if kept:
-            author_index[name] = kept
-
-    suspects_out = {n: author_index.get(n, []) for n in SUSPECTS}
+    # group authorships into identities (ORCID-or-name); label = most common name
+    ident_dois = defaultdict(set)
+    ident_names = defaultdict(Counter)
+    for r in author_rows:
+        if r["doi"] not in papers_out:
+            continue
+        ident = identity_of(r["doi"], r["name"])
+        ident_dois[ident].add(r["doi"])
+        ident_names[ident][r["name"]] += 1
+    author_index = {i: sorted(dois) for i, dois in ident_dois.items()}
+    author_labels = {i: cnt.most_common(1)[0][0] for i, cnt in ident_names.items()}
+    n_orcid_ident = sum(1 for i in author_index if i in all_orcids)
 
     # --- report ------------------------------------------------------------
-    print(f"\nCorpus: {len(papers_out)} usable papers, {len(author_index)} authors with >=1 usable paper, "
-          f"{len(journals_out)} journal baselines."
+    print(f"\nCorpus: {len(papers_out)} usable papers, {len(author_index)} author identities "
+          f"with >=1 usable paper, {len(journals_out)} journal baselines."
           + (f"  (restricted to journal {args.journal})" if args.journal else ""))
-    print("Suspect anchor (usable papers each): "
-          + ", ".join(f"{n!r}={len(suspects_out[n])}" for n in SUSPECTS))
+    if all_orcids:
+        print(f"ORCID grouping: {n_orcid_ident}/{len(author_index)} identities ORCID-keyed "
+              f"({n_orcid_ident/max(len(author_index),1):.1%}); "
+              f"{len(name_unique_orcid)} names had a unique ORCID for propagation.")
+    else:
+        print("ORCID grouping: springer.author_orcid not found -> name-only identities.")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(
@@ -321,7 +336,7 @@ def main():
         "journals": journals_out,
         "papers": papers_out,
         "author_index": author_index,
-        "suspects": suspects_out,
+        "author_labels": author_labels,
     }
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2, default=str)

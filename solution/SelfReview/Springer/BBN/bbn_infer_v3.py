@@ -44,7 +44,14 @@ import csv
 import json
 import math
 import os
+import re
 from collections import defaultdict
+
+_ORCID_RE = re.compile(r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$")
+
+
+def _is_orcid(s):
+    return bool(_ORCID_RE.match(s or ""))
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -186,12 +193,13 @@ def score_author(gaps, journals, pooled, bins, alpha, prior_genuine, want_detail
 
 
 def iter_candidates(data):
-    """Yield (name, gaps) for every author with >=1 non-typical gap."""
+    """Yield (identity, label, gaps) for every author with >=1 non-typical gap."""
     papers = data["papers"]
-    for name, dois in data["author_index"].items():
+    labels = data.get("author_labels", {})
+    for ident, dois in data["author_index"].items():
         gaps = [{**papers[d], "doi": d} for d in dois if d in papers]
         if any(g["z_bin"] != "typical" for g in gaps):
-            yield name, gaps
+            yield ident, labels.get(ident, ident), gaps
 
 
 def rank_corpus(data, alpha=ALPHA, prior=PRIOR_GENUINE):
@@ -200,12 +208,13 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR_GENUINE):
     journals = data["journals"]
     pooled = build_pooled(journals, bins)
     rows = []
-    for name, gaps in iter_candidates(data):
+    for ident, label, gaps in iter_candidates(data):
         post, log_odds, _ = score_author(gaps, journals, pooled, bins, alpha, prior)
         nontyp = sum(1 for g in gaps if g["z_bin"] != "typical")
         worst = min(gaps, key=lambda g: g["z"])
         rows.append({
-            "name": name, "p_genuine": post, "log10_odds": log_odds / math.log(10),
+            "name": label, "orcid": ident if _is_orcid(ident) else "",
+            "p_genuine": post, "log10_odds": log_odds / math.log(10),
             "n_gaps": len(gaps), "n_nontypical": nontyp,
             "n_journals": len({g["journal_id"] for g in gaps}),
             "lowest_z": worst["z"], "lowest_bin": worst["z_bin"], "gaps": gaps,
@@ -247,7 +256,7 @@ def main():
     # log10_odds (weight of evidence) is the primary, non-saturating sort key;
     # p_genuine is written with full precision so tiny posteriors never read 0.
     rank_path = os.path.join(OUT_DIR, "bbn_v3_ranking.csv")
-    cols = ["name", "p_genuine", "log10_odds", "n_gaps", "n_nontypical", "n_journals",
+    cols = ["name", "orcid", "p_genuine", "log10_odds", "n_gaps", "n_nontypical", "n_journals",
             "lowest_z", "lowest_bin"]
     with open(rank_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -265,7 +274,7 @@ def main():
         _, _, detail = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, True)
         detail.sort(key=lambda d: d["lr"])  # most incriminating gap first
         shortlist_out.append({
-            "name": r["name"], "p_genuine": r["p_genuine"],
+            "name": r["name"], "orcid": r["orcid"], "p_genuine": r["p_genuine"],
             "log10_odds": round(r["log10_odds"], 3),
             "n_gaps": r["n_gaps"], "n_nontypical": r["n_nontypical"],
             "n_journals": r["n_journals"],
@@ -285,9 +294,10 @@ def main():
           " P can underflow but WoE stays ordered. Absolute values are overconfident with large n"
           " -- the ranking + sensitivity are the reportable output.)")
     for r in shortlist:
+        tag = f" {r['orcid']}" if r["orcid"] else ""
         print(f"  P(genuine)={fmt_p(r['p_genuine']):>9}  WoE={r['log10_odds']:>7.2f}  {r['name']:<28} "
               f"n_gaps={r['n_gaps']:<3} non-typ={r['n_nontypical']:<3} "
-              f"j={r['n_journals']:<2} worst_z={r['lowest_z']:>7} [{r['lowest_bin']}]")
+              f"j={r['n_journals']:<2} worst_z={r['lowest_z']:>7} [{r['lowest_bin']}]{tag}")
 
     if shortlist_out:
         top = shortlist_out[0]
@@ -393,9 +403,18 @@ def selftest():
     # 5. a typical-only author is NOT a candidate; anomalous ones are
     data = {"papers": {"A1": A[0], "C1": C[0], "D1": D[0], "E1": E[0]},
             "author_index": {"AuthA": ["A1"], "AuthC": ["C1"], "AuthD": ["D1"], "AuthE": ["E1"]}}
-    cand = {n for n, _ in iter_candidates(data)}
+    cand = {ident for ident, _, _ in iter_candidates(data)}
     check("candidate set = {AuthA, AuthD, AuthE} (typical-only AuthC excluded)",
           cand == {"AuthA", "AuthD", "AuthE"})
+
+    # ORCID identity -> display label resolved, orcid column populated
+    odata = {"config": {"z_bins": bins}, "journals": journals,
+             "papers": {"P1": A[0]},
+             "author_index": {"0000-0001-2345-6789": ["P1"]},
+             "author_labels": {"0000-0001-2345-6789": "Jane Doe"}}
+    orows = rank_corpus(odata)[0]
+    check("ORCID identity -> name=label and orcid column set",
+          orows[0]["name"] == "Jane Doe" and orows[0]["orcid"] == "0000-0001-2345-6789")
 
     # 6. full back-off chain with post-exclusion threshold:
     #    D's fast_type|short has 30; minus D's paper -> 29 < 30 -> journal:type (29) < 30

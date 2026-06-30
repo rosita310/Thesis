@@ -30,7 +30,7 @@ import json
 import os
 import sys
 
-import bbn_infer_v2 as v2
+import solution.SelfReview.Springer.BBN.archive.bbn_infer_v2 as v2
 
 try:
     try:

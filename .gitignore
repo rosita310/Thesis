@@ -11,7 +11,11 @@ geckodriver.log
 solution/.env
 venv
 logs
+dblp.nt.gz
 /solution/SelfReview/Springer/scraper/data
 /solution/SelfReview/Springer/scraper/progress.json
 /solution/SelfReview/Springer/scraper/.chrome_profile
 /solution/SelfReview/Springer/BBN/bbn_baselines
+/solution/SelfReview/Springer/BBN/dblp_store
+/solution/SelfReview/Springer/BBN/dblp_orcid_raw.tsv
+/solution/SelfReview/Springer/BBN/springer_dois.txt
