@@ -10,6 +10,8 @@ geckodriver.log
 .fake
 solution/.env
 venv
+/solution/SelfReview/ACM/data
+/solution/SelfReview/ACM/progress.json
 logs
 /solution/SelfReview/Springer/data
 /solution/SelfReview/Springer/progress.json
