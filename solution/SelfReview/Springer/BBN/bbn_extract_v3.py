@@ -42,6 +42,7 @@ import configparser
 import json
 import math
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -101,6 +102,37 @@ FAST_TYPE_KEYWORDS = (
     "letter", "preface", "introduction", "book review", "obituary",
     "addendum", "retraction", "foreword", "in memoriam",
 )
+
+# Editorial-signalling TITLE patterns, used to reclassify papers whose
+# `article_type` is generic (e.g. "Article") but whose title marks them as
+# editorial / non-peer-reviewed content -- the leak the field-only classifier
+# misses (a same-day "Editorial: ..." filed as an Article looks incriminating).
+# Matched as a PREFIX (case-insensitive, leading quote/paren/space tolerated) so
+# genuine research titles ("An introduction to ...") are never caught: precision
+# matters because a false reclassification would HIDE a real fast gap.
+FAST_TITLE_PATTERNS = (
+    r"(guest\s+)?editorial\b",
+    r"editor['’`s]*\s+(note|introduction|message|perspective|comment)\b",
+    r"from\s+the\s+editors?\b",
+    r"preface\b",
+    r"foreword\b",
+    r"in\s+memoriam\b",
+    r"obituar(y|ies)\b",
+    r"erratum\b",
+    r"corrigendum\b",
+    r"correction\s+to\b",
+    r"retraction\s+note\b",
+    r"retraction:",
+    r"addendum\b",
+    r"comments?\s+on\b",
+    r"reply\s+to\b",
+    r"response\s+to\s+(the\s+)?comment",
+    r"introduction\s+to\s+the\s+special\s+(issue|section)\b",
+    r"special\s+(issue|section)\s*(?::|on\b)",
+)
+_FAST_TITLE_RE = re.compile(
+    r"^\s*[\"'`(\[]?\s*(?:" + "|".join(FAST_TITLE_PATTERNS) + r")", re.IGNORECASE)
+
 SHORT_PAGES_MAX = 4
 
 ENV_PATH = "../../../.env"      # run from BBN/
@@ -128,9 +160,23 @@ def pages_of(first, last):
     return last - first + 1
 
 
-def type_bin(article_type):
+def title_is_fast(title):
+    """True if the *title* signals editorial / non-peer-reviewed content.
+
+    Anchored at the start of the title (leading quote/paren/space tolerated), so
+    "Editorial: ..." / "Correction to: ..." match while a research paper titled
+    "An introduction to ..." does not. Catches items filed under a generic
+    `article_type` that are editorial in nature."""
+    return bool(title) and _FAST_TITLE_RE.match(title) is not None
+
+
+def type_bin(article_type, title=None):
     t = (article_type or "").lower()
-    return "fast_type" if any(k in t for k in FAST_TYPE_KEYWORDS) else "normal_type"
+    if any(k in t for k in FAST_TYPE_KEYWORDS):
+        return "fast_type"
+    if title_is_fast(title):
+        return "fast_type"
+    return "normal_type"
 
 
 def pages_bin(pages):
@@ -167,7 +213,7 @@ def main():
 
     print("Loading all journals ...")
     articles = db.execute_query_result(f"""
-        SELECT doi, journal_id, received, review_days, article_type, first_page, last_page
+        SELECT doi, journal_id, received, review_days, article_type, title, first_page, last_page
         FROM "{SCHEMA}"."articles"
     """)
     author_rows = db.execute_query_result(f"""
@@ -200,10 +246,15 @@ def main():
     # --- pass 1: per-paper transform + per-journal reference ----------------
     papers = {}
     journal_vals = defaultdict(list)
-    neg_gaps = zero_gaps = 0
+    missing_gaps = neg_gaps = zero_gaps = 0
+    n_title_reclassified = 0
+    title_reclass_sample = []
     for a in articles:
         gap = a["review_days"]
-        if gap is None or gap < 0:
+        if gap is None:            # no received/accepted date -> no computable gap
+            missing_gaps += 1
+            continue
+        if gap < 0:                # acceptance before submission (verified: ~none in corpus)
             neg_gaps += 1
             continue
         if gap == 0:
@@ -211,9 +262,18 @@ def main():
         if gap > HIGH_GAP_CUTOFF_DAYS:
             continue
         t = math.log(max(gap, GAP_FLOOR_DAYS))
+        title = a["title"]
+        tbin_field = type_bin(a["article_type"])        # article_type field only
+        tbin = "fast_type" if (tbin_field == "fast_type" or title_is_fast(title)) else "normal_type"
+        via_title = tbin_field == "normal_type" and tbin == "fast_type"
+        if via_title:
+            n_title_reclassified += 1
+            if len(title_reclass_sample) < 20:
+                title_reclass_sample.append((a["doi"], a["article_type"], title))
         papers[a["doi"]] = {
             "doi": a["doi"], "journal_id": a["journal_id"], "gap": gap, "t": t,
-            "article_type": a["article_type"], "type_bin": type_bin(a["article_type"]),
+            "article_type": a["article_type"], "title": title,
+            "type_bin": tbin, "type_from_title": via_title,
             "pages": pages_of(a["first_page"], a["last_page"]),
         }
         journal_vals[a["journal_id"]].append(t)
@@ -245,8 +305,8 @@ def main():
         p["z_bin"] = bin_z(p["z"]) if p["z"] is not None else None
 
     usable = [p for p in papers.values() if p["z_bin"] is not None]
-    print(f"Usable gaps: {len(usable)} (0-day floored: {zero_gaps}; negative excluded: {neg_gaps}); "
-          f"journals with z reference: {len(journal_ref)}")
+    print(f"Usable gaps: {len(usable)} (0-day floored: {zero_gaps}; missing date excluded: {missing_gaps}; "
+          f"negative excluded: {neg_gaps}); journals with z reference: {len(journal_ref)}")
     print("Pooled z percentiles: " + ", ".join(f"{k}={v:+.2f}" for k, v in percentiles.items()))
     print("z-edges in use:       "
           + ", ".join(f"{lbl}<=({e:+.3f})" if e != float('inf') else f"{lbl}=rest"
@@ -256,6 +316,20 @@ def main():
         pooled_bins[p["z_bin"]] += 1
     print("Pooled bin shares:    "
           + ", ".join(f"{b}={pooled_bins[b]/len(usable):.4f}" for b in Z_BINS))
+
+    # Editorial-title leak: papers rescued from a wrong "normal_type" baseline.
+    # rescued_fast are the actual false positives this fix removes -- editorial
+    # content that would otherwise have contributed an incriminating fast-bin LR.
+    rescued = [p for p in usable if p["type_from_title"]]
+    fast_bins = ("extreme", "very_extreme", "ultra_extreme")
+    rescued_fast = [p for p in rescued if p["z_bin"] in fast_bins]
+    print(f"Editorial-title reclassification: {n_title_reclassified} papers filed under a "
+          f"non-fast article_type but flagged editorial by title;")
+    print(f"   {len(rescued)} are usable gaps, of which {len(rescued_fast)} fall in a fast "
+          f"z-bin (the false positives this fix removes).")
+    for doi, at, tt in title_reclass_sample[:15]:
+        shown = (tt[:70] + "...") if tt and len(tt) > 70 else (tt or "")
+        print(f"     [{at or '?'}] {shown}  ({doi})")
 
     # --- JOURNAL-SPECIFIC genuine baseline counts P(z-bin | type, pages) -----
     # No exclusion here: every usable paper counts. Leave-one-author exclusion is
@@ -287,7 +361,8 @@ def main():
             "journal_id": p["journal_id"], "gap_days": p["gap"],
             "z": round(p["z"], 3), "z_bin": p["z_bin"],
             "type_bin": p["type_bin"], "pages_bin": p["pages_bin"],
-            "article_type": p["article_type"],
+            "article_type": p["article_type"], "title": p["title"],
+            "type_from_title": p["type_from_title"],
         }
 
     # group authorships into identities (ORCID-or-name); label = most common name
@@ -327,6 +402,8 @@ def main():
             "z_bins": Z_BINS,
             "z_percentiles": percentiles,
             "short_pages_max": SHORT_PAGES_MAX,
+            "fast_title_patterns": list(FAST_TITLE_PATTERNS),
+            "n_title_reclassified": n_title_reclassified,
         },
         "journals": journals_out,
         "papers": papers_out,
