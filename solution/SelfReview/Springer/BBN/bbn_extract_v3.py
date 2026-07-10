@@ -1,39 +1,34 @@
 """
-BBN V3 corpus extraction for the self-review case study (SQ1.1).
+BBN corpus extraction for the self-review case study (SQ1.1).
 
-Same per-gap "plate" model as V2 (latent G = is_genuine; one gap node per gap,
-parents (G, article_type, pages); gaps are the conditionally-independent unit of
-evidence). What changed in V3:
+Builds the data that bbn_infer.py needs, from the PostgreSQL `springer` schema.
+The model is a per-gap Bayesian network: one latent node G = is_genuine per
+author, and for each review-time "gap" (days from submission to acceptance) one
+observed node hanging off G with parents (article_type, pages). Gaps are the
+conditionally-independent unit of evidence.
 
-  * AUTHOR-CENTRIC, CORPUS-WIDE OUTPUT. No longer bound to 3 hardcoded suspects.
-    We emit, once and deduplicated, everything the inference needs to score ANY
-    author:
-        journals      -- per-journal genuine baseline counts P(z-bin | type, pages)
-        papers        -- one entry per usable DOI (journal, gap, z, z_bin, bins)
-        author_index  -- identity -> [doi, ...]  (cross-journal)
-        author_labels -- identity -> representative display name
-        
-    Author identity is the hybrid ORCID-or-name key (Punt 4): a row's ORCID if
-    springer.author_orcid has one, propagated to that author's ORCID-less rows
-    when the name maps to exactly one ORCID, else the name string. Falls back to
-    name-only identities if springer.author_orcid is absent.
+Per paper: gap -> t = ln(max(gap_days, GAP_FLOOR_DAYS)), standardized within its
+own journal to z = (t - mean_j) / std_j (sample stats; gaps > HIGH_GAP_CUTOFF_DAYS
+trimmed from the reference). z is discretized with edges set to the pooled
+percentiles of z over all journals -- fast (left) tail refined, slow side coarse:
+    ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
+    < mild_fast <= p15 < typical
+The edges used are written to config.z_edges, so inference reads the precomputed
+z_bin and never re-bins.
 
-  * DATA-DERIVED Z-EDGES. The fixed z = -1/-2/-4 cuts are
-    replaced by the pooled percentiles of the standardized log-gap z over all
-    journals:
-        ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
-        < mild_fast <= p15 < typical.
-    The extra p0.1 cut keeps tail magnitude (a z=-9 corpus outlier is not lumped
-    with a z~-2.9 p1 gap). The edges actually used are written to config.z_edges
-    so `infer` stays in sync automatically (it reads the precomputed z_bin).
+Output (one corpus JSON in bbn_baselines/):
+    journals      -- per-journal genuine baseline counts P(z-bin | type, pages),
+                     over every usable paper (no exclusion here; leave-one-author
+                     exclusion is applied at inference time)
+    papers        -- one entry per usable DOI (journal, gap, z, z_bin, type/pages bins)
+    author_index  -- author identity -> [doi, ...] (cross-journal)
+    author_labels -- identity -> representative display name
+    suspects      -- the 3 case-study names, as a validation anchor
 
-  * NO baseline exclusion here. The baseline counts include every usable paper;
-    leave-one-AUTHOR exclusion is applied at inference time (so each author is
-    judged against peers, not themselves) -- see bbn_infer_v3.py.
-
-z transform & per-journal reference are unchanged from V1/V2:
-  transform = ln(max(gap_days, GAP_FLOOR_DAYS)); per-journal sample mean/std,
-  high outliers (> HIGH_GAP_CUTOFF_DAYS) trimmed from the reference.
+Author identity is a hybrid ORCID-or-name key: a row's ORCID (from
+springer.author_orcid) if present; propagated to that author's ORCID-less rows
+when the name maps to exactly one ORCID corpus-wide; else the name string. Falls
+back to name-only identities if springer.author_orcid is absent.
 
 Run from this directory (BBN/) with the scraper venv (DB via pyodbc):
     python bbn_extract_v3.py                 # whole corpus
@@ -62,12 +57,12 @@ HIGH_GAP_CUTOFF_DAYS = 924
 GAP_FLOOR_DAYS = 0.5
 MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to define z
 
-# Vooraf B: z-bin edges are the pooled percentiles of the standardized log-gap z.
+# z-bin edges are the pooled percentiles of the standardized log-gap z.
 # Edges are upper z-thresholds, fastest first. Refined on the fast (left) tail so
 # the model has resolution where manipulation lives; the slow side stays coarse
 # (manipulation never makes a review slower). The deep tail is split with an extra
 # p0.1 cut (`ultra_extreme`) so a corpus-level outlier (e.g. z=-9) is no longer
-# lumped with a merely-p1 gap (z~-2.9) -- the single coarse bin discarded magnitude.
+# lumped with a merely-p1 gap (z~-2.9).
 Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme", "ultra_extreme"]
 PCT_EDGES = [(0.1, "ultra_extreme"), (1, "very_extreme"), (5, "extreme"), (15, "mild_fast")]
 
@@ -108,7 +103,7 @@ FAST_TYPE_KEYWORDS = (
 )
 SHORT_PAGES_MAX = 4
 
-ENV_PATH = "../../../.env"      # run from BBN/ (matches the V1/V2 scripts)
+ENV_PATH = "../../../.env"      # run from BBN/
 OUT_DIR = os.path.join(os.path.dirname(__file__), "bbn_baselines")
 
 
@@ -184,7 +179,7 @@ def main():
     for r in author_rows:
         name_to_dois[r["name"]].add(r["doi"])
 
-    # --- ORCID identity (Punt 4): hybrid key = ORCID where known, else name -----
+    # ----- ORCID identity: hybrid key = ORCID where known, else name -----
     # Load the DBLP->springer ORCID map (springer.author_orcid) if present. A row's
     # identity = its own ORCID; if it has none but its name maps to exactly ONE
     # ORCID corpus-wide, propagate that ORCID (consolidate the person's record);
@@ -209,7 +204,7 @@ def main():
     for a in articles:
         gap = a["review_days"]
         if gap is None or gap < 0:
-            neg_gaps += (gap is not None and gap < 0)
+            neg_gaps += 1
             continue
         if gap == 0:
             zero_gaps += 1

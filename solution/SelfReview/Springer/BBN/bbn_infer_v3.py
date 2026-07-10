@@ -1,35 +1,39 @@
 """
-BBN V3 inference for the self-review case study (SQ1.1) -- per-gap plate model,
-author-centric and corpus-wide.
+BBN inference for the self-review case study (SQ1.1).
 
-Latent node G = is_genuine in {genuine, not_genuine} (presumption of innocence:
-the named state is innocence; we escalate cases whose genuineness is implausibly
-low). Reads bbn_baselines/bbn_v3_corpus.json (from bbn_extract_v3.py) and, for
-every author with at least one non-`typical` gap, multiplies the per-gap
-likelihood ratios:
+Reads the corpus JSON from bbn_extract.py and scores every author with at least
+one non-`typical` review-time gap. The latent node is G = is_genuine in {genuine,
+not_genuine} (presumption of innocence): we report P(genuine | evidence) and
+escalate the LOWEST values for manual review -- a ranking to support
+investigation, never an accusation.
 
-    posterior_odds(genuine) = prior_odds(genuine) * PRODUCT_over_gaps  LR(gap_i)
+Each gap contributes a likelihood ratio:
 
     LR(gap) = P(b | genuine, journal, type, pages) / P(b | not_genuine, ...)
-            = genuine_b / ( alpha * P(b | manipulated) + (1 - alpha) * genuine_b )
+            = genuine_b / ( alpha * MANIP_DIST[b] + (1 - alpha) * genuine_b )
 
-where b is the gap's z-bin. genuine_b is the JOURNAL-SPECIFIC empirical baseline.
-The not_genuine branch is the alpha-mixture: a fraction alpha of a non-genuine
-author's papers are manipulated (-> near-instant review, MANIP_DIST), the rest
-behave genuinely. A fast gap therefore yields LR < 1 and *lowers* genuineness.
+where b is the gap's z-bin and genuine_b is the journal-specific empirical
+baseline. The not_genuine branch is an alpha-mixture: a fraction `alpha` of a
+non-genuine author's papers are manipulated (near-instant review, distribution
+MANIP_DIST), the rest behave genuinely. A fast gap gives LR < 1 and lowers
+genuineness; MANIP_DIST[typical] = 0 makes LR_typical = 1/(1-alpha), so a typical
+gap is mild positive evidence.
 
-LEAVE-ONE-AUTHOR (V3): when scoring author A, A's own papers are subtracted from
-the baseline histogram A is compared against (at whichever back-off level is
-used). An author is judged against peers, never against themselves -- this
-removes the self-justification bias that would otherwise inflate genuineness for
-exactly the most anomalous authors.
+Combined in log space (weight of evidence, additive over gaps):
+    log odds(genuine|E) = log odds(genuine) + SUM log LR_i
+A very small posterior is reported as log10-odds (never a misleading 0.000), and
+the ranking is by weight of evidence. Absolute posteriors are overconfident at
+large n (gaps are not perfectly independent), so lean on the ranking and the
+alpha/prior sensitivity sweeps.
 
-Genuine-baseline back-off ladder (so no hard zeros, pages=unknown is missing):
+Leave-one-author: when scoring author A, A's own papers are subtracted from the
+baseline A is compared against -- judged against peers, not itself. Genuine
+baseline uses a Laplace-smoothed back-off (threshold checked on post-exclusion
+counts); pages=unknown is treated as missing:
     journal type+pages  ->  journal type (pages marginal)  ->  pooled type
-all Laplace-smoothed; the threshold check uses the POST-exclusion count.
 
-Output: P(is_genuine | evidence) per author; investigation priority = lowest
-genuineness first. A ranking to support manual review, never an accusation.
+Outputs (bbn_baselines/): bbn_v3_ranking.csv (all scored authors) and
+bbn_v3_shortlist.json (full per-gap evidence breakdown for P < threshold).
 
 Run from this directory (BBN/), any venv (stdlib only):
     python bbn_infer_v3.py                  # score the corpus
@@ -80,7 +84,7 @@ SHORTLIST_THRESHOLD = 0.50                # P(genuine) below this -> reported sh
 SWEEP_PRINT_CAP = 12                      # cap printed sensitivity rows
 
 
-def sigmoid(log_odds):
+def log_odds_to_p(log_odds):
     """P(genuine) from log-odds, overflow-safe. Underflows to 0.0 only when the true
     posterior is below ~1e-308 -- report weight-of-evidence (log_odds) in that regime."""
     if log_odds >= 0:
@@ -189,7 +193,7 @@ def score_author(gaps, journals, pooled, bins, alpha, prior_genuine, want_detail
                 "backoff_level": level, "genuine_p": round(gdist[g["z_bin"]], 6),
                 "lr": round(lr, 6),
             })
-    return sigmoid(log_odds), log_odds, detail
+    return log_odds_to_p(log_odds), log_odds, detail
 
 
 def iter_candidates(data):
