@@ -52,6 +52,7 @@ def parse_journals_page(html: str) -> tuple[list[dict], bool]:
 
     # Extract journal anchors
     # The links match /xpl/RecentIssue.jsp
+    # This ignores virtual journals, whose links look different (there are currently 3 virutal journals within our search parameters (see URL_TEMPLATE))
     journal_links = soup.find_all('a', class_='text-md-md-lh')
     
     page_journals = []
