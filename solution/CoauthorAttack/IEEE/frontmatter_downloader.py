@@ -23,6 +23,8 @@ BASE_DOMAIN = "https://ieeexplore.ieee.org"
 # --- CONFIGURATION ---
 MIN_YEAR = 2000              # Stop scraping issues published before this year
 MAX_WAIT_TIME_SECONDS = 126  # Max time to wait for manual captcha solve
+RETRY_ATTEMPTS = 3          # Number of attempts to download a PDF before giving up
+RETRY_WAIT_TIME = 5      # Wait time between retry attempts for PDF download
 
 def read_config(path) -> dict:
     with open(path, 'r') as f:
@@ -75,7 +77,7 @@ def download_pdf(driver, stamp_url, filepath):
     Bypasses the /?denied= error by fetching the stamp wrapper, 
     extracting the raw iframe URL, and downloading the PDF directly.
     """
-    for attempt in range(3):
+    for attempt in range(RETRY_ATTEMPTS):
         # Always grab fresh cookies in case the session token rotated
         cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
         user_agent = driver.execute_script("return navigator.userAgent;")
@@ -86,8 +88,8 @@ def download_pdf(driver, stamp_url, filepath):
             response = requests.get(stamp_url, cookies=cookies, headers=headers, timeout=30)
             
             if 'denied' in response.url or response.status_code != 200:
-                logging.warning(f"Access denied on attempt {attempt + 1}. Retrying in 5s...")
-                time.sleep(5)
+                logging.warning(f"Access denied on attempt {attempt + 1}. Retrying in {RETRY_WAIT_TIME}s...")
+                time.sleep(RETRY_WAIT_TIME)
                 continue
                 
             # Extract the actual PDF iframe URL
@@ -95,7 +97,7 @@ def download_pdf(driver, stamp_url, filepath):
             iframe = soup.find('iframe')
             if not iframe or not iframe.get('src'):
                 logging.warning("Could not locate PDF iframe on stamp page. Retrying...")
-                time.sleep(5)
+                time.sleep(RETRY_WAIT_TIME)
                 continue
                 
             actual_pdf_url = iframe.get('src')
@@ -105,20 +107,20 @@ def download_pdf(driver, stamp_url, filepath):
             # Download the raw PDF
             pdf_response = requests.get(actual_pdf_url, cookies=cookies, headers=headers, timeout=30)
             
-            # Ensure we actually downloaded a PDF (usually > 5KB), not a hidden error page
+            # Ensure we actually downloaded a PDF (usually > 5KB), not an error page
             if pdf_response.status_code == 200 and len(pdf_response.content) > 5000:
                 with open(filepath, 'wb') as f:
                     f.write(pdf_response.content)
                 return True
             else:
                 logging.warning(f"Downloaded file seems corrupt or empty. Retrying...")
-                time.sleep(5)
+                time.sleep(RETRY_WAIT_TIME)
                 
         except Exception as e:
             logging.error(f"Network error during PDF download: {e}")
-            time.sleep(5)
+            time.sleep(RETRY_WAIT_TIME)
             
-    logging.error("Failed to download PDF after 3 attempts.")
+    logging.error(f"Failed to download PDF after {RETRY_ATTEMPTS} attempts.")
     return False
 
 def extract_frontmatter_link(html_source, journal_title):
