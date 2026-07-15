@@ -23,6 +23,8 @@ BASE_DOMAIN = "https://dl.acm.org"
 # --- CONFIGURATION ---
 MAX_JOURNALS = 1000          # Set high to process the whole DB
 MAX_WAIT_TIME_SECONDS = 126  # Max time to wait for manual captcha solve
+MAX_MISSING_PDFS = 5         # Consecutive missing PDFs before giving up
+MIN_SCRAPE_YEAR = 2000       # Earliest year to scrape
 
 def read_config(path) -> dict:
     with open(path, 'r') as f:
@@ -174,9 +176,26 @@ def main():
                 latest_issue_elem = driver.find_element(By.CSS_SELECTOR, "a[title='Latest Issue']")
                 current_issue_url = latest_issue_elem.get_attribute('href')
             
+            # Initialize our missing PDF counter for this journal
+            consecutive_missing_pdfs = 0
+
             # Navigate backwards through the issues
             while current_issue_url:
                 logging.info(f"Navigating to Issue: {current_issue_url}")
+
+                # Attempt to extract a 4-digit year from the URL
+                year_match = re.search(r'/toc/[^/]+/(\d{4})/', current_issue_url)
+                
+                if year_match:
+                    issue_year = int(year_match.group(1))
+                    if issue_year < MIN_SCRAPE_YEAR:
+                        logging.info(f"Issue year {issue_year} is below the {MIN_SCRAPE_YEAR} threshold. Moving to next Journal.")
+                        break # Exit the while loop to move to the next journal
+                elif 'current' in current_issue_url:
+                    logging.info("Current issue detected. Assuming year is within bounds.")
+                else:
+                    logging.warning(f"Could not determine year from URL ({current_issue_url}). Continuing scraping the journal.")
+
                 driver.get(current_issue_url)
                 
                 # Wait for the Volume/Issue Header to confirm the page loaded
@@ -186,22 +205,28 @@ def main():
                 pdf_url, vol_issue_text, next_issue_url = extract_issue_metadata(driver.page_source)
                 
                 if not pdf_url:
-                    logging.info("No Front Matter PDF found on this issue. Assuming no more exist. Moving to next Journal.")
-                    break # Exit the while loop to move to the next journal
-                
-                # Generate safe filename and check if we already downloaded it
-                safe_jtitle = re.sub(r'[\\/*?:"<>|]', "", journal_title).strip()
-                safe_vol = re.sub(r'[\\/*?:"<>|]', "", vol_issue_text).strip()
-                pdf_filename = f"{safe_jtitle}_{safe_vol}.pdf"
-                pdf_filepath = data_dir / pdf_filename
-                
-                if not pdf_filepath.exists():
-                    logging.info(f"  -> Downloading Front Matter: {pdf_filename}")
-                    success = download_pdf(driver, pdf_url, pdf_filepath)
-                    if success:
-                        time.sleep(2) # Friendly delay after download
+                    consecutive_missing_pdfs += 1
+                    logging.info(f"No Front Matter PDF found. (Missing {consecutive_missing_pdfs}/{MAX_MISSING_PDFS} in a row)")
+                    
+                    if consecutive_missing_pdfs >= MAX_MISSING_PDFS:
+                        logging.info("Missing PDF limit reached. Assuming no more exist. Moving to next Journal.")
+                        break # Exit the while loop to move to the next journal
                 else:
-                    logging.info(f"  -> File already exists: {pdf_filename}. Skipping download.")
+                    consecutive_missing_pdfs = 0 # Reset counter when a PDF is found
+                    
+                    # Generate safe filename and check if we already downloaded it
+                    safe_jtitle = re.sub(r'[\\/*?:"<>|]', "", journal_title).strip()
+                    safe_vol = re.sub(r'[\\/*?:"<>|]', "", vol_issue_text).strip()
+                    pdf_filename = f"{safe_jtitle}_{safe_vol}.pdf"
+                    pdf_filepath = data_dir / pdf_filename
+                    
+                    if not pdf_filepath.exists():
+                        logging.info(f"  -> Downloading Front Matter: {pdf_filename}")
+                        success = download_pdf(driver, pdf_url, pdf_filepath)
+                        if success:
+                            time.sleep(2) # Friendly delay after download
+                    else:
+                        logging.info(f"  -> File already exists: {pdf_filename}. Skipping download.")
                 
                 # Update loop and save incremental progress
                 current_issue_url = next_issue_url
