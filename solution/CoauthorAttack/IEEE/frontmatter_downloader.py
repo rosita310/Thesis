@@ -23,8 +23,9 @@ BASE_DOMAIN = "https://ieeexplore.ieee.org"
 # --- CONFIGURATION ---
 MIN_YEAR = 2000              # Stop scraping issues published before this year
 MAX_WAIT_TIME_SECONDS = 126  # Max time to wait for manual captcha solve
-RETRY_ATTEMPTS = 3          # Number of attempts to download a PDF before giving up
-RETRY_WAIT_TIME = 5      # Wait time between retry attempts for PDF download
+RETRY_ATTEMPTS = 10           # Number of attempts to download a PDF before giving up
+RETRY_WAIT_TIME = 5          # Wait time between retry attempts for PDF download
+MAX_CONSECUTIVE_MISSING = 5  # Skip journal if this many consecutive issues lack a frontmatter PDF
 
 def read_config(path) -> dict:
     with open(path, 'r') as f:
@@ -73,18 +74,12 @@ def save_progress(progress_file, state):
 # --- EXTRACTION & DOWNLOADING ---
 
 def download_pdf(driver, stamp_url, filepath):
-    """
-    Bypasses the /?denied= error by fetching the stamp wrapper, 
-    extracting the raw iframe URL, and downloading the PDF directly.
-    """
     for attempt in range(RETRY_ATTEMPTS):
-        # Always grab fresh cookies in case the session token rotated
         cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
         user_agent = driver.execute_script("return navigator.userAgent;")
         headers = {'User-Agent': user_agent}
         
         try:
-            # Fetch the wrapper page
             response = requests.get(stamp_url, cookies=cookies, headers=headers, timeout=30)
             
             if 'denied' in response.url or response.status_code != 200:
@@ -92,7 +87,6 @@ def download_pdf(driver, stamp_url, filepath):
                 time.sleep(RETRY_WAIT_TIME)
                 continue
                 
-            # Extract the actual PDF iframe URL
             soup = BeautifulSoup(response.text, 'html.parser')
             iframe = soup.find('iframe')
             if not iframe or not iframe.get('src'):
@@ -104,10 +98,8 @@ def download_pdf(driver, stamp_url, filepath):
             if not actual_pdf_url.startswith('http'):
                 actual_pdf_url = urljoin(BASE_DOMAIN, actual_pdf_url)
                 
-            # Download the raw PDF
             pdf_response = requests.get(actual_pdf_url, cookies=cookies, headers=headers, timeout=30)
             
-            # Ensure we actually downloaded a PDF (usually > 5KB), not an error page
             if pdf_response.status_code == 200 and len(pdf_response.content) > 5000:
                 with open(filepath, 'wb') as f:
                     f.write(pdf_response.content)
@@ -124,16 +116,14 @@ def download_pdf(driver, stamp_url, filepath):
     return False
 
 def extract_frontmatter_link(html_source, journal_title):
-    """Scans the issue page for Masthead or Information PDFs."""
     soup = BeautifulSoup(html_source, 'html.parser')
     
     valid_titles = [
-        journal_title,
-        f"{journal_title} Information",
+        journal_title.lower(),
+        f"{journal_title.lower()} information",
         "masthead"
     ]
     
-    # Iterate through all results on the page
     results = soup.find_all('div', class_='result-item')
     for result in results:
         title_tag = result.find('h2', class_='text-md-md-lh')
@@ -142,9 +132,7 @@ def extract_frontmatter_link(html_source, journal_title):
             
         title_text = title_tag.get_text(strip=True).lower()
         
-        # Check if the title matches our expected frontmatter names
         if title_text in valid_titles:
-            # Find the PDF link inside this specific result block
             pdf_btn = result.find('a', class_=re.compile(r'stats_PDF'))
             if pdf_btn and pdf_btn.get('href'):
                 return urljoin(BASE_DOMAIN, pdf_btn.get('href'))
@@ -186,46 +174,41 @@ def main():
             logging.info(f"Processing Journal: {journal_title}")
             logging.info(f"=====================================")
             
-            # Clean whitespace and attach prefix if missing
             journal_url = journal_url.strip() if journal_url else ""
-
             if journal_url and not journal_url.startswith(("http://", "https://")):
                 journal_url = f"https://{journal_url}"
 
             driver.get(journal_url)
             
-            # Check for 'All Issues' vs 'All Volumes' (Continuous Publications)
-            # Continuous publications (like IEEE Access) don't produce traditional mastheads or issue front matter
             tab_selector = (By.CSS_SELECTOR, "a.stats-jhp-AllIssues, a.stats-jhp-AllVolumes")
             
             if not wait_for_human_and_page(driver, tab_selector, "All Issues / Volumes Tab"):
-                return  # Hard exit on unresolvable CAPTCHA or timeout
+                return
                 
             all_issues_tab = driver.find_element(By.CSS_SELECTOR, "a.stats-jhp-AllIssues, a.stats-jhp-AllVolumes")
             
-            # Check if this journal uses Volumes (continuous publication)
             if "stats-jhp-AllVolumes" in all_issues_tab.get_attribute("class"):
-                logging.info(f"Skipping {journal_title}: Detected 'All Volumes' (Continuous publication without front matter).")
+                logging.info(f"Skipping {journal_title}: Detected 'All Volumes' (Continuous publication).")
                 state['completed_journals'].append(journal_url)
                 save_progress(progress_file, state)
                 continue
 
-            # Click "All Issues" tab
             driver.execute_script("arguments[0].click();", all_issues_tab)
-            time.sleep(3) # Wait for Angular to swap the view
+            time.sleep(3)
             
             reached_target_year = False
+            consecutive_missing_pdfs = 0
             
-            # Iterate through Year tabs
+            # Store the main window handle to return to after processing each issue in a new tab
+            main_window = driver.current_window_handle
+            
             while not reached_target_year:
-                # Find all available year links in the sidebar
                 year_elements = driver.find_elements(By.CSS_SELECTOR, "a[data-analytics_identifier='past_issue_selected_year']")
                 
                 if not year_elements:
                     logging.warning("No year navigation found. Moving to next journal.")
                     break
                 
-                # Extract text and sort years descending so we always process newest first
                 years_available = []
                 for elem in year_elements:
                     try:
@@ -243,41 +226,44 @@ def main():
                         
                     logging.info(f"--- Loading Issues for Year: {year} ---")
                     
-                    # Locate the specific year link and click it via JS
                     year_link = driver.find_element(By.XPATH, f"//a[@data-analytics_identifier='past_issue_selected_year' and text()='{year}']")
                     driver.execute_script("arguments[0].click();", year_link)
-                    time.sleep(4) # Wait for Angular to fetch and render the issues for this year
+                    time.sleep(4)
                     
-                    # Extract all issues for this year
                     soup = BeautifulSoup(driver.page_source, 'html.parser')
                     issue_links = []
                     
-                    # IEEE has two layouts (that we know of): .issue-details and .issue-list-item
                     issue_anchors = soup.find_all('a', href=re.compile(r'/xpl/tocresult\.jsp'))
                     for anchor in issue_anchors:
                         href = anchor.get('href')
                         issue_text = anchor.get_text(strip=True)
                         if href and "Issue" in issue_text:
                             full_url = urljoin(BASE_DOMAIN, href)
-                            if full_url not in issue_links:
+                            if full_url not in [url for _, url in issue_links]:
                                 issue_links.append((issue_text, full_url))
                                 
-                    # Process each issue
                     for issue_name, issue_url in issue_links:
                         if issue_url in state['completed_issues']:
                             continue
                             
                         logging.info(f"Navigating to {issue_name} ({year})")
-                        driver.get(issue_url)
+                        
+                        # Open the issue in a NEW TAB to preserve the "All Issues" Angular state
+                        driver.execute_script("window.open(arguments[0], '_blank');", issue_url)
+                        driver.switch_to.window(driver.window_handles[-1])
                         
                         if not wait_for_human_and_page(driver, (By.CLASS_NAME, "result-item"), "Issue Contents"):
+                            driver.close()
+                            driver.switch_to.window(main_window)
                             return
                             
                         stamp_url = extract_frontmatter_link(driver.page_source, journal_title)
                         
                         if not stamp_url:
                             logging.info(f"No Masthead/Information PDF found for {issue_name}.")
+                            consecutive_missing_pdfs += 1
                         else:
+                            consecutive_missing_pdfs = 0
                             safe_jtitle = re.sub(r'[\\/*?:"<>|]', "", journal_title).strip()
                             safe_issue = re.sub(r'[\\/*?:"<>|]', "", issue_name).replace(" ", "_")
                             pdf_filename = f"{safe_jtitle}_{year}_{safe_issue}.pdf"
@@ -291,14 +277,23 @@ def main():
                             else:
                                 logging.info(f"  -> File already exists: {pdf_filename}. Skipping.")
                                 
-                        # Save progress after every issue
                         state['completed_issues'].append(issue_url)
                         save_progress(progress_file, state)
                         
-                # If we processed all available year tabs and none were below MIN_YEAR, 
-                # we need to check if there is a previous decade tab to click.
+                        # Close the issue tab and return to the main tab
+                        driver.close()
+                        driver.switch_to.window(main_window)
+
+                        # Check consecutive missing limit
+                        if consecutive_missing_pdfs >= MAX_CONSECUTIVE_MISSING:
+                            logging.warning(f"Skipping rest of journal: {MAX_CONSECUTIVE_MISSING} consecutive issues missing PDFs.")
+                            reached_target_year = True
+                            break
+                    
+                    if reached_target_year:
+                        break # Break the year loop if cutoff or missing limit is hit
+                        
                 if not reached_target_year:
-                    # Look for decade tabs (e.g., "2010s")
                     decade_elements = driver.find_elements(By.XPATH, "//li/a[contains(text(), 's') and string-length(text()) = 5]")
                     clicked_decade = False
                     
@@ -306,7 +301,6 @@ def main():
                         decade_text = decade_elem.text.strip()
                         try:
                             decade_year = int(decade_text[:4])
-                            # Only click a decade if it contains years >= MIN_YEAR
                             if decade_year + 9 >= MIN_YEAR:
                                 driver.execute_script("arguments[0].click();", decade_elem)
                                 time.sleep(3)
@@ -316,9 +310,8 @@ def main():
                             pass
                             
                     if not clicked_decade:
-                        reached_target_year = True # No more valid decades to explore
+                        reached_target_year = True
 
-            # Mark journal as fully complete
             state['completed_journals'].append(journal_url)
             save_progress(progress_file, state)
             
@@ -329,6 +322,11 @@ def main():
     finally:
         logging.info("Detaching from browser.")
         try:
+            # Safely close any remaining tabs
+            while len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[-1])
+                driver.close()
+            driver.switch_to.window(driver.window_handles[0])
             driver.close()
         except:
             pass
