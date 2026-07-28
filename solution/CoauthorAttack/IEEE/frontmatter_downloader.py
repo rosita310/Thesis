@@ -128,8 +128,8 @@ def extract_frontmatter_link(html_source, journal_title):
     soup = BeautifulSoup(html_source, 'html.parser')
     
     valid_titles = [
-        journal_title.lower(),
-        f"{journal_title.lower()} information",
+        journal_title,
+        f"{journal_title} Information",
         "masthead"
     ]
     
