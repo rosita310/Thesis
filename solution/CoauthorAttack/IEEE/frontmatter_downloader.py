@@ -186,13 +186,31 @@ def main():
             logging.info(f"Processing Journal: {journal_title}")
             logging.info(f"=====================================")
             
+            # Clean whitespace and attach prefix if missing
+            journal_url = journal_url.strip() if journal_url else ""
+
+            if journal_url and not journal_url.startswith(("http://", "https://")):
+                journal_url = f"https://{journal_url}"
+
             driver.get(journal_url)
             
-            # Click "All Issues" tab
-            if not wait_for_human_and_page(driver, (By.CSS_SELECTOR, "a.stats-jhp-AllIssues"), "All Issues Tab"):
-                return
+            # Check for 'All Issues' vs 'All Volumes' (Continuous Publications)
+            # Continuous publications (like IEEE Access) don't produce traditional mastheads or issue front matter
+            tab_selector = (By.CSS_SELECTOR, "a.stats-jhp-AllIssues, a.stats-jhp-AllVolumes")
+            
+            if not wait_for_human_and_page(driver, tab_selector, "All Issues / Volumes Tab"):
+                return  # Hard exit on unresolvable CAPTCHA or timeout
                 
-            all_issues_tab = driver.find_element(By.CSS_SELECTOR, "a.stats-jhp-AllIssues")
+            all_issues_tab = driver.find_element(By.CSS_SELECTOR, "a.stats-jhp-AllIssues, a.stats-jhp-AllVolumes")
+            
+            # Check if this journal uses Volumes (continuous publication)
+            if "stats-jhp-AllVolumes" in all_issues_tab.get_attribute("class"):
+                logging.info(f"Skipping {journal_title}: Detected 'All Volumes' (Continuous publication without front matter).")
+                state['completed_journals'].append(journal_url)
+                save_progress(progress_file, state)
+                continue
+
+            # Click "All Issues" tab
             driver.execute_script("arguments[0].click();", all_issues_tab)
             time.sleep(3) # Wait for Angular to swap the view
             
