@@ -118,11 +118,7 @@ def download_pdf(driver, stamp_url, filepath):
 def extract_frontmatter_link(html_source, journal_title):
     soup = BeautifulSoup(html_source, 'html.parser')
     
-    valid_titles = [
-        journal_title.lower(),
-        f"{journal_title.lower()} information",
-        "masthead"
-    ]
+    journal_title_clean = journal_title.strip().lower()
     
     results = soup.find_all('div', class_='result-item')
     for result in results:
@@ -132,7 +128,8 @@ def extract_frontmatter_link(html_source, journal_title):
             
         title_text = title_tag.get_text(strip=True).lower()
         
-        if title_text in valid_titles:
+        # Match if the title text contains the journal title or 'masthead'
+        if journal_title_clean in title_text or "masthead" in title_text:
             pdf_btn = result.find('a', class_=re.compile(r'stats_PDF'))
             if pdf_btn and pdf_btn.get('href'):
                 return urljoin(BASE_DOMAIN, pdf_btn.get('href'))
@@ -166,6 +163,12 @@ def main():
         for journal in journals_to_process:
             journal_title = journal['title']
             journal_url = journal['link']
+
+            
+            journal_url = journal_url.strip() if journal_url else ""
+            if journal_url and not journal_url.startswith(("http://", "https://")):
+                journal_url = f"https://{journal_url}"
+
             
             if journal_url in state['completed_journals']:
                 continue
@@ -173,10 +176,6 @@ def main():
             logging.info(f"\n=====================================")
             logging.info(f"Processing Journal: {journal_title}")
             logging.info(f"=====================================")
-            
-            journal_url = journal_url.strip() if journal_url else ""
-            if journal_url and not journal_url.startswith(("http://", "https://")):
-                journal_url = f"https://{journal_url}"
 
             driver.get(journal_url)
             
