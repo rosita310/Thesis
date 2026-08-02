@@ -116,21 +116,36 @@ def download_pdf(driver, stamp_url, filepath):
     return False
 
 def extract_frontmatter_link(html_source, journal_title):
+    """
+    Scans the IEEE issue page DOM for Masthead or Information PDFs,
+    handling Angular-rendered <h2> blocks robustly.
+    """
     soup = BeautifulSoup(html_source, 'html.parser')
     
-    journal_title_clean = journal_title.strip().lower()
+    # Pre-compile case-insensitive regex pattern for matching title targets
+    # Matches the journal name (escaped to prevent regex syntax errors) or 'masthead'
+    escaped_journal_title = re.escape(journal_title.strip())
+    target_pattern = re.compile(rf"({escaped_journal_title}|masthead)", re.IGNORECASE)
     
-    results = soup.find_all('div', class_='result-item')
+    # Find all issue result item blocks
+    results = soup.find_all('xpl-issue-results-items')
+    
     for result in results:
-        title_tag = result.find('h2', class_='text-md-md-lh')
-        if not title_tag:
-            continue
-            
-        title_text = title_tag.get_text(strip=True).lower()
+        # Search all <h2> tags inside this item (handles mobile/desktop visual variants)
+        h2_tags = result.find_all('h2')
+        matched = False
         
-        # Match if the title text contains the journal title or 'masthead'
-        if journal_title_clean in title_text or "masthead" in title_text:
-            pdf_btn = result.find('a', class_=re.compile(r'stats_PDF'))
+        for h2 in h2_tags:
+            # Extract clean text from the h2 (including inner <span> elements)
+            title_text = h2.get_text(separator=" ", strip=True)
+            
+            if target_pattern.search(title_text):
+                matched = True
+                break
+                
+        if matched:
+            # Find the PDF anchor tag within this xpl-issue-results-items parent block
+            pdf_btn = result.find('a', class_=re.compile(r'stats_PDF', re.IGNORECASE))
             if pdf_btn and pdf_btn.get('href'):
                 return urljoin(BASE_DOMAIN, pdf_btn.get('href'))
                 
