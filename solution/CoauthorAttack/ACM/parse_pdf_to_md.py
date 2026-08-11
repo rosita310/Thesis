@@ -4,7 +4,7 @@ import pymupdf4llm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-MAX_PDFS_TO_PARSE = 3  # Limit the number of PDFs processed during this run
+MAX_PDFS_TO_PARSE = 10000  # Limit the number of PDFs processed during this run
 
 def main():
 
