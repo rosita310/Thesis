@@ -1,6 +1,8 @@
 import json
 import logging
 from pathlib import Path
+import re
+import unicodedata
 
 # ==========================================
 # CONFIGURATION
@@ -32,17 +34,65 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logging.getLogger().addHandler(console_handler)
 
+#    Sanitizes markdown text by normalizing unicode, removing control characters,
+#    stripping useless lines, and removing standard boilerplate blocks (like the ACM address).
+def clean_markdown(text: str) -> str:
+
+    # Normalize Unicode (fixes ligatures like 'ﬁ' -> 'fi' where possible)
+    text = unicodedata.normalize("NFKC", text)
+
+    # Remove unwanted ASCII control characters (0x00 - 0x1F)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+
+    # Process line by line for empty and junk lines
+    lines = text.split('\n')
+    valid_lines = []
+    
+    for line in lines:
+        # Condition A: Line MUST contain at least one letter or number
+        if not re.search(r'[A-Za-z0-9]', line):
+            continue
+            
+        # Condition B: Remove isolated PyMuPDF ligature artifacts ('f', 'i', 'fi', 'if')
+        # We strip all non-alphabetic chars to ignore spaces or formatting like "**f**"
+        alpha_only = re.sub(r'[^A-Za-z]', '', line).lower()
+        if alpha_only in ['f', 'i', 'fi', 'if']:
+            continue
+            
+        valid_lines.append(line)
+        
+    # Rejoin the lines (empty lines are now completely gone)
+    cleaned_text = '\n'.join(valid_lines)
+    
+    # Remove the contiguous ACM contact block
+    # Using MULTILINE so ^ matches the start of a line.
+    acm_block_pattern = re.compile(
+        r"^[\*\s_]*ACM[\*\s_]*\n"          # 'ACM' (possibly with markdown bold/italics)
+        r"(?:[^\n]+\n){1,2}"               # 1 or 2 generic address lines (I only found cases with 1 line, but just in case)
+        r"[^\n]*New York, NY[^\n]*\n"      # The New York state/zip line
+        r"[^\n]*Tel\.?[^\n]*\n"            # Telephone line
+        r"[^\n]*Fax[^\n]*\n"               # Fax line
+        r"[^\n]*acm\.org[^\n]*\n?"         # Primary ACM website line
+        r"[^\n]*Home Page:[^\n]*(?:\n|$)", # Home Page line (ignoring any surround formatting)
+        re.IGNORECASE | re.MULTILINE
+    )
+    
+    cleaned_text = re.sub(acm_block_pattern, "", cleaned_text)
+    
+    return cleaned_text
+
 # ==========================================
 # PARSING LOGIC (Iterative target)
 # ==========================================
 
 def parse_markdown_file(md_path: Path) -> dict:
-    """
-    Reads a markdown file and extracts editor information.
-    This is where the complex, iterative parsing logic will go.
-    """
+    #   Reads a markdown file and extracts editor information.
+    #   This is where the complex, iterative parsing logic will go.
     with open(md_path, "r", encoding="utf-8") as file:
-        content = file.read()
+        raw_content = file.read()
+
+    # Apply our cleaning sequence
+    content = clean_markdown(raw_content)
     
     # TODO: Implement iterative parsing logic here
     # Expected output structure example:
