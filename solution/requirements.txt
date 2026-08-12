@@ -64,6 +64,7 @@ pyasn1-modules==0.2.8
 pycparser==2.20
 pycryptodomex==3.11.0
 PyJWT==2.3.0
+pymupdf4llm>=0.0.27
 pyodbc==4.0.32
 pyOpenSSL==20.0.1
 pyparsing==3.0.4
