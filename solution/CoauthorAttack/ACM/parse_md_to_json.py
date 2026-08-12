@@ -19,6 +19,124 @@ SKIP_PREFIXES = (                       # Files starting with these prefixes wil
     "Proceedings of the ACM on",        # Divergent structure from other journals. Also, these are conference proceedings, not true journals.
 )
 
+Python
+# ==========================================
+# PARSER CONFIGURATION
+# ==========================================
+
+# WANTED ROLES & NORMALIZATION
+# Maps variations of a role found in the text to the standard role name we want in the JSON.
+# These include variations I did not find but could plausibly exist.
+ROLE_MAPPING = {
+    "editor-in-chief": "Editor-in-Chief",
+    "editor in chief": "Editor-in-Chief",
+    "editors-in-chief": "Editor-in-Chief",
+    "co-editor-in-chief": "Co-Editor-in-Chief",
+    "co-editors-in-chief": "Co-Editor-in-Chief",
+    "guest editor-in-chief": "Guest Editor-in-Chief",
+    "guest editors-in-chief": "Guest Editor-in-Chief",
+    "guest editor in chief": "Guest Editor-in-Chief",
+    "guest editors in chief": "Guest Editor-in-Chief",
+    "assistant to the editor-in-chief": "Assistant to the Editor-in-Chief",
+    "assistant to the editors-in-chief": "Assistant to the Editor-in-Chief",
+    "assistant to the editor in chief": "Assistant to the Editor-in-Chief",
+    "assistant to the editors in chief": "Assistant to the Editor-in-Chief",
+    "associate editor": "Associate Editor",
+    "associate editors": "Associate Editor",
+    "specialized associate editor": "Associate Editor",
+    "senior associate editor": "Senior Associate Editor",
+    "senior associate editors": "Senior Associate Editor",
+    "senior associate editor and acting editor-in-chief": "Senior Associate Editor",
+    "sr. associate editor": "Senior Associate Editor",
+    "sr. associate editors": "Senior Associate Editor",
+    "editorial board": "Editorial Board Member",
+    "editorial board member": "Editorial Board Member",
+    "editorial assistant": "Editorial Assistant",
+    "area editors": "Area Editor",
+    "area editors, ai, ml and data science for sustainable societies": "Area Editor",
+    "area editors, development, economics and policy": "Area Editor",
+    "area editors, environment, sustainability and climate change": "Area Editor",
+    "area editors, hci, design and critical perspectives": "Area Editor",
+    "area editors, systems and iot for sustainable societies": "Area Editor",
+    "area editors, technology, media, and social practice": "Area Editor",
+    "algorithms editor": "Algorithms Editor",
+    "on-line editor": "Online Editor",
+    "online editor": "Online Editor",
+    "special issue editor": "Special Issue Editor",
+    "special issue editors": "Special Issue Editor",
+    "special issue associate editors and advidors": "Special Issue Editor",
+    "outreach editor": "Outreach Editor",
+    "outreach editors": "Outreach Editor",
+    "distinguished reviewer board": "Distinguished Reviewer Board Member",
+    "distinguished reviewer": "Distinguished Reviewer",
+    "managing editor": "Managing Editor",
+    "managing editors": "Managing Editor",
+    "perspective articles editor": "Perspective Articles Editor",
+    "survey and tutorial papers editor": "Survey and Tutorial Papers Editor",
+    "release papers editor": "Release Papers Editor",
+    "senior advisory editor": "Senior Advisory Editor",
+    "senior advisory editors": "Senior Advisory Editor",
+    "social media editor": "Social Media Editor",
+    "review board": "Review Board Member",
+    "north america editor": "North America Editor",
+    "book review editor": "Book Review Editor",
+    "guest editor": "Guest Editor",
+    "guest editors": "Guest Editor",
+    "assistant editor": "Assistant Editor",
+    "assistant editors": "Assistant Editor",
+    "editor": "Editor",
+    "editors": "Editor",
+    "reprodicibility board": "Reproducibility Board Member",
+    "reproducibility editorial board": "Reproducibility Board Member",
+}
+
+# IGNORED ROLES
+# Roles we don't care about, but finding them shouldn't stop the whole parsing process.
+IGNORED_ROLES = {
+    "advisory board",
+    "advisory board members",
+    "information director",
+    "information directors",
+    "information officer and administrator",
+    "assistant information director",
+    "administrator",
+    "editorial advisor",
+    "founding editor",
+    "founding co-editors-in-chief",
+    "publicity chairs",
+}
+
+# TERMINATING ROLES
+# If we see these roles, we know there are no more valid editors after this point.
+TERMINATING_ROLES = {
+    "acm headquarters staff",
+    "administrative support",
+    "former editors-in-chief",
+    "founding editor-in-chief",
+    "headquarters staf",
+    "headquarters journals staf",
+    "headquarters journals staff",
+    "information co-directors",
+    "information specialist",
+    "journal administrator",
+    "past associate editors",
+    "past distinguished reviewers",
+    "past editors-in-chief",
+    "senior advisors",
+    "steering committee",
+    "traffic manager",
+}
+
+# TERMINATING TEXTS
+# Non-role lines that indicate the end of the editor section. 
+# We will use substring matching for these.
+TERMINATING_TEXTS = [
+    "ACM European Service Centre",
+    "For manuscript submissions and ACM membership information, see inside backcover.",
+    "Guide to Manuscript Submission",
+    "service, notify your local post office before",
+]
+
 # ==========================================
 # LOGGING SETUP
 # ==========================================
@@ -86,21 +204,52 @@ def clean_markdown(text: str) -> str:
 # ==========================================
 
 def parse_markdown_file(md_path: Path) -> dict:
-    #   Reads a markdown file and extracts editor information.
-    #   This is where the complex, iterative parsing logic will go.
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
-
-    # Apply our cleaning sequence
-    content = clean_markdown(raw_content)
     
-    # TODO: Implement iterative parsing logic here
-    # Expected output structure example:
+    # Clean the text
+    content = clean_markdown(raw_content)
+    lines = content.split('\n')
+    
+    extracted_editors = []
+    current_role = None
+    
+    # Extract Data
+    for line in lines:
+        # Strip markdown formatting (* and _) and whitespace, then lowercase for matching
+        clean_line = re.sub(r'[*_]', '', line).strip().lower()
+        
+        # Check if we should terminate completely
+        if clean_line in TERMINATING_ROLES:
+            break
+            
+        if any(term_text in clean_line for term_text in TERMINATING_TEXTS):
+            break
+            
+        # Check if it's a role we want
+        if clean_line in ROLE_MAPPING:
+            current_role = ROLE_MAPPING[clean_line]
+            continue
+            
+        # Check if it's a role we want to ignore
+        if clean_line in IGNORED_ROLES:
+            current_role = None  # Stop collecting names, but keep reading the file
+            continue
+            
+        # If the line isn't a role, but we have an active current_role,
+        # then this line contains editor name/association data.
+        if current_role:
+            # We append the original 'line' (not clean_line) to preserve capitals 
+            # and formatting, this will be useful for parsing the names later.
+            extracted_editors.append({
+                "role": current_role,
+                "raw_data": line.strip()
+            })
+            
+    # Compile the final dictionary
     extracted_data = {
         "journal_file": md_path.name,
-        "editors": [
-            # {"name": "John Doe", "role": "Editor-in-Chief", "association": "University of X"}
-        ],
+        "editors": extracted_editors,
         "metadata": {}
     }
     
