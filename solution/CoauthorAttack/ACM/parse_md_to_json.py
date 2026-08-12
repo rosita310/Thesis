@@ -19,7 +19,7 @@ SKIP_PREFIXES = (                       # Files starting with these prefixes wil
     "Proceedings of the ACM on",        # Divergent structure from other journals. Also, these are conference proceedings, not true journals.
 )
 
-Python
+
 # ==========================================
 # PARSER CONFIGURATION
 # ==========================================
