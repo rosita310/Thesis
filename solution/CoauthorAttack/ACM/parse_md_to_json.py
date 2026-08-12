@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 5                           # Set to None to process all valid files
+MAX_FILES = None                        # Set to None to process all valid files
 OVERWRITE_EXISTING = False              # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     "ACM Transactions on Graphics",     # Doesn't contain information we want   
@@ -30,7 +30,8 @@ SKIP_PREFIXES = (                       # Files starting with these prefixes wil
 ROLE_MAPPING = {
     "editor-in-chief": "Editor-in-Chief",
     "editor in chief": "Editor-in-Chief",
-    "editors-in-chief": "Editor-in-Chief",
+    "editors-in-chief": "Co-Editor-in-Chief",
+    "editors in chief": "Co-Editor-in-Chief",
     "co-editor-in-chief": "Co-Editor-in-Chief",
     "co-editors-in-chief": "Co-Editor-in-Chief",
     "guest editor-in-chief": "Guest Editor-in-Chief",
@@ -51,6 +52,7 @@ ROLE_MAPPING = {
     "sr. associate editors": "Senior Associate Editor",
     "editorial board": "Editorial Board Member",
     "editorial board member": "Editorial Board Member",
+    "editorial board members": "Editorial Board Member",
     "editorial assistant": "Editorial Assistant",
     "area editors": "Area Editor",
     "area editors, ai, ml and data science for sustainable societies": "Area Editor",
@@ -64,7 +66,7 @@ ROLE_MAPPING = {
     "online editor": "Online Editor",
     "special issue editor": "Special Issue Editor",
     "special issue editors": "Special Issue Editor",
-    "special issue associate editors and advidors": "Special Issue Editor",
+    "special issue associate editors and advisors": "Special Issue Editor",
     "outreach editor": "Outreach Editor",
     "outreach editors": "Outreach Editor",
     "distinguished reviewer board": "Distinguished Reviewer Board Member",
@@ -200,60 +202,104 @@ def clean_markdown(text: str) -> str:
     return cleaned_text
 
 # ==========================================
-# PARSING LOGIC (Iterative target)
+# PARSING LOGIC 
 # ==========================================
 
-def parse_markdown_file(md_path: Path) -> dict:
+def parse_editors_from_blocks(role_blocks: dict) -> list:
+    extracted_editors = []
+    
+    for role, lines in role_blocks.items():
+        people_raw = []
+        current_person_lines = []
+        
+        for line in lines:
+            clean_start = line.replace("** **", "").strip()
+            
+            if clean_start.startswith("**"):
+                if current_person_lines:
+                    first_line = current_person_lines[0].replace("** **", "")
+                    first_bold = re.search(r"\*\*(.*?)\*\*", first_line)
+                    
+                    if first_bold and len(first_bold.group(1).strip().split()) == 1:
+                        current_person_lines.append(line)
+                    else:
+                        people_raw.append(" \n ".join(current_person_lines))
+                        current_person_lines = [line]
+                else:
+                    current_person_lines = [line]
+            else:
+                if current_person_lines:
+                    current_person_lines.append(line)
+                    
+        if current_person_lines:
+            people_raw.append(" \n ".join(current_person_lines))
+
+        eic_count = 0
+        for raw_person in people_raw:
+            text = raw_person.replace("** **", "")
+            text = re.sub(r"\*\*\[(.*?)\](?:\(https?://[^)]+\))?\*\*", r"**\1**", text)
+            
+            bolds = re.findall(r"\*\*(.*?)\*\*", text)
+            if not bolds:
+                continue
+                
+            name = bolds[0].strip()
+            if len(name.split()) == 1 and len(bolds) > 1:
+                name = name + " " + bolds[1].strip()
+                text = text.replace(f"**{bolds[0]}**", "", 1).replace(f"**{bolds[1]}**", "", 1)
+            else:
+                text = text.replace(f"**{bolds[0]}**", "", 1)
+
+            association = re.sub(r"^[\s_]+|[\s_]+$", "", text.strip())
+            association = " ".join(association.split())
+            
+            assigned_role = role
+            if role == "Editor-in-Chief":
+                if eic_count > 0:
+                    assigned_role = "Associate Editor"
+                eic_count += 1
+                
+            extracted_editors.append({
+                "name": name,
+                "role": assigned_role,
+                "association": association
+            })
+            
+    return extracted_editors
+
+def parse_markdown_file(md_path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
     
-    # Clean the text
     content = clean_markdown(raw_content)
     lines = content.split('\n')
     
-    extracted_editors = []
+    role_blocks = {}
     current_role = None
     
-    # Extract Data
     for line in lines:
-        # Strip markdown formatting (* and _) and whitespace, then lowercase for matching
         clean_line = re.sub(r'[*_]', '', line).strip().lower()
         
-        # Check if we should terminate completely
-        if clean_line in TERMINATING_ROLES:
+        if clean_line in TERMINATING_ROLES or any(t in clean_line for t in TERMINATING_TEXTS):
             break
-            
-        if any(term_text in clean_line for term_text in TERMINATING_TEXTS):
-            break
-            
-        # Check if it's a role we want
         if clean_line in ROLE_MAPPING:
             current_role = ROLE_MAPPING[clean_line]
+            if current_role not in role_blocks:
+                role_blocks[current_role] = []
             continue
-            
-        # Check if it's a role we want to ignore
         if clean_line in IGNORED_ROLES:
-            current_role = None  # Stop collecting names, but keep reading the file
+            current_role = None
             continue
             
-        # If the line isn't a role, but we have an active current_role,
-        # then this line contains editor name/association data.
         if current_role:
-            # We append the original 'line' (not clean_line) to preserve capitals 
-            # and formatting, this will be useful for parsing the names later.
-            extracted_editors.append({
-                "role": current_role,
-                "raw_data": line.strip()
-            })
+            role_blocks[current_role].append(line.strip())
             
-    # Compile the final dictionary
-    extracted_data = {
+    extracted_editors = parse_editors_from_blocks(role_blocks)
+    
+    return {
         "journal_file": md_path.name,
         "editors": extracted_editors,
-        "metadata": {}
     }
-    
-    return extracted_data
 
 # ==========================================
 # MAIN EXECUTION
@@ -296,7 +342,7 @@ def main():
         try:
             extracted_data = parse_markdown_file(md_path)
             
-            # 5. Write to JSON
+            # Write to JSON
             with open(json_path, "w", encoding="utf-8") as json_file:
                 json.dump(extracted_data, json_file, indent=4, ensure_ascii=False)
                 
@@ -305,8 +351,6 @@ def main():
             
         except Exception as e:
             logging.error(f"Failed to parse {md_path.name}. Error: {e}", exc_info=True)
-            # Depending on testing needs, you might want to raise the exception to stop execution
-            # raise e
 
     logging.info(f"Run complete. Successfully processed {processed_count} files.\n")
 
