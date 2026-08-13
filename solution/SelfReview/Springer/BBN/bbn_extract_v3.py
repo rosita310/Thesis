@@ -68,40 +68,13 @@ Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme", "ultra_extreme"]
 PCT_EDGES = [(0.1, "ultra_extreme"), (1, "very_extreme"), (5, "extreme"), (15, "mild_fast")]
 
 
-def percentile(sorted_vals, pct):
-    """Linear-interpolated percentile (pct in [0,100]) on an ascending list."""
-    n = len(sorted_vals)
-    if n == 1:
-        return sorted_vals[0]
-    k = (n - 1) * (pct / 100.0)
-    lo, hi = math.floor(k), math.ceil(k)
-    if lo == hi:
-        return sorted_vals[int(k)]
-    return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
-
-
-def build_z_edges(sorted_z):
-    """Derive [(z_threshold, label), ..., (inf, 'typical')] from pooled percentiles."""
-    edges = [(percentile(sorted_z, pct), label) for pct, label in PCT_EDGES]
-    edges.append((float("inf"), "typical"))
-    return edges
-
-
-def make_bin_z(z_edges):
-    def bin_z(z):
-        for edge, label in z_edges:
-            if z <= edge:
-                return label
-        return Z_BINS[0]
-    return bin_z
-
-
 # per-gap context bins (parents of each gap node)
 FAST_TYPE_KEYWORDS = (
     "editorial", "erratum", "correction", "corrigendum", "comment",
     "letter", "preface", "introduction", "book review", "obituary",
     "addendum", "retraction", "foreword", "in memoriam",
 )
+
 
 # Editorial-signalling TITLE patterns, used to reclassify papers whose
 # `article_type` is generic (e.g. "Article") but whose title marks them as
@@ -188,6 +161,33 @@ def pages_bin(pages):
 def stratum_key(tbin, pbin):
     return f"{tbin}|{pbin}"
 
+
+def percentile(sorted_vals, pct):
+    """Linear-interpolated percentile (pct in [0,100]) on an ascending list."""
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    k = (n - 1) * (pct / 100.0)
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return sorted_vals[int(k)]
+    return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
+
+
+def build_z_edges(sorted_z):
+    """Derive [(z_threshold, label), ..., (inf, 'typical')] from pooled percentiles."""
+    edges = [(percentile(sorted_z, pct), label) for pct, label in PCT_EDGES]
+    edges.append((float("inf"), "typical"))
+    return edges
+
+
+def make_bin_z(z_edges):
+    def bin_z(z):
+        for edge, label in z_edges:
+            if z <= edge:
+                return label
+        return Z_BINS[0]
+    return bin_z
 
 # ---------------------------------------------------------------------------
 # Main
