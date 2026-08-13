@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 
 import requests
@@ -71,12 +72,17 @@ RATE_LIMIT_WAIT = 60
 MAX_RETRIES = 3
 
 
-def read_config(path) -> dict:
-    with open(path, 'r') as f:
-        config_string = '[SECTION]\n' + f.read()
+def read_config(path) -> configparser.SectionProxy:
+    if not os.path.exists(path):
+        sys.exit(
+            f"\nERROR: no .env found at {path}\n"
+            f"Copy code/env-example to code/.env and fill in the POSTGRES_* values.\n"
+        )
+    with open(path, "r") as f:
+        config_string = "[SECTION]\n" + f.read()
     config = configparser.ConfigParser()
     config.read_string(config_string)
-    return config['SECTION']
+    return config["SECTION"]
 
 
 def make_session() -> requests.Session:
@@ -725,7 +731,7 @@ def process_journal(fetcher: Fetcher, journal_id: str, name: str, progress: dict
 
 
 def main():
-    config = read_config('../../.env')
+    config = read_config('../../../.env')
     db = Postgress(
         server=config['POSTGRES_SERVER'],
         database=config['POSTGRES_DB'],
