@@ -10,11 +10,17 @@ geckodriver.log
 .fake
 solution/.env
 venv
+/solution/SelfReview/ACM/data
+/solution/SelfReview/ACM/progress.json
 logs
 dblp.nt.gz
 /solution/SelfReview/Springer/scraper/data
 /solution/SelfReview/Springer/scraper/progress.json
 /solution/SelfReview/Springer/scraper/.chrome_profile
+/solution/CoauthorAttack/ACM/data
+/solution/CoauthorAttack/ACM/parsing.log
+/solution/CoauthorAttack/IEEE/data
+
 /solution/SelfReview/Springer/BBN/bbn_baselines
 /solution/SelfReview/Springer/BBN/dblp_store
 /solution/SelfReview/Springer/BBN/dblp_orcid_raw.tsv
