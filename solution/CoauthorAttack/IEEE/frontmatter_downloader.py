@@ -117,37 +117,38 @@ def download_pdf(driver, stamp_url, filepath):
 
 def extract_frontmatter_link(html_source, journal_title):
     """
-    Scans the IEEE issue page DOM for Masthead or Information PDFs,
-    handling Angular-rendered <h2> blocks robustly.
+    Scans the IEEE issue page DOM for Masthead or Information PDFs.
+    Uses expanded keywords and targets the stamp URL structure rather than CSS classes.
     """
     soup = BeautifulSoup(html_source, 'html.parser')
     
-    # Pre-compile case-insensitive regex pattern for matching title targets
-    # Matches the journal name (escaped to prevent regex syntax errors) or 'masthead'
     escaped_journal_title = re.escape(journal_title.strip())
-    target_pattern = re.compile(rf"({escaped_journal_title}|masthead)", re.IGNORECASE)
     
-    # Find all issue result item blocks
-    results = soup.find_all('xpl-issue-results-items')
+    # Expanded keyword search to catch common IEEE front matter naming conventions
+    keywords = rf"({escaped_journal_title}|masthead|publication information|frontmatter)"
+    target_pattern = re.compile(keywords, re.IGNORECASE)
+    
+    # IEEE sometimes uses 'result-item' classes or custom 'xpl' tags
+    results = soup.find_all(lambda tag: tag.name == 'xpl-issue-results-items' or 
+                                        (tag.has_attr('class') and 'result-item' in tag.get('class')))
     
     for result in results:
-        # Search all <h2> tags inside this item (handles mobile/desktop visual variants)
-        h2_tags = result.find_all('h2')
+        # Search all h2 (and h3 just in case) tags inside this item
+        header_tags = result.find_all(['h2', 'h3'])
         matched = False
         
-        for h2 in h2_tags:
-            # Extract clean text from the h2 (including inner <span> elements)
-            title_text = h2.get_text(separator=" ", strip=True)
+        for header in header_tags:
+            title_text = header.get_text(separator=" ", strip=True)
             
             if target_pattern.search(title_text):
                 matched = True
                 break
                 
         if matched:
-            # Find the PDF anchor tag within this xpl-issue-results-items parent block
-            pdf_btn = result.find('a', class_=re.compile(r'stats_PDF', re.IGNORECASE))
+            # Find the link by checking the href for the stamp URL
+            pdf_btn = result.find('a', href=re.compile(r'/stamp/stamp\.jsp', re.IGNORECASE))
             if pdf_btn and pdf_btn.get('href'):
-                return urljoin(BASE_DOMAIN, pdf_btn.get('href'))
+                return urljoin("https://ieeexplore.ieee.org", pdf_btn.get('href'))
                 
     return None
 
@@ -270,7 +271,10 @@ def main():
                             driver.close()
                             driver.switch_to.window(main_window)
                             return
-                            
+
+                        # Give angular time to inject the href variables into the <a> tags
+                        time.sleep(1)
+                        
                         stamp_url = extract_frontmatter_link(driver.page_source, journal_title)
                         
                         if not stamp_url:
