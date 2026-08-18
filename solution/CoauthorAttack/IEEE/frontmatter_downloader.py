@@ -123,10 +123,16 @@ def extract_frontmatter_link(html_source, journal_title):
     soup = BeautifulSoup(html_source, 'html.parser')
     
     escaped_journal_title = re.escape(journal_title.strip())
-    
-    # Expanded keyword search to catch common IEEE front matter naming conventions
-    keywords = rf"({escaped_journal_title}|masthead|publication information|frontmatter)"
-    target_pattern = re.compile(keywords, re.IGNORECASE)
+
+    # Known valid patterns for frontmatter links:
+    pattern_str = (
+        rf"({escaped_journal_title}"
+        rf"|masthead"
+        rf"|publication information"
+        rf"|ieee\b.{'{0,80}'}information\b"
+        rf"|frontmatter)"
+    )
+    target_pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
     
     # IEEE sometimes uses 'result-item' classes or custom 'xpl' tags
     results = soup.find_all(lambda tag: tag.name == 'xpl-issue-results-items' or 
