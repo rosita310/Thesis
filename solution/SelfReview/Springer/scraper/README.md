@@ -1,83 +1,157 @@
-# Springer Scraper — Aanpak
+# Springer — Article Metadata Collection
 
-## Doel
-Publicatiedata verzamelen van artikelen in Springer Computer Science journals om de publication-lag (tijd tussen indiening en acceptatie) te analyseren als indicator voor mogelijke self-review fraude.
+Collects publication dates for articles in Springer Computer Science journals, to
+analyse publication lag (submission → acceptance) as an indicator of possible
+self-review fraud.
 
-## Benodigde datums per artikel
-- **Received** (= submitted)
-- **Accepted**
-- **Published**
+Dates needed per article: **Received** (= submitted), **Accepted**, **Published**.
 
-## Architectuur
-
-Drie Python-scripts, vergelijkbaar met de Elsevier aanpak:
+## Layout
 
 ```
 springer/
-  journals_scraper.py     Stap 1: lijst van CS journals ophalen        ✅
-  article_downloader.py   Stap 2: per journal artikelen ophalen en metadata opslaan  ✅
-  parse_output.py         Stap 3: opgeslagen JSON parsen en naar database schrijven  ✅
-  skip_journals.csv       Journals zonder received-datum automatisch overslaan
-  progress.json           Voortgang per journal (laatste voltooide pagina, status)
-  .chrome_profile/        Persistent Chrome-profiel voor de Selenium-fallback (mag weg)
-  logs/                   Logbestanden per run (parse_output_YYYYMMDD_HHMMSS.log)
+  journals_scraper.py       Step 1: list CS journals
+  article_downloader.py     Step 2: scrape metadata from Springer HTML   — deprecated
+  crossref_collector.py     Step 2b: same metadata via the Crossref API  — use this
+  parse_output.py           Step 3: parse stored JSON into the database
+  skip_journals.csv         Journals without received dates, skipped on later runs
+  progress.json             Scraper progress (last completed page per journal)
+  crossref_issn_map.csv     journal_id → ISSN, for the Crossref collector
+  crossref_progress.json    Crossref collector progress, per journal
+  .chrome_profile/          Chrome profile for the Selenium fallback (safe to delete)
+  logs/                     Per-run log files
 ```
 
-## Stap 1 — Journals scraper ✅
-- Bron: `link.springer.com/journals/browse-subject?subject=COMPUTER_SCIENCE`
-- Pagineert automatisch (20 per pagina, 8 pagina's)
-- Scraper gebruikt `requests` + `BeautifulSoup` (Selenium niet nodig gebleken)
+## Step 1 — Journals scraper
+
+- Source: `link.springer.com/journals/browse-subject?subject=COMPUTER_SCIENCE`
 - Selector: `h2.app-card-open__heading a[data-track-label]`
-- Resultaat: **143 journals** opgeslagen in `springer.journals` (PostgreSQL)
-- Kolommen: `journal_id`, `name`
+- Uses `requests` + `BeautifulSoup`; Selenium not needed here
+- Writes `journal_id`, `name` to `springer.journals`
 
-## Stap 2 — Article downloader ✅
-- Per journal: artikellijst doorlopen via `/journal/{id}/articles?page={n}` (50 per pagina)
-- Per artikel: metadata extraheren uit de artikelpagina
-- Opgeslagen als kleine JSON-bestanden op schijf: `data/{journal_id}/{doi}.json`
-- Artikelen van vóór `MIN_YEAR` worden overgeslagen (stopconditie op publicatiejaar)
-- Script is veilig hervattbaar op twee niveaus:
-  - **Per artikel**: `already_downloaded()` check (vangnet op paginagrenzen)
-  - **Per journal/pagina**: `progress.json` (zie hieronder) — voltooide journals worden
-    volledig overgeslagen en een onderbroken journal hervat op de volgende pagina i.p.v.
-    alle paginavanaf 1 opnieuw op te halen
-- **Hybride fetch + handmatige CAPTCHA-oplossing**: standaard snel via `requests`; bij een
-  block/CAPTCHA schakelt het script automatisch over naar een zichtbaar Chrome-venster
-  (Selenium). Daar los je de CAPTCHA met de hand op, waarna het verdergaat en de
-  browser-cookies terugkopieert naar de `requests`-sessie (terug naar het snelle pad).
-- **Adaptieve snelheid**: lage basisdelay (0.25–1.0s) voor doorvoer, met automatische
-  backoff (×2 per block, gedempt bij succes) zodat het script vertraagt zodra Springer
-  begint te blokkeren en weer versnelt als het rustig is.
-- 429-afhandeling (60s wacht) en CAPTCHA/block-detectie blijven behouden.
-- **Block-detectie is content-bewust**: een pagina geldt pas als geblokkeerd als de
-  echte content ontbreekt (geen artikelkaarten / citation-metadata) én er een volledige
-  block-tekst aanwezig is. Losse woorden als "captcha" worden níét gematcht, omdat die
-  legitiem in artikeltitels voorkomen (bijv. een paper getiteld "...Color Constancy
-  CAPTCHA") — anders zou zo'n titel ten onrechte als block worden gezien.
-- Journals zonder received-datum worden automatisch toegevoegd aan `skip_journals.csv`
+## Step 2 — Article downloader (deprecated)
 
-### Voortgang bijhouden — `progress.json`
-Per journal wordt opgeslagen: `status` (`in_progress`/`done`), `last_page` (laatste
-volledig voltooide paginalijst), `articles_saved`, `received_count`, `min_year`
-(de drempel die een `done`-status weerspiegelt) en `updated_at`. Het bestand wordt na
-elke voltooide pagina atomisch weggeschreven, dus een block kost hooguit één pagina.
+> **No longer usable (2026-08-18).** `link.springer.com` serves a Fastly **client
+> challenge** on every page, article and listing alike: HTTP 200, a short body with
+> `<title>Client Challenge</title>` and assets under `/_fs-ch-<id>/`.
+>
+> The clearance is bound to the client's TLS fingerprint, not to a cookie — after a
+> successful load in Chrome there is no `_fs_ch_*` cookie in the jar, and the
+> challenge cookie `_fs_ch_st_*` expires within seconds. So the `requests` path
+> cannot pass it and `_sync_cookies()` does not help: every following request is
+> challenged again. Extra headers (`Accept`, `Sec-Fetch-*`, `sec-ch-ua`) change
+> nothing.
+>
+> In practice every fetch falls through to Selenium. The data collected that way is
+> still correct — the "Blocked" / "Block cleared" log lines are misleading, not
+> wrong. Use step 2b instead.
 
-**Iteratief scrapen (2020 → 2010 → 2000)**: verlaag je `MIN_YEAR`, zet dan de betrokken
-journals in `progress.json` met de hand terug van `"done"` naar `"in_progress"` maar
-**behoud `last_page`**. Omdat Springer nieuw-naar-oud lijst, staan de oudere artikelen op
-de látere pagina's; de run hervat op `last_page + 1` en gaat direct door met de nieuwe data
-zonder al opgehaalde pagina's opnieuw te bezoeken. Het `min_year`-veld laat zien tot welke
-drempel elke `done` is voltooid.
+- Walks each journal's article list via `/journal/{id}/articles?page={n}`, then
+  extracts metadata per article page
+- Stores `data/{journal_id}/{doi}.json`
+- Stops paginating once it reaches an article older than `MIN_YEAR`
+- Resumable per article (`already_downloaded()`) and per page (`progress.json`)
+- Block detection is content-aware: a page counts as blocked only when the real
+  content is absent *and* a full block-page string is present. Bare words like
+  "captcha" are not matched, because they occur in legitimate article titles
+- Journals that yield no received dates are appended to `skip_journals.csv`
 
-**Grenspagina wordt automatisch opnieuw bezocht**: op de pagina waar de stop valt, worden
-alleen de artikelen ván of ná `MIN_YEAR` verwerkt; de oudere helft op diezelfde pagina
-wordt overgeslagen. Daarom telt die grenspagina níét als "volledig voltooid": `last_page`
-wijst naar de laatste vólledig verwerkte pagina (één eerder). Bij een volgende iteratie
-(lagere `MIN_YEAR`) hervat de run dus op de grenspagina zelf, slaat `already_downloaded()`
-de al opgeslagen helft over, en pikt de nu-binnen-bereik oudere helft alsnog op. Zo gaat
-geen enkel artikel op de grenspagina verloren.
+### `progress.json`
 
-### Formaat van opgeslagen JSON
+Per journal: `status`, `last_page`, `articles_saved`, `received_count`, `min_year`,
+`updated_at`. Written after each completed page.
+
+`last_page` points at the last *fully* processed page. The page where `MIN_YEAR`
+cuts in is only partly processed, so it is deliberately not counted — a later run
+with a lower `MIN_YEAR` revisits it and picks up the older half, while
+`already_downloaded()` skips what was saved before.
+
+When lowering `MIN_YEAR`, set the affected journals back from `done` to
+`in_progress` by hand but **keep `last_page`**: Springer lists newest first, so the
+older articles are on the later pages.
+
+## Step 2b — Crossref collector
+
+Fetches the same metadata from the Crossref REST API instead of Springer HTML. No
+browser, no challenge, no backoff. Writes the same JSON shape to the same
+`data/{journal_id}/{doi}.json`, so `parse_output.py` runs unchanged.
+
+```
+python crossref_collector.py
+```
+
+`Received` and `Accepted` live in Crossref's `assertion` array. Validated
+field-by-field against already-scraped articles: dates, authors, volume, pages and
+ISSN match exactly.
+
+### Springer only
+
+Assertions are **voluntary publisher deposits**, not a standard Crossref field.
+Springer deposits them; **Elsevier and IEEE deposit none at all**, so for those
+publishers scraping remains the only route.
+
+Note that the `search.crossref.org` UI does not display assertions — only the API
+returns them. In the JSON the `assertion` array sits well below the date fields,
+among licence and funder data.
+
+### Three fields are left empty
+
+Written as `null`/empty rather than approximated, so the database keeps NULL where
+the value was not determined instead of mixing two vocabularies in one column:
+
+| Field | Reason |
+|---|---|
+| `affiliations` | Crossref does not carry them for Springer |
+| `article_type` | Crossref only ever reports `"journal-article"`; the scraper captured granular values like "Original Article" |
+| `open_access` | Springer attaches its TDM licence to paywalled articles too, so the `license` array is not an open-access signal |
+
+None of the three is read by analysis code — they appear only in the ingest schemas
+of `parse_output.py`.
+
+### Behaviour
+
+- Pages per journal through `/journals/{issn}/works` using Crossref's **cursor**
+  (deep paging), filtered on
+  `type:journal-article,from-pub-date:{MIN_YEAR}-01-01`. The bulk listing carries
+  the assertions, so no per-DOI request is needed.
+- `CONTACT_EMAIL` goes into the User-Agent for Crossref's polite pool; without a
+  contact address you land in the shared pool and hit 429s sooner. `Retry-After` is
+  respected.
+- **Never overwrites.** A DOI already present under `data/{journal_id}/` is skipped,
+  so affiliation data in previously scraped files stays intact and a run only fills
+  gaps. The check is case-insensitive.
+- Each new file carries `"source": "crossref"`. `parse_output.py` reads named keys
+  only, so it is ignored at ingest but distinguishes API rows from scraped rows in
+  the JSON corpus.
+- Partial Crossref dates (`published-print` is often year-and-month only) become
+  `null` rather than a fabricated day.
+
+### `crossref_issn_map.csv`
+
+Crossref works on ISSN, but `springer.journals` holds only `journal_id` and `name`.
+The mapping is derived automatically from the `issn` in already-scraped JSON files
+(the scraper captured the electronic ISSN; Crossref accepts either variant and
+returns identical results). Hand-edited values always win.
+
+Journals with no scraped data get an empty `issn` and are **skipped** with a
+warning — deliberately not looked up by title, since a fuzzy match would silently
+collect a different journal. Add the ISSN by hand to include them. Some entries are
+legitimately empty: one is a book archive rather than a journal, and several are
+recent launches that Crossref does not index as journals.
+
+### `crossref_progress.json`
+
+Separate from `progress.json` so the two collectors never overwrite each other's
+state. Per journal: `status`, `articles_written`, `already_present`,
+`received_count`, `min_year`, `issn`, `updated_at`.
+
+A journal recorded at a higher `min_year` is re-run automatically, so unlike
+`progress.json` there is no need to reset anything by hand after lowering
+`MIN_YEAR`. Resuming needs no stored cursor: completed articles are recognised by
+file existence, and re-walking a journal costs only a few requests.
+
+## Stored JSON format
+
 ```json
 {
   "doi": "10.1007/s10015-026-01123-8",
@@ -105,40 +179,36 @@ geen enkel artikel op de grenspagina verloren.
 }
 ```
 
-## Stap 3 — Parse output ✅
-- JSON-bestanden inlezen en schrijven naar vier PostgreSQL-tabellen:
+`fallback_date_value` is filled only when none of received/accepted/published was
+found, so it flags genuinely missing data instead of duplicating an issue date.
 
-| Tabel | Inhoud |
+## Step 3 — Parse output
+
+Reads the JSON files into four PostgreSQL tables:
+
+| Table | Contents |
 |---|---|
-| `springer.articles` | Één rij per artikel (alle platte velden) |
-| `springer.authors` | Één rij per auteur, met positie (volgorde in paper) |
-| `springer.affiliations` | Één rij per affiliatie met institutienaam |
-| `springer.affiliation_authors` | Koppeltabel affiliatie ↔ auteur |
+| `springer.articles` | One row per article (all flat fields) |
+| `springer.authors` | One row per author, with position in the paper |
+| `springer.affiliations` | One row per affiliation |
+| `springer.affiliation_authors` | Affiliation ↔ author link table |
 
-- **Batch-schrijven**: elke 500 artikelen worden geflushed naar de DB (geheugengebruik laag, DB-round-trips beperkt)
-- **Hervattbaar**: bij opstarten worden alle DOIs uit `springer.articles` geladen in een set; al verwerkte bestanden worden overgeslagen zonder de JSON te lezen
-- **Logging**: tegelijk naar terminal en naar `logs/parse_output_YYYYMMDD_HHMMSS.log`
-- Tabel- en kolomaanmaak volledig automatisch via de gedeelde `Saver`-library
+- Batched writes, flushed per `BATCH_SIZE` articles, all four tables in one
+  transaction
+- Resumable: DOIs already in `springer.articles` are loaded into a set at startup
+  and skipped without reading the JSON
+- `review_days` is computed at ingest as `accepted - received`
+- Logs to terminal and to `logs/parse_output_<timestamp>.log`
 
-## Opslagschatting
-| Aanpak | Grootte |
-|---|---|
-| Volledige HTML opslaan | ~130 GB |
-| Alleen metadata als JSON | ~400 MB |
+## Technical notes
 
-Door alleen de benodigde velden op te slaan blijft de totale schijfruimte ruim onder de 1 GB voor de verwachte ~400.000 artikelen (143 journals, 2000–heden).
-
-## Technische keuzes
-- **Taal**: Python 3.9 (`requests`, `BeautifulSoup4`)
-- **Database**: PostgreSQL via gedeelde `Postgress`/`Saver` library (pyodbc)
-- **Selenium**: alleen als fallback bij een block/CAPTCHA (niet voor normale fetches —
-  Springer-pagina's zijn server-side rendered); lazy geïmporteerd, dus alleen nodig zodra
-  er daadwerkelijk geblokkeerd wordt. **Vereist Selenium ≥ 4.6** zodat de ingebouwde
-  Selenium Manager zelf de juiste chromedriver ophaalt: `pip install -U selenium`.
-  Bij een oudere Selenium zonder Selenium Manager valt het script terug op
-  `webdriver-manager` als die geïnstalleerd is (`pip install webdriver-manager`); anders
-  stopt het netjes met een installatie-instructie en blijft de voortgang bewaard.
-  Een hard IP-block lost de browser niet op — val dan terug op de schone hervatting
-  (progress + opnieuw starten vanaf een ander netwerk/VPN).
-- **Tussenopslag**: minimale JSON-bestanden per artikel — biedt robuustheid zonder opslagprobleem
-- **Periode**: iteratief, instelbaar via `MIN_YEAR` (eerst 2020, daarna 2010, uiteindelijk 2000)
+- Python 3.9, `requests`, `BeautifulSoup4`
+- PostgreSQL via the shared `Postgress`/`Saver` library
+- Only the needed fields are stored as small per-article JSON files, rather than
+  full HTML
+- Collection window is set by `MIN_YEAR`
+- Selenium is only a fallback for the (now permanent) Springer block, lazily
+  imported. Requires Selenium ≥ 4.6 so its own driver manager fetches a matching
+  chromedriver (`pip install -U selenium`); otherwise it falls back to
+  `webdriver-manager` if installed, and exits cleanly with instructions if neither
+  is available

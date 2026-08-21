@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 BASE_URL = "https://link.springer.com"
 OUTPUT_DIR = "data"
-MIN_YEAR = 2020
+MIN_YEAR = 2016
 
 # Browser identity shared by the requests fast path and the Selenium fallback,
 # so both look like the same client to Springer.

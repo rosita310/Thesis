@@ -17,8 +17,7 @@ SCHEMA = "springer"
 DATA_DIR = "data"
 LOGS_DIR = "logs"
 
-# With ~400k articles expected, BATCH_SIZE=500 means ~800 DB flush cycles —
-# a good balance between memory use and number of round-trips.
+# With ~400k articles expected, BATCH_SIZE=500 means ~800 DB flush cycles
 BATCH_SIZE = 500
 
 
