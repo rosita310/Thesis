@@ -1,5 +1,6 @@
 """
-Loads the parsed ACM front matter into the database for the co-author editor case study (SQ1.2).
+Loads the parsed ACM front matter into the database for the co-author editor case
+study (SQ1.2).
 
 parse_md_to_json.py writes one JSON per issue (the editorial board).
 This script loads that corpus into two tables, adding the issue key taken from the
@@ -93,6 +94,42 @@ def parse_filename(stem: str) -> dict | None:
 # Corpus assembly
 # ---------------------------------------------------------------------------
 
+def build_issue_board(key: dict, editors: list, stats: Counter) -> list[dict]:
+    """Board rows for one issue, de-duplicated on (name, role, association).
+
+    The association is part of the key, because a board can carry two *different* people
+    with the same name. Keying on (name, role) alone deletes one of them.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    seen_name_role: set[tuple[str, str]] = set()
+    rows = []
+    for editor in editors:
+        name = (editor.get("name") or "").strip()
+        role = (editor.get("role") or "").strip()
+        association = (editor.get("association") or "").strip()
+        if not name:
+            continue
+        if (name, role, association) in seen:
+            stats["duplicate_editor_rows"] += 1
+            continue
+        if (name, role) in seen_name_role:
+            # same name and role, different affiliation: two people, both kept
+            stats["shared_name_rows_kept"] += 1
+        seen.add((name, role, association))
+        seen_name_role.add((name, role))
+        rows.append({
+            **key,
+            "name": name,
+            "role": role,
+            "association": association or None,
+        })
+
+    # One person holding two roles in the same issue keeps both rows, but they are 
+    # one board member, which is what n_board counts.
+    per_person = Counter((r["name"], r["association"]) for r in rows)
+    stats["multi_role_people"] += sum(1 for n in per_person.values() if n > 1)
+    return rows
+
 def load_corpus(data_dir: Path, limit: int | None = None) -> dict:
     """Read every issue JSON into issues/board rows plus quality counters.
     """
@@ -130,25 +167,12 @@ def load_corpus(data_dir: Path, limit: int | None = None) -> dict:
             "volume_label": issue["volume_label"],
             "issue_label": issue["issue_label"],
         }
-        seen: set[tuple[str, str]] = set()
-        issue_board = []
-        for editor in issue["editors"]:
-            name = (editor.get("name") or "").strip()
-            role = (editor.get("role") or "").strip()
-            if not name:
-                continue
-            if (name, role) in seen:
-                stats["duplicate_editor_rows"] += 1
-                continue
-            seen.add((name, role))
-            issue_board.append({
-                **key,
-                "name": name,
-                "role": role,
-                "association": (editor.get("association") or "").strip() or None,
-            })
+        issue_board = build_issue_board(key, issue["editors"], stats)
 
-        n_board = len(issue_board)
+        # A board member is a person, not a row. The same person can be listed under two
+        # roles in one issue, and two different people can share a name, so neither the
+        # row count nor the distinct-name count is right on its own.
+        n_board = len({(r["name"], r["association"]) for r in issue_board})
         issue_row = {
             "journal_name": issue["journal_name"],
             "volume_label": issue["volume_label"], "volume_num": issue["volume_num"],
@@ -187,7 +211,15 @@ def print_report(result: dict) -> None:
     print("\n=== ANOMALIES ===")
     for key in ("bad_filename", "unreadable_json", "duplicate_editor_rows",
                 "issues_without_board"):
-        print(f"  {key:<24} {stats[key]:>7}")
+        print(f"  {key:<30} {stats[key]:>7}")
+
+    # Two ways one person can occupy more than one row of an issue's board. Both are
+    # kept on purpose; both matter to the DBLP person match, so both are
+    # reported rather than folded into `duplicate_editor_rows`.
+    print(f"  {'shared_name_rows_kept':<30} {stats['shared_name_rows_kept']:>7}"
+          f"   (same name+role, different affiliation -> distinct people)")
+    print(f"  {'multi_role_people':<30} {stats['multi_role_people']:>7}"
+          f"   (one person, >1 role in the same issue)")
 
     print("\n=== ROLES (all roles count as board membership) ===")
     for role, count in Counter(r["role"] for r in board).most_common():
@@ -343,6 +375,40 @@ def selftest() -> None:
     check("filename: a journal name containing underscores is not split early",
           name_parts("A_B Journal_Volume_3__Issue_2")["journal_name"] == "A_B Journal")
     check("filename: unparseable name returns None", parse_filename("random.md") is None)
+
+    # --- board de-duplication --------------------------------
+    def board(editors):
+        stats = Counter()
+        return build_issue_board({"issue_label": "1"}, editors, stats), stats
+
+    rows, stats = board([
+        {"name": "Ada Lovelace", "role": "Associate Editor", "association": "Tsinghua"},
+        {"name": "Ada Lovelace", "role": "Associate Editor", "association": "UT Dallas"},
+    ])
+    check("dedup: same name+role at different institutions are two people",
+          len(rows) == 2 and stats["duplicate_editor_rows"] == 0
+          and stats["shared_name_rows_kept"] == 1)
+
+    rows, stats = board([
+        {"name": "Ada Lovelace", "role": "Editor-in-Chief", "association": "X"},
+        {"name": "Ada Lovelace", "role": "Editor-in-Chief", "association": "X"},
+    ])
+    check("dedup: a repeated identical entry still collapses",
+          len(rows) == 1 and stats["duplicate_editor_rows"] == 1)
+
+    rows, stats = board([
+        {"name": "Ada Lovelace", "role": "Associate Editor", "association": "X"},
+        {"name": "Ada Lovelace", "role": "Special Issue Editor", "association": "X"},
+    ])
+    check("dedup: one person under two roles keeps both rows, counted once",
+          len(rows) == 2 and stats["multi_role_people"] == 1
+          and len({(r["name"], r["association"]) for r in rows}) == 1)
+
+    rows, stats = board([{"name": "  ", "role": "Editor", "association": "X"},
+                         {"name": "Grace Hopper", "role": "Editor", "association": None}])
+    check("dedup: a blank name is dropped and a missing association becomes NULL",
+          len(rows) == 1 and rows[0]["name"] == "Grace Hopper"
+          and rows[0]["association"] is None)
 
     # --- batching for the database load (this module) ----------------------
     records = [{"issue": {"source_file": f"{i}.json"}, "board": [{"n": i}] * (i + 1)}
