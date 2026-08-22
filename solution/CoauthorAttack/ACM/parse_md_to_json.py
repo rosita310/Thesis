@@ -1,6 +1,5 @@
 import json
 import logging
-from collections import Counter
 from pathlib import Path
 import re
 import unicodedata
@@ -161,16 +160,6 @@ NAME_MIN_WORDS = 2
 NAME_MAX_WORDS = 5
 
 # ==========================================
-# ISSUE YEAR
-# ==========================================
-
-# A plausible year alone on a line; years in copyright lines are not the issue year.
-YEAR_LINE_PATTERN = re.compile(r"^[\s*_#]*((?:19|20)\d{2})[\s*_#]*$", re.MULTILINE)
-YEAR_ANY_PATTERN = re.compile(r"\b((?:19|20)\d{2})\b")
-YEAR_MIN = 1990
-YEAR_MAX = 2030
-
-# ==========================================
 # LOGGING SETUP
 # ==========================================
 logging.basicConfig(
@@ -255,26 +244,6 @@ def is_person_name(name: str) -> bool:
     if not any(character.isalpha() for character in name):
         return False
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
-
-
-#    Extracts the issue year. None when the front matter does not print one.
-def parse_year(text: str):
-    for match in YEAR_LINE_PATTERN.finditer(text):
-        year = int(match.group(1))
-        if YEAR_MIN <= year <= YEAR_MAX:
-            return year
-    return None
-
-
-#    Weaker guess for front matter without a standalone year: the most frequent
-#    plausible year anywhere in it. Reported separately so the caller can prefer
-#    stronger evidence.
-def parse_year_fallback(text: str):
-    years = [int(y) for y in YEAR_ANY_PATTERN.findall(text)]
-    years = [y for y in years if YEAR_MIN <= y <= YEAR_MAX]
-    if not years:
-        return None
-    return Counter(years).most_common(1)[0][0]
 
 
 # ==========================================
@@ -390,8 +359,6 @@ def parse_markdown_file(md_path) -> dict:
 
     return {
         "journal_file": md_path.name,
-        "year": parse_year(content),
-        "year_fallback": parse_year_fallback(content),
         "editors": extracted_editors,
     }
 
