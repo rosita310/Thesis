@@ -13,7 +13,7 @@ DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
 MAX_FILES = 100                         # Set to None to process all valid files
-OVERWRITE_EXISTING = False              # True: re-parse and overwrite. False: skip if JSON exists.
+OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     
 )
@@ -100,6 +100,8 @@ ROLE_MAPPING = {
     "editors": "Editor",
     "reprodicibility board": "Reproducibility Board Member",
     "reproducibility editorial board": "Reproducibility Board Member",
+    "associate editors for feature articles": "Associate Editor",
+    "ieee antennas and propagation magazine editorial board": "Editorial Board Member",   
 }
 
 IGNORED_ROLES = {
@@ -114,6 +116,18 @@ IGNORED_ROLES = {
     "founding editor",
     "founding co-editors-in-chief",
     "publicity chairs",
+    "ieee officers",
+    "ieee executive staff",
+    "ieee publishing operations",
+    "ieee periodicals",
+    "president",
+    "president-elect",
+    "past president",
+    "secretary",
+    "treasurer",
+    "director & secretary",
+    "director & treasurer",
+    "vice president",
 }
 
 TERMINATING_ROLES = {
@@ -165,35 +179,42 @@ def log_unmapped_role(role_name: str, journal_name: str):
     with open(UNMAPPED_ROLES_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{journal_name}] - {role_name}\n")
 
+def parse_inline_entry(line: str) -> tuple[str, str] | None:
+    """Checks if a line contains 'Name, Role' or 'Role: Name' inline format.
+
+    Returns (Name, Role) if matched, else None.
+    """
+    # Pattern 1: 'Name, Role' (e.g., "CHRISTOPHE FUMEAUX, Editor-in-Chief" or "KAREN BARTLESON, President")
+    if "," in line:
+        parts = line.split(",", 1)
+        potential_name = parts[0].strip()
+        potential_role = parts[1].strip().lower()
+
+        if potential_role in ROLE_MAPPING:
+            return potential_name, ROLE_MAPPING[potential_role]
+
+    # Pattern 2: 'Role: Name' (e.g., "Director, Production Services: PETER M. TUOHY")
+    if ":" in line:
+        parts = line.split(":", 1)
+        potential_role = parts[0].strip().lower()
+        potential_name = parts[1].strip()
+
+        if potential_role in ROLE_MAPPING:
+            return potential_name, ROLE_MAPPING[potential_role]
+
+    return None
+
+
 def parse_markdown_file(md_path: Path) -> dict:
-    """Reads the columnar Markdown and parses editors using heuristics."""
     with open(md_path, "r", encoding="utf-8") as file:
         text = file.read()
-    
-    # Normalize basic unicode 
+
     text = unicodedata.normalize("NFKC", text)
-    
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-
-    # Pre-process multi-line headers
-    merged_lines = []
-    skip_next = False
-    for i in range(len(lines)):
-        if skip_next:
-            skip_next = False
-            continue
-            
-        current_line = lines[i]
-        # If line ends with 'for', 'of', or 'and' and it's not the last line
-        if re.search(r"\b(for|of|and)$", current_line.lower()) and i + 1 < len(lines):
-            merged_lines.append(f"{current_line} {lines[i+1]}")
-            skip_next = True
-        else:
-            merged_lines.append(current_line)
-            
-    lines = merged_lines
-
+    raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
     journal_name = md_path.name
+
+    # Skip Table of Contents / Page numbers (lines starting with digits + whitespace)
+    lines = [line for line in raw_lines if not re.match(r"^\d+\s+", line)]
 
     extracted_editors = []
     current_role = None
@@ -203,12 +224,10 @@ def parse_markdown_file(md_path: Path) -> dict:
     for line in lines:
         clean_line = line.lower()
 
-        # Skip Table of Contents lines (starts with a number)
-        if re.match(r"^\d+\s+", clean_line):
-            continue
-
-        # Check for complete termination
-        if clean_line in TERMINATING_ROLES or any(t in clean_line for t in TERMINATING_TEXTS):
+        # Check for Termination
+        if clean_line in TERMINATING_ROLES or any(
+            t in clean_line for t in TERMINATING_TEXTS
+        ):
             if current_name and current_role:
                 extracted_editors.append({
                     "name": current_name,
@@ -217,8 +236,34 @@ def parse_markdown_file(md_path: Path) -> dict:
                 })
             break
 
-        # Check for Ignored Roles
+        # Check for Inline Name/Role Combos
+        inline_match = parse_inline_entry(line)
+        if inline_match:
+            # Save any editor currently being built
+            if current_name and current_role:
+                extracted_editors.append({
+                    "name": current_name,
+                    "role": current_role,
+                    "association": " ".join(affiliation_lines).strip(),
+                })
+                affiliation_lines = []
+
+            name, role = inline_match
+            extracted_editors.append(
+                {"name": name, "role": role, "association": ""}
+            )
+            current_name = None
+            current_role = None
+            continue
+
+        # Check for Ignored Roles / Organizational Headers
         if clean_line in IGNORED_ROLES:
+            if current_name and current_role:
+                extracted_editors.append({
+                    "name": current_name,
+                    "role": current_role,
+                    "association": " ".join(affiliation_lines).strip(),
+                })
             current_role = None
             current_name = None
             affiliation_lines = []
@@ -229,13 +274,12 @@ def parse_markdown_file(md_path: Path) -> dict:
         if clean_line in ROLE_MAPPING:
             matched_role = ROLE_MAPPING[clean_line]
 
-        # Fallback: Heuristic Fuzzy Match for Rare Roles
+        # Fallback: Fuzzy Heuristic for Multi-line or Custom Headers
         if not matched_role and is_potential_role_header(line):
             matched_role = f"Unmapped: {line}"
             log_unmapped_role(line, journal_name)
 
         if matched_role:
-            # Save previous editor if state was active
             if current_name and current_role:
                 extracted_editors.append({
                     "name": current_name,
@@ -247,39 +291,14 @@ def parse_markdown_file(md_path: Path) -> dict:
             current_role = matched_role
             continue
 
-        # If no role is active, skip processing names
         if not current_role:
             continue
 
-        # Process Editor Data under an active role
+        # Collect Names and Affiliations under active roles
         if not current_name:
-            # Check for "Name, Role" inline formatting
-            if "," in line:
-                parts = line.split(",", 1)
-                potential_name = parts[0].strip()
-                potential_role = parts[1].strip().lower()
-                
-                # If the right side of the comma is a recognized role
-                if potential_role in ROLE_MAPPING:
-                    # Save the previous editor if one is active
-                    if current_name and current_role:
-                        extracted_editors.append({
-                            "name": current_name,
-                            "role": current_role,
-                            "association": " ".join(affiliation_lines).strip(),
-                        })
-                        affiliation_lines = []
-                    
-                    # Set the new inline data
-                    current_name = potential_name
-                    current_role = ROLE_MAPPING[potential_role]
-                    continue
-
-            # Standard path: line is just the name
             current_name = line
             continue
 
-        # Email anchor terminates the current editor
         if "@" in line and "." in line.split("@")[-1]:
             extracted_editors.append({
                 "name": current_name,
@@ -291,7 +310,7 @@ def parse_markdown_file(md_path: Path) -> dict:
         else:
             affiliation_lines.append(line)
 
-    # Flush the last editor if the file ended without a terminating text
+    # Flush final editor
     if current_name and current_role:
         extracted_editors.append({
             "name": current_name,
