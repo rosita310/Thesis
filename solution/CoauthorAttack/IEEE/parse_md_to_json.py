@@ -174,6 +174,25 @@ def parse_markdown_file(md_path: Path) -> dict:
     text = unicodedata.normalize("NFKC", text)
     
     lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    # Pre-process multi-line headers
+    merged_lines = []
+    skip_next = False
+    for i in range(len(lines)):
+        if skip_next:
+            skip_next = False
+            continue
+            
+        current_line = lines[i]
+        # If line ends with 'for', 'of', or 'and' and it's not the last line
+        if re.search(r"\b(for|of|and)$", current_line.lower()) and i + 1 < len(lines):
+            merged_lines.append(f"{current_line} {lines[i+1]}")
+            skip_next = True
+        else:
+            merged_lines.append(current_line)
+            
+    lines = merged_lines
+
     journal_name = md_path.name
 
     extracted_editors = []
@@ -183,6 +202,10 @@ def parse_markdown_file(md_path: Path) -> dict:
 
     for line in lines:
         clean_line = line.lower()
+
+        # Skip Table of Contents lines (starts with a number)
+        if re.match(r"^\d+\s+", clean_line):
+            continue
 
         # Check for complete termination
         if clean_line in TERMINATING_ROLES or any(t in clean_line for t in TERMINATING_TEXTS):
@@ -230,6 +253,29 @@ def parse_markdown_file(md_path: Path) -> dict:
 
         # Process Editor Data under an active role
         if not current_name:
+            # Check for "Name, Role" inline formatting
+            if "," in line:
+                parts = line.split(",", 1)
+                potential_name = parts[0].strip()
+                potential_role = parts[1].strip().lower()
+                
+                # If the right side of the comma is a recognized role
+                if potential_role in ROLE_MAPPING:
+                    # Save the previous editor if one is active
+                    if current_name and current_role:
+                        extracted_editors.append({
+                            "name": current_name,
+                            "role": current_role,
+                            "association": " ".join(affiliation_lines).strip(),
+                        })
+                        affiliation_lines = []
+                    
+                    # Set the new inline data
+                    current_name = potential_name
+                    current_role = ROLE_MAPPING[potential_role]
+                    continue
+
+            # Standard path: line is just the name
             current_name = line
             continue
 
