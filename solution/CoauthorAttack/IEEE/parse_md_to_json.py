@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import logging
 from pathlib import Path
@@ -180,25 +181,20 @@ def log_unmapped_role(role_name: str, journal_name: str):
         f.write(f"[{journal_name}] - {role_name}\n")
 
 def parse_inline_entry(line: str) -> tuple[str, str] | None:
-    """Checks if a line contains 'Name, Role' or 'Role: Name' inline format.
-
-    Returns (Name, Role) if matched, else None.
-    """
-    # Pattern 1: 'Name, Role' (e.g., "CHRISTOPHE FUMEAUX, Editor-in-Chief" or "KAREN BARTLESON, President")
+    """Checks if a line contains 'Name, Role' or 'Role: Name' inline format."""
+    # Pattern 1: 'Name, Role'
     if "," in line:
         parts = line.split(",", 1)
         potential_name = parts[0].strip()
         potential_role = parts[1].strip().lower()
-
         if potential_role in ROLE_MAPPING:
             return potential_name, ROLE_MAPPING[potential_role]
 
-    # Pattern 2: 'Role: Name' (e.g., "Director, Production Services: PETER M. TUOHY")
+    # Pattern 2: 'Role: Name'
     if ":" in line:
         parts = line.split(":", 1)
         potential_role = parts[0].strip().lower()
         potential_name = parts[1].strip()
-
         if potential_role in ROLE_MAPPING:
             return potential_name, ROLE_MAPPING[potential_role]
 
@@ -210,21 +206,48 @@ def parse_markdown_file(md_path: Path) -> dict:
         text = file.read()
 
     text = unicodedata.normalize("NFKC", text)
-    raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    # Clean raw lines: remove blank lines, trim spaces, and collapse multiple spaces into one
+    raw_lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in text.split("\n")
+        if line.strip()
+    ]
+
+    # Filter out Table of Contents lines (starts with numbers followed by text/tabs)
+    filtered_lines = [
+        line for line in raw_lines if not re.match(r"^\d+[\s\t]+", line)
+    ]
+
+    # Merge Multi-Line Headers (robust against trailing whitespace variations)
+    merged_lines = []
+    skip_next = False
+    for i in range(len(filtered_lines)):
+        if skip_next:
+            skip_next = False
+            continue
+
+        current_line = filtered_lines[i]
+        # Check if line ends with prepositions like 'for', 'of', 'and'
+        if (
+            re.search(r"\b(for|of|and)$", current_line.lower())
+            and i + 1 < len(filtered_lines)
+        ):
+            merged_lines.append(f"{current_line} {filtered_lines[i+1]}")
+            skip_next = True
+        else:
+            merged_lines.append(current_line)
+
     journal_name = md_path.name
-
-    # Skip Table of Contents / Page numbers (lines starting with digits + whitespace)
-    lines = [line for line in raw_lines if not re.match(r"^\d+\s+", line)]
-
     extracted_editors = []
     current_role = None
     current_name = None
     affiliation_lines = []
 
-    for line in lines:
+    for line in merged_lines:
         clean_line = line.lower()
 
-        # Check for Termination
+        # Termination Check
         if clean_line in TERMINATING_ROLES or any(
             t in clean_line for t in TERMINATING_TEXTS
         ):
@@ -236,10 +259,22 @@ def parse_markdown_file(md_path: Path) -> dict:
                 })
             break
 
+        # Check and Ignore Corporate Officers & Staff (BEFORE inline & header checks)
+        if any(role in clean_line for role in IGNORED_ROLES):
+            if current_name and current_role:
+                extracted_editors.append({
+                    "name": current_name,
+                    "role": current_role,
+                    "association": " ".join(affiliation_lines).strip(),
+                })
+            current_role = None
+            current_name = None
+            affiliation_lines = []
+            continue
+
         # Check for Inline Name/Role Combos
         inline_match = parse_inline_entry(line)
         if inline_match:
-            # Save any editor currently being built
             if current_name and current_role:
                 extracted_editors.append({
                     "name": current_name,
@@ -256,25 +291,12 @@ def parse_markdown_file(md_path: Path) -> dict:
             current_role = None
             continue
 
-        # Check for Ignored Roles / Organizational Headers
-        if clean_line in IGNORED_ROLES:
-            if current_name and current_role:
-                extracted_editors.append({
-                    "name": current_name,
-                    "role": current_role,
-                    "association": " ".join(affiliation_lines).strip(),
-                })
-            current_role = None
-            current_name = None
-            affiliation_lines = []
-            continue
-
-        # Check for Role Headers (Exact Match First)
+        # Check for Role Headers (Exact Match)
         matched_role = None
         if clean_line in ROLE_MAPPING:
             matched_role = ROLE_MAPPING[clean_line]
 
-        # Fallback: Fuzzy Heuristic for Multi-line or Custom Headers
+        # Fuzzy Heuristic Fallback
         if not matched_role and is_potential_role_header(line):
             matched_role = f"Unmapped: {line}"
             log_unmapped_role(line, journal_name)
@@ -294,7 +316,7 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not current_role:
             continue
 
-        # Collect Names and Affiliations under active roles
+        # Parse Name and Affiliations under active roles
         if not current_name:
             current_name = line
             continue
