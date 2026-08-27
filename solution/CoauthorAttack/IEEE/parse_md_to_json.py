@@ -35,7 +35,7 @@ INSTITUTION_KEYWORDS = {
 }
 
 BLOCKLIST_KEYWORDS = {
-    "cf.", "silicon device", "technology"
+    "cf.", "silicon device", "technology", "editorial:"
 }
 
 # ==========================================
@@ -112,7 +112,8 @@ ROLE_MAPPING = {
     "executive editor": "Executive Editor",
     "outgoing editor-in-chief": "Outgoing Editor-in-Chief",
     "associate editor-in-chief": "Associate Editor-in-Chief",
-    "senior editorial assistant": "Senior Editorial Assistant",   
+    "senior editorial assistant": "Senior Editorial Assistant",
+    "senior managing editor": "Senior Managing Editor",
 }
 
 IGNORED_ROLES = {
@@ -153,6 +154,17 @@ IGNORED_ROLES = {
     "director & secretary",
     "director & treasurer",
     "vice president",
+    "staff director",
+    "senior director",
+    "executive director",
+    "associate director",
+    "production editor",
+    "publications coordinator",
+    "manager of administrative services",
+    "transactions operations chair",
+    "past editors-in-chief",
+    "past editor-in-chief",
+    "director, division vi",
 }
 
 TERMINATING_ROLES = {
@@ -207,7 +219,8 @@ def is_potential_role_header(line: str) -> bool:
         return False
     if any(inst in clean_line for inst in INSTITUTION_KEYWORDS):
         return False
-    if any(role_word in clean_line for role_word in ROLE_KEYWORDS):
+    # Enforce word boundaries so "vice" doesn't match words like "device" or "service"
+    if any(re.search(rf"\b{role_word}\b", clean_line) for role_word in ROLE_KEYWORDS):
         return True
     return False
 
