@@ -13,8 +13,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 100                         # Set to None to process all valid files
-OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
+MAX_FILES = 500                         # Set to None to process all valid files
+OVERWRITE_EXISTING = True               # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     
 )
@@ -32,6 +32,10 @@ ROLE_KEYWORDS = {
 INSTITUTION_KEYWORDS = {
     "university", "univ", "institute", "inst", "department", "dept", 
     "inc", "corp", "laboratory", "lab", "center", "college", "school"
+}
+
+BLOCKLIST_KEYWORDS = {
+    "cf.", "silicon device", "technology"
 }
 
 # ==========================================
@@ -102,10 +106,30 @@ ROLE_MAPPING = {
     "reprodicibility board": "Reproducibility Board Member",
     "reproducibility editorial board": "Reproducibility Board Member",
     "associate editors for feature articles": "Associate Editor",
-    "ieee antennas and propagation magazine editorial board": "Editorial Board Member",   
+    "ieee antennas and propagation magazine editorial board": "Editorial Board Member",
+    "track editor": "Track Editor",
+    "senior editor": "Senior Editor",
+    "executive editor": "Executive Editor",
+    "outgoing editor-in-chief": "Outgoing Editor-in-Chief",
+    "associate editor-in-chief": "Associate Editor-in-Chief",
+    "senior editorial assistant": "Senior Editorial Assistant",   
 }
 
 IGNORED_ROLES = {
+    "chief financial officer",
+    "chief marketing officer",
+    "chief governance officer",
+    "chief information officer",
+    "chief human resources officer",
+    "chief publication officer",
+    "director of journals",
+    "managing director",
+    "editorial director",
+    "production director",
+    "journals coordinator",
+    "general counsel and chief compliance officer",
+    "administrative committee",
+    "transactions operations committee",
     "advisory board",
     "advisory board members",
     "information director",
@@ -157,14 +181,26 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logging.getLogger().addHandler(console_handler)
 
-
 # ==========================================
 # PARSING LOGIC 
 # ==========================================
 
 def is_potential_role_header(line: str) -> bool:
     """Evaluates if a line is likely a custom role or section header based on heuristics."""
+    # Length limit: Skip long article titles masquerading as roles
+    if len(line) > 75: 
+        return False
+        
     clean_line = line.lower().strip()
+    
+    # Exclude all-caps generic plural section headers (e.g., SENIOR EDITORS)
+    if line.isupper() and clean_line.endswith('s') and clean_line not in ROLE_MAPPING:
+        return False
+
+    # Blocklist check for academic topics and edge-case text
+    if any(block_word in clean_line for block_word in BLOCKLIST_KEYWORDS):
+        return False
+
     words = clean_line.split()
     
     if len(words) > 8 or len(words) == 0:
@@ -182,24 +218,27 @@ def log_unmapped_role(role_name: str, journal_name: str):
 
 def parse_inline_entry(line: str) -> tuple[str, str] | None:
     """Checks if a line contains 'Name, Role' or 'Role: Name' inline format."""
-    # Pattern 1: 'Name, Role'
-    if "," in line:
-        parts = line.split(",", 1)
-        potential_name = parts[0].strip()
-        potential_role = parts[1].strip().lower()
-        if potential_role in ROLE_MAPPING:
-            return potential_name, ROLE_MAPPING[potential_role]
-
-    # Pattern 2: 'Role: Name'
+    # Length limit for inline entries to avoid capturing heavily punctuated prose
+    if len(line) > 100:
+        return None
+        
+    # Pattern 1: 'Role: Name'
     if ":" in line:
         parts = line.split(":", 1)
         potential_role = parts[0].strip().lower()
-        potential_name = parts[1].strip()
+        potential_name = parts[1].strip().rstrip(',') # Clean trailing commas on names
+        if potential_role in ROLE_MAPPING:
+            return potential_name, ROLE_MAPPING[potential_role]
+
+    # Pattern 2: 'Name, Role' (Using rsplit to handle names that have commas like Jr., Ph.D.)
+    if "," in line:
+        parts = line.rsplit(",", 1)
+        potential_name = parts[0].strip()
+        potential_role = parts[1].strip().lower().rstrip(',') # Clean trailing commas on roles
         if potential_role in ROLE_MAPPING:
             return potential_name, ROLE_MAPPING[potential_role]
 
     return None
-
 
 def parse_markdown_file(md_path: Path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
@@ -215,9 +254,14 @@ def parse_markdown_file(md_path: Path) -> dict:
     ]
 
     # Filter out Table of Contents lines (starts with numbers followed by text/tabs)
-    filtered_lines = [
-        line for line in raw_lines if not re.match(r"^\d+[\s\t]+", line)
-    ]
+    # Also filter out Index Metadata lines (contains a semicolon followed by typical volume/page structures)
+    filtered_lines = []
+    for line in raw_lines:
+        if re.match(r"^\d+[\s\t]+", line):
+            continue
+        if ";" in line and re.search(r'\d+-\d+', line): # Metadata filter e.g., 'COML Feb 03 52-54'
+            continue
+        filtered_lines.append(line)
 
     # Merge Multi-Line Headers (robust against trailing whitespace variations)
     merged_lines = []
