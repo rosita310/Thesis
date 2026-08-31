@@ -165,6 +165,9 @@ IGNORED_ROLES = {
     "past editors-in-chief",
     "past editor-in-chief",
     "director, division vi",
+    "director, editorial services:",
+    "director, production services:",
+    "associate director, editorial services:"
 }
 
 TERMINATING_ROLES = {
@@ -174,10 +177,16 @@ TERMINATING_ROLES = {
 
 TERMINATING_TEXTS = [
     "ieee prohibits discrimination",
-    "digital object identifier",
-    "general information for contributors",
     "copyright and reprint permissions",
 ]
+
+SUBJECT_AREAS = {
+    "coding", "communication systems i", "communication systems ii",
+    "wireless communications i", "wireless communications ii",
+    "wireless networks i", "wireless networks ii", "communication theory",
+    "network architecture", "machine learning", "resource management and optimization",
+    "signal processing i", "signal processing ii"
+}
 
 # ==========================================
 # LOGGING SETUP
@@ -316,6 +325,10 @@ def parse_markdown_file(md_path: Path) -> dict:
                 })
             break
 
+        # Skip subject area sub-headers
+        if clean_line in SUBJECT_AREAS:
+            continue
+
         # Check and Ignore Corporate Officers & Staff (BEFORE inline & header checks)
         if any(role in clean_line for role in IGNORED_ROLES):
             if current_name and current_role:
@@ -377,6 +390,19 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not current_name:
             current_name = line
             continue
+
+        # Heuristic to separate consecutive editors without emails
+        if current_name and not ("@" in line):
+            # If the line is short, has no commas, and doesn't contain affiliation keywords, it's likely a new name
+            if len(line) < 30 and "," not in line and not any(inst in clean_line for inst in INSTITUTION_KEYWORDS):
+                extracted_editors.append({
+                    "name": current_name,
+                    "role": current_role,
+                    "association": " ".join(affiliation_lines).strip(),
+                })
+                current_name = line
+                affiliation_lines = []
+                continue
 
         if "@" in line and "." in line.split("@")[-1]:
             extracted_editors.append({
