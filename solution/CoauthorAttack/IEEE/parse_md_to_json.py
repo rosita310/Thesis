@@ -13,7 +13,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 500                         # Set to None to process all valid files
+MAX_FILES = 2000                        # Set to None to process all valid files
 OVERWRITE_EXISTING = True               # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     
@@ -45,6 +45,7 @@ BLOCKLIST_KEYWORDS = {
 ROLE_MAPPING = {
     "editor-in-chief": "Editor-in-Chief",
     "editor in chief": "Editor-in-Chief",
+    "editor-in-chief.": "Editor-in-Chief",
     "editors-in-chief": "Co-Editor-in-Chief",
     "editors in chief": "Co-Editor-in-Chief",
     "co-editor-in-chief": "Co-Editor-in-Chief",
@@ -53,6 +54,12 @@ ROLE_MAPPING = {
     "guest editors-in-chief": "Guest Editor-in-Chief",
     "guest editor in chief": "Guest Editor-in-Chief",
     "guest editors in chief": "Guest Editor-in-Chief",
+    "deputy editor-in-chief": "Deputy Editor-in-Chief",
+    "deputy editor in chief": "Deputy Editor-in-Chief",
+    "deputy editors-in-chief": "Deputy Editor-in-Chief",
+    "deputy editors in chief": "Deputy Editor-in-Chief",
+    "web editor-in-chief": "Web Editor-in-Chief",
+    "ieee sensors editor-in-chief": "IEEE Sensors Editor-in-Chief",
     "assistant to the editor-in-chief": "Assistant to the Editor-in-Chief",
     "assistant to the editors-in-chief": "Assistant to the Editor-in-Chief",
     "assistant to the editor in chief": "Assistant to the Editor-in-Chief",
@@ -60,6 +67,7 @@ ROLE_MAPPING = {
     "associate editor": "Associate Editor",
     "associate editors": "Associate Editor",
     "specialized associate editor": "Associate Editor",
+    "associate editor for portuguese": "Associate Editor",
     "senior associate editor": "Senior Associate Editor",
     "senior associate editors": "Senior Associate Editor",
     "senior associate editor and acting editor-in-chief": "Senior Associate Editor",
@@ -114,6 +122,10 @@ ROLE_MAPPING = {
     "associate editor-in-chief": "Associate Editor-in-Chief",
     "senior editorial assistant": "Senior Editorial Assistant",
     "senior managing editor": "Senior Managing Editor",
+    "senior area editor": "Senior Area Editor",
+    "transasctions executive editor": "Transactions Executive Editor",
+    "topical editor": "Topical Editor",
+    "topical editor-at-large": "Topical Editor-at-Large",
 }
 
 IGNORED_ROLES = {
@@ -164,10 +176,41 @@ IGNORED_ROLES = {
     "transactions operations chair",
     "past editors-in-chief",
     "past editor-in-chief",
+    "past editor in chief",
+    "director, division i",
+    "director, division ii",
+    "director, division iii",
+    "director, division iv",
+    "director, division v",
     "director, division vi",
     "director, editorial services:",
     "director, production services:",
-    "associate director, editorial services:"
+    "associate director, editorial services:",
+    "director, editorial services",
+    "director, production services",
+    "associate director, editorial services",
+    "technical committee chairs",
+    "compliance officer",
+    "board of governors",
+    "committee chairpersons and representatives",
+    "director & delegate, division i",
+    "executive committee",
+    "steering committee",
+    "committe chair",
+    "academic affairs chair",
+    "eds operations director",
+    "j-pv steering committee",
+    "director of research",
+    "technical committee chairs",
+    "publications board chair",
+    "founding chair",
+    "nominations and appointments chair",
+    "website coordinator",
+    "chair of power engineering",
+    "professor and grainger chair",
+    "director regional",
+    "director regional pasado",
+    "director regional electo",
 }
 
 TERMINATING_ROLES = {
@@ -238,27 +281,45 @@ def log_unmapped_role(role_name: str, journal_name: str):
     with open(UNMAPPED_ROLES_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{journal_name}] - {role_name}\n")
 
+def is_valid_inline_role(role_str: str) -> bool:
+    """Helper to check if a string looks like a role."""
+    role_str = role_str.lower()
+    if role_str in ROLE_MAPPING:
+        return True
+    return any(re.search(rf"\b{kw}\b", role_str) for kw in ROLE_KEYWORDS)
+
 def parse_inline_entry(line: str) -> tuple[str, str] | None:
     """Checks if a line contains 'Name, Role' or 'Role: Name' inline format."""
     # Length limit for inline entries to avoid capturing heavily punctuated prose
     if len(line) > 100:
         return None
-        
+
+    # Pattern 0: 'Name (Role)'
+    paren_match = re.search(r"^(.*?)\s*\((.*?)\)$", line)
+    if paren_match:
+        potential_name = paren_match.group(1).strip()
+        potential_role = paren_match.group(2).strip().lower()
+        if is_valid_inline_role(potential_role):
+            mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
+            return potential_name, mapped_role
+
     # Pattern 1: 'Role: Name'
     if ":" in line:
         parts = line.split(":", 1)
         potential_role = parts[0].strip().lower()
         potential_name = parts[1].strip().rstrip(',') # Clean trailing commas on names
-        if potential_role in ROLE_MAPPING:
-            return potential_name, ROLE_MAPPING[potential_role]
+        if is_valid_inline_role(potential_role):
+            mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
+            return potential_name, mapped_role
 
     # Pattern 2: 'Name, Role' (Using rsplit to handle names that have commas like Jr., Ph.D.)
     if "," in line:
         parts = line.rsplit(",", 1)
         potential_name = parts[0].strip()
         potential_role = parts[1].strip().lower().rstrip(',') # Clean trailing commas on roles
-        if potential_role in ROLE_MAPPING:
-            return potential_name, ROLE_MAPPING[potential_role]
+        if is_valid_inline_role(potential_role):
+            mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
+            return potential_name, mapped_role
 
     return None
 
@@ -354,6 +415,8 @@ def parse_markdown_file(md_path: Path) -> dict:
                 affiliation_lines = []
 
             name, role = inline_match
+            if role.startswith("Unmapped:"):
+                log_unmapped_role(role, journal_name)
             extracted_editors.append(
                 {"name": name, "role": role, "association": ""}
             )
