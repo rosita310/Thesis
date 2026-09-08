@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BASE_DOMAIN = "https://dl.acm.org"
 
 # --- CONFIGURATION ---
-MAX_WAIT_TIME_SECONDS = 126  # Max time to wait for manual captcha solve
-MIN_SCRAPE_YEAR = 2000       # Earliest year to scrape
+MAX_WAIT_TIME_SECONDS = 126  
+MIN_SCRAPE_YEAR = 2000       
 
 def get_debugging_driver():
     """Connects to an existing Chrome instance launched with --remote-debugging-port=9222"""
@@ -54,15 +54,19 @@ def load_progress(progress_file):
     if progress_file.exists():
         with open(progress_file, 'r', encoding='utf-8') as f:
             state = json.load(f)
-            # Ensure new keys exist if loading an older progress file
+            # Ensure all keys exist
+            if "gathered_links" not in state: state["gathered_links"] = []
+            if "completed_proceedings" not in state: state["completed_proceedings"] = []
             if "processed_endpoints" not in state: state["processed_endpoints"] = []
-            if "phase1_complete" not in state: state["phase1_complete"] = False
+            if "extracted_endpoints" not in state: state["extracted_endpoints"] = []
+            if "phase1_complete" not in state: state["phase1_complete"] = False 
             return state
             
     return {
         "gathered_links": [], 
         "completed_proceedings": [],
         "processed_endpoints": [],
+        "extracted_endpoints": [],
         "phase1_complete": False
     }
 
@@ -70,7 +74,7 @@ def save_progress(progress_file, state):
     with open(progress_file, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=4)
 
-# --- EXTRACTION & DOWNLOADING ---
+# EXTRACTION & DOWNLOADING 
 
 def download_pdf(driver, pdf_url, filepath):
     cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
@@ -129,49 +133,45 @@ def extract_proceeding_metadata(html_source):
 
     return pdf_url, proceeding_title, isbn, published_year
 
+# PHASE 1: ENDPOINT DISCOVERY & FAST FETCHING 
+
 def gather_proceeding_links(driver, state, progress_file):
+    """Finds all endpoints from the main page and attempts to fetch them via requests."""
     driver.get(f"{BASE_DOMAIN}/proceedings")
     
     if not wait_for_human_and_page(driver, (By.CSS_SELECTOR, "a.proceedings-browse__control"), "Proceedings Page"):
         return False
 
-    # Scroll down the page to trigger lazy-loading of all DOM elements 
     logging.info("Scrolling down the page to load all hidden tabs...")
     last_height = driver.execute_script("return document.body.scrollHeight")
     while True:
-        # Scroll to bottom
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        # Wait for page to load new content
         time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
         last_height = new_height
     logging.info("Scrolling complete.")
-    
 
     cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
     user_agent = driver.execute_script("return navigator.userAgent;")
     headers = {'User-Agent': user_agent}
 
-    # We capture the page source after scrolling
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     conf_tabs = soup.find_all('a', attrs={'data-ajaxurl': True})
     logging.info(f"Found {len(conf_tabs)} total conference endpoints.")
 
-    
-    # If the page failed to load properly, don't accidentally mark phase 1 as done
+    # Safety Check for lazy-loading failures
     if len(conf_tabs) < len(state["processed_endpoints"]):
-        logging.error(f"Found fewer endpoints ({len(conf_tabs)}) than already processed ({len(state['processed_endpoints'])}). The page likely didn't load fully. Aborting to protect progress.")
+        logging.error(f"Found fewer endpoints ({len(conf_tabs)}) than already processed. Page likely didn't load fully. Aborting.")
         return False
-    
 
     interrupted = False
 
     for idx, tab in enumerate(conf_tabs):
         ajax_url = tab.get('data-ajaxurl')
         
-        # Skip if we already successfully processed this endpoint
+        # Skip if we already know about this endpoint
         if not ajax_url or ajax_url in state["processed_endpoints"]:
             continue
             
@@ -182,21 +182,21 @@ def gather_proceeding_links(driver, state, progress_file):
             
             if res.status_code == 200:
                 snippet_soup = BeautifulSoup(res.text, 'html.parser')
-                
-                # Extract and store new links
                 for a_tag in snippet_soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
                     link = urljoin(BASE_DOMAIN, a_tag['href'])
                     if link not in state["gathered_links"]:
                         state["gathered_links"].append(link)
                 
-                # Mark endpoint as completed and save progress
+                # MARK AS BOTH QUEUED (PROCESSED) AND COMPLETED (EXTRACTED)
                 state["processed_endpoints"].append(ajax_url)
+                if ajax_url not in state["extracted_endpoints"]:
+                    state["extracted_endpoints"].append(ajax_url)
                 save_progress(progress_file, state)
                 
             elif res.status_code in [403, 429]:
-                logging.error(f"HTTP {res.status_code} blocked! Saving progress and stopping Phase 1.")
+                logging.warning(f"HTTP {res.status_code} blocked! Stopping Phase 1 requests. Passing the baton to Phase 1.5...")
                 interrupted = True
-                break  # Stop processing and exit loop
+                break  # Break out of the requests loop
             else:
                 logging.warning(f"HTTP {res.status_code} for {tab.get('title', 'Unknown')}")
                 
@@ -210,14 +210,64 @@ def gather_proceeding_links(driver, state, progress_file):
         if (idx + 1) % 25 == 0:
             logging.info(f"  ...Checked {len(state['processed_endpoints'])}/{len(conf_tabs)} endpoints...")
 
-    # If we got through the entire loop without being interrupted, Phase 1 is done
-    if not interrupted and len(state["processed_endpoints"]) >= len(conf_tabs):
-        logging.info("All conference endpoints processed successfully!")
-        state["phase1_complete"] = True
-        save_progress(progress_file, state)
-        return True
+    # Regardless of interruption, we have found all endpoints on the page.
+    # Add any un-requested endpoints to the 'processed_endpoints' queue for Phase 1.5 to handle.
+    for tab in conf_tabs:
+        url = tab.get('data-ajaxurl')
+        if url and url not in state["processed_endpoints"]:
+            state["processed_endpoints"].append(url)
 
-    return False
+    state["phase1_complete"] = True
+    save_progress(progress_file, state)
+    
+    if interrupted:
+        logging.info("Phase 1 finished early due to block. Unextracted endpoints queued for Phase 1.5.")
+    else:
+        logging.info("Phase 1 complete. All endpoints discovered and fast-fetched.")
+        
+    return True
+
+# PHASE 1.5: ENDPOINT TO LINK CONVERTER VIA SELENIUM
+
+def convert_endpoints_to_links(driver, state, progress_file):
+    """Uses Selenium to safely visit any endpoints that Phase 1 couldn't successfully extract."""
+    endpoints_to_process = [ep for ep in state["processed_endpoints"] if ep not in state["extracted_endpoints"]]
+    
+    if not endpoints_to_process:
+        return True
+        
+    logging.info(f"Starting Phase 1.5: Safely converting {len(endpoints_to_process)} remaining endpoints into usable links.")
+
+    for idx, endpoint in enumerate(endpoints_to_process):
+        full_url = urljoin(BASE_DOMAIN, endpoint)
+        driver.get(full_url)
+        
+        # Anti-bot safety loop
+        while "Just a moment" in driver.title or "captcha" in driver.page_source.lower() or "challenge" in driver.title.lower():
+            logging.warning("Captcha or Cloudflare block detected! Please solve it in the browser.")
+            time.sleep(10)
+            
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        links_found = 0
+        
+        for a_tag in soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
+            link = urljoin(BASE_DOMAIN, a_tag['href'])
+            if link not in state["gathered_links"]:
+                state["gathered_links"].append(link)
+                links_found += 1
+                
+        if links_found > 0:
+            logging.info(f"  -> Found {links_found} proceedings links.")
+            
+        state["extracted_endpoints"].append(endpoint)
+        save_progress(progress_file, state)
+        
+        time.sleep(1.5) 
+        
+        if (idx + 1) % 50 == 0:
+            logging.info(f"  ...Converted {idx + 1}/{len(endpoints_to_process)} endpoints...")
+
+    return True
 
 # --- MAIN EXECUTION ---
 
@@ -233,20 +283,27 @@ def main():
     logging.info("Connected to manual Chrome session. Press Ctrl+C to pause safely.")
     
     try:
-        # Phase 1: Gather links incrementally
+        # Phase 1: Discover all endpoints and fast-fetch if possible
         if not state.get("phase1_complete"):
-            logging.info(f"Resuming Phase 1: {len(state['processed_endpoints'])} endpoints already processed.")
+            logging.info(f"Starting/Resuming Phase 1: Gathering endpoints...")
             success = gather_proceeding_links(driver, state, progress_file)
-            
             if not success:
                 logging.info("Exiting early so you can bypass bot protection or resume later.")
                 return
         else:
-            logging.info(f"Phase 1 complete. Loaded {len(state['gathered_links'])} gathered links.")
+            logging.info("Phase 1 complete. Endpoints gathered.")
 
-        # Phase 2: Iterate through links
+        # Phase 1.5: Convert collected endpoints into browseable links safely
+        if len(state["extracted_endpoints"]) < len(state["processed_endpoints"]):
+            success = convert_endpoints_to_links(driver, state, progress_file)
+            if not success:
+                return
+        else:
+            logging.info("Phase 1.5 complete. All endpoints converted to links.")
+        
+        # Phase 2: Iterate through links and download PDFs
         links_to_process = [link for link in state["gathered_links"] if link not in state["completed_proceedings"]]
-        logging.info(f"{len(links_to_process)} proceedings left to process.")
+        logging.info(f"{len(links_to_process)} total proceedings left to process.")
 
         for url in links_to_process:
             logging.info(f"\nNavigating to Proceeding: {url}")
@@ -258,7 +315,7 @@ def main():
             pdf_url, proceeding_title, isbn, published_year = extract_proceeding_metadata(driver.page_source)
             
             if published_year and published_year < MIN_SCRAPE_YEAR:
-                logging.info(f"Proceeding published in {published_year} is below the {MIN_SCRAPE_YEAR} threshold. Skipping download.")
+                logging.info(f"Proceeding published in {published_year} is below the {MIN_SCRAPE_YEAR} threshold. Skipping.")
                 state["completed_proceedings"].append(url)
                 save_progress(progress_file, state)
                 continue
