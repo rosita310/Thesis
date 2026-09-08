@@ -128,41 +128,59 @@ def extract_proceeding_metadata(html_source):
     return pdf_url, proceeding_title, isbn, published_year
 
 def gather_proceeding_links(driver):
-    """Navigates the proceedings page, opens all tabs, and extracts all links."""
+    """
+    Extracts data-ajaxurl attributes from the base page and requests 
+    the backend endpoint directly using requests.
+    """
     driver.get(f"{BASE_DOMAIN}/proceedings")
     
-    if not wait_for_human_and_page(driver, (By.CSS_SELECTOR, "a.proceedings-browse__control"), "Alphanumeric Tabs"):
+    if not wait_for_human_and_page(driver, (By.CSS_SELECTOR, "a.proceedings-browse__control"), "Proceedings Page"):
         return []
 
-    main_tabs = driver.find_elements(By.CSS_SELECTOR, "a.proceedings-browse__control")
-    logging.info(f"Opening {len(main_tabs)} main alphanumeric tabs...")
-    for tab in main_tabs:
-        if tab.get_attribute("aria-expanded") == "false":
-            driver.execute_script("arguments[0].click();", tab)
-            time.sleep(0.5)
+    # Get session cookies and headers from Selenium
+    cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
+    user_agent = driver.execute_script("return navigator.userAgent;")
+    headers = {'User-Agent': user_agent}
 
-    conference_tabs = driver.find_elements(By.CSS_SELECTOR, "a.accordion-tabbed__control.loadAjax")
-    logging.info(f"Opening {len(conference_tabs)} conference tabs (this will take a moment)...")
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
     
-    for idx, conf_tab in enumerate(conference_tabs):
-        if conf_tab.get_attribute("aria-expanded") == "false":
-            driver.execute_script("arguments[0].click();", conf_tab)
-            time.sleep(0.25)
+    # Find all conference tab links containing data-ajaxurl
+    conf_tabs = soup.find_all('a', attrs={'data-ajaxurl': True})
+    logging.info(f"Found {len(conf_tabs)} conference endpoints to query.")
+
+    all_proceeding_links = []
+
+    for idx, tab in enumerate(conf_tabs):
+        ajax_url = tab.get('data-ajaxurl')
+        if not ajax_url:
+            continue
             
-        if (idx + 1) % 50 == 0:
-            logging.info(f"  ...Opened {idx + 1}/{len(conference_tabs)} tabs...")
+        full_url = urljoin(BASE_DOMAIN, ajax_url)
+        
+        try:
+            # Fetch the proceedings snippet directly
+            res = requests.get(full_url, cookies=cookies, headers=headers, timeout=15)
+            if res.status_code == 200:
+                snippet_soup = BeautifulSoup(res.text, 'html.parser')
+                # Find all proceedings links inside the fetched HTML snippet
+                for a_tag in snippet_soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
+                    link = urljoin(BASE_DOMAIN, a_tag['href'])
+                    all_proceeding_links.append(link)
+            else:
+                logging.warning(f"HTTP {res.status_code} for {tab.get('title', 'Unknown')}")
+        except Exception as e:
+            logging.error(f"Error fetching endpoint: {e}")
 
-    logging.info("Waiting for final AJAX elements to render...")
-    time.sleep(10)
+        # Rate control delay between AJAX requests
+        time.sleep(1)
 
-    proceeding_elements = driver.find_elements(By.CSS_SELECTOR, "ul.dotted-list a")
-    links = [elem.get_attribute("href") for elem in proceeding_elements if elem.get_attribute("href")]
-    
-    links = [link for link in links if "/doi/proceedings/" in link]
-    links = list(dict.fromkeys(links))
-    
-    logging.info(f"Successfully gathered {len(links)} proceeding URLs.")
-    return links
+        if (idx + 1) % 25 == 0:
+            logging.info(f"  ...Processed {idx + 1}/{len(conf_tabs)} conference endpoints...")
+
+    # Deduplicate while preserving order
+    all_proceeding_links = list(dict.fromkeys(all_proceeding_links))
+    logging.info(f"Successfully gathered {len(all_proceeding_links)} proceeding URLs.")
+    return all_proceeding_links
 
 # --- MAIN EXECUTION ---
 
