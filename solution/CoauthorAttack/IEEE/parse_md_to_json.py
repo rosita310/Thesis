@@ -532,6 +532,10 @@ def is_valid_inline_role(role_str: str) -> bool:
         return True
     return any(re.search(rf"\b{kw}\b", role_str) for kw in ROLE_KEYWORDS)
 
+def is_valid_name(name_str: str) -> bool:
+    """Returns False if the string contains any numeric digits. Can be expanded with more heuristics."""
+    return not any(char.isdigit() for char in name_str)
+
 def parse_inline_entry(line: str) -> tuple[str, str] | None:
     """Checks if a line contains 'Name, Role' or 'Role: Name' inline format."""
     # Length limit for inline entries to avoid capturing heavily punctuated prose
@@ -544,6 +548,8 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
         potential_name = paren_match.group(1).strip()
         potential_role = paren_match.group(2).strip().lower()
         if is_valid_inline_role(potential_role):
+            if not is_valid_name(potential_name):
+                return None
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
@@ -553,6 +559,9 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
         potential_role = parts[0].strip().lower()
         potential_name = parts[1].strip().rstrip(',') # Clean trailing commas on names
         if is_valid_inline_role(potential_role):
+            if not is_valid_name(potential_name):
+                return None
+            
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
@@ -562,6 +571,8 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
         potential_name = parts[0].strip()
         potential_role = parts[1].strip().lower().rstrip(',') # Clean trailing commas on roles
         if is_valid_inline_role(potential_role):
+            if not is_valid_name(potential_name):
+                return None
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
@@ -695,13 +706,18 @@ def parse_markdown_file(md_path: Path) -> dict:
 
         # Parse Name and Affiliations under active roles
         if not current_name:
+            if not is_valid_name(line):
+                continue  # Skip lines with numbers; they aren't names
             current_name = line
             continue
 
         # Heuristic to separate consecutive editors without emails
         if current_name and not ("@" in line):
-            # If the line is short, has no commas, and doesn't contain affiliation keywords, it's likely a new name
-            if len(line) < 30 and "," not in line and not any(inst in clean_line for inst in INSTITUTION_KEYWORDS):
+            # If the line is short, has no commas, no affiliation keywords, AND no numbers
+            if (len(line) < 30 
+                and "," not in line 
+                and not any(inst in clean_line for inst in INSTITUTION_KEYWORDS)
+                and is_valid_name(line)):
                 extracted_editors.append({
                     "name": current_name,
                     "role": current_role,
