@@ -14,6 +14,7 @@ venv
 /solution/SelfReview/ACM/progress.json
 logs
 dblp.nt.gz
+dblp.nt
 /solution/SelfReview/Springer/scraper/data
 /solution/SelfReview/Springer/scraper/progress.json
 /solution/SelfReview/Springer/scraper/.chrome_profile

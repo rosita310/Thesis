@@ -13,7 +13,7 @@ DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
 MAX_FILES = None                        # Set to None to process all valid files
-OVERWRITE_EXISTING = False              # True: re-parse and overwrite. False: skip if JSON exists.
+OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     "ACM Transactions on Graphics",     # Doesn't contain information we want   
     "Proceedings of the ACM on",        # Divergent structure from other journals. Also, these are conference proceedings, not true journals.
@@ -139,6 +139,26 @@ TERMINATING_TEXTS = [
     "service, notify your local post office before",
 ]
 
+# NON-PERSON NAMES
+# Bolded text inside a role block that is not a person: ACM address blocks,
+# subscription blurbs, section captions. Only recognisable by what they say.
+NON_PERSON_PATTERNS = re.compile(
+    r"\bACM\b|Home\s*Page|\bTel\.?\b|\bFax\b|Phone|E-?Mail|Catalog"
+    r"|Subscription|Membership|inside\s+back\s*cover|Guide\s+to\s+Manuscript"
+    r"|Send\s+orders|For\s+information|For\s+manuscript|Change\s+of\s+Address"
+    r"|Notice\s+to|About\s+ACM|Web\s*site|Website|\bStaff\b|Administrator"
+    r"|Representative|^Past\b|^Alumni\b|^Former\b|Information\s+Director"
+    r"|http|www\.",
+    re.IGNORECASE,
+)
+
+# A "name" that is really a role caption ("Associate Editors:", "RCR Editor").
+ROLE_CAPTION_PATTERNS = re.compile(
+    r"\b(editor|editors|chief|board|reviewers?|chairs?)\b", re.IGNORECASE)
+
+NAME_MIN_WORDS = 2
+NAME_MAX_WORDS = 5
+
 # ==========================================
 # LOGGING SETUP
 # ==========================================
@@ -201,8 +221,33 @@ def clean_markdown(text: str) -> str:
     
     return cleaned_text
 
+#    Tidies a name: drops surrounding punctuation, collapses spacing and separates
+#    a run-together initial ("D.Thenmozhi" -> "D. Thenmozhi").
+def clean_person_name(name: str) -> str:
+    name = name.replace("*", " ").replace("_", " ")
+    name = " ".join(name.split()).strip(" ,;:-")
+    name = re.sub(r"\.(?=[A-Za-z])", ". ", name)
+    return " ".join(name.split())
+
+
+#    True if the text can be a person's name rather than boilerplate or a caption.
+#    Strict on purpose: admitting an address block would invent a board member.
+def is_person_name(name: str) -> bool:
+    if not name:
+        return False
+    if any(character.isdigit() for character in name):
+        return False
+    if NON_PERSON_PATTERNS.search(name):
+        return False
+    if ROLE_CAPTION_PATTERNS.search(name):
+        return False
+    if not any(character.isalpha() for character in name):
+        return False
+    return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
+
+
 # ==========================================
-# PARSING LOGIC 
+# PARSING LOGIC
 # ==========================================
 
 def parse_editors_from_blocks(role_blocks: dict) -> list:
@@ -220,7 +265,16 @@ def parse_editors_from_blocks(role_blocks: dict) -> list:
                     first_line = current_person_lines[0].replace("** **", "")
                     first_bold = re.search(r"\*\*(.*?)\*\*", first_line)
                     
-                    if first_bold and len(first_bold.group(1).strip().split()) == 1:
+                    # A one-word first bold means the name is split over two bold runs
+                    # ("**Palaiahnakote**" / "**Shivakumara**"), so absorb one more line
+                    # to complete it -- but only one: unbounded, the block swallows every
+                    # following editor. Join like people_raw below, so two adjacent bold
+                    # runs are not mistaken for the "** **" artifact and collapsed.
+                    block_text = " \n ".join(current_person_lines).replace("** **", "")
+                    block_bolds = [b for b in re.findall(r"\*\*(.*?)\*\*", block_text) if b.strip()]
+
+                    if (first_bold and len(first_bold.group(1).strip().split()) == 1
+                            and len(block_bolds) < 2):
                         current_person_lines.append(line)
                     else:
                         people_raw.append(" \n ".join(current_person_lines))
@@ -252,7 +306,14 @@ def parse_editors_from_blocks(role_blocks: dict) -> list:
 
             association = re.sub(r"^[\s_]+|[\s_]+$", "", text.strip())
             association = " ".join(association.split())
-            
+
+            # Drop boilerplate before the role is assigned, so an address block
+            # cannot take the Editor-in-Chief slot below.
+            name = clean_person_name(name)
+            if not is_person_name(name):
+                logging.debug(f"Skipping non-person entry in '{role}': {name!r}")
+                continue
+
             assigned_role = role
             if role == "Editor-in-Chief":
                 if eic_count > 0:
@@ -295,7 +356,7 @@ def parse_markdown_file(md_path) -> dict:
             role_blocks[current_role].append(line.strip())
             
     extracted_editors = parse_editors_from_blocks(role_blocks)
-    
+
     return {
         "journal_file": md_path.name,
         "editors": extracted_editors,
