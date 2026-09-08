@@ -135,13 +135,36 @@ def gather_proceeding_links(driver, state, progress_file):
     if not wait_for_human_and_page(driver, (By.CSS_SELECTOR, "a.proceedings-browse__control"), "Proceedings Page"):
         return False
 
+    # Scroll down the page to trigger lazy-loading of all DOM elements 
+    logging.info("Scrolling down the page to load all hidden tabs...")
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        # Scroll to bottom
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        # Wait for page to load new content
+        time.sleep(2)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+    logging.info("Scrolling complete.")
+    
+
     cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
     user_agent = driver.execute_script("return navigator.userAgent;")
     headers = {'User-Agent': user_agent}
 
+    # We capture the page source after scrolling
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     conf_tabs = soup.find_all('a', attrs={'data-ajaxurl': True})
     logging.info(f"Found {len(conf_tabs)} total conference endpoints.")
+
+    
+    # If the page failed to load properly, don't accidentally mark phase 1 as done
+    if len(conf_tabs) < len(state["processed_endpoints"]):
+        logging.error(f"Found fewer endpoints ({len(conf_tabs)}) than already processed ({len(state['processed_endpoints'])}). The page likely didn't load fully. Aborting to protect progress.")
+        return False
+    
 
     interrupted = False
 
