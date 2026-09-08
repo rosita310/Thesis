@@ -21,6 +21,8 @@ dblp.nt
 /solution/CoauthorAttack/ACM/data
 /solution/CoauthorAttack/ACM/parsing.log
 /solution/CoauthorAttack/IEEE/data
+/solution/CoauthorAttack/IEEE/parsing.log
+/solution/CoauthorAttack/IEEE/unmapped_roles.txt
 
 /solution/SelfReview/Springer/BBN/bbn_baselines
 /solution/SelfReview/Springer/BBN/dblp_store

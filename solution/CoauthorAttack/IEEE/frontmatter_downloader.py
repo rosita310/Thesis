@@ -117,37 +117,44 @@ def download_pdf(driver, stamp_url, filepath):
 
 def extract_frontmatter_link(html_source, journal_title):
     """
-    Scans the IEEE issue page DOM for Masthead or Information PDFs,
-    handling Angular-rendered <h2> blocks robustly.
+    Scans the IEEE issue page DOM for Masthead or Information PDFs.
+    Uses expanded keywords and targets the stamp URL structure rather than CSS classes.
     """
     soup = BeautifulSoup(html_source, 'html.parser')
     
-    # Pre-compile case-insensitive regex pattern for matching title targets
-    # Matches the journal name (escaped to prevent regex syntax errors) or 'masthead'
     escaped_journal_title = re.escape(journal_title.strip())
-    target_pattern = re.compile(rf"({escaped_journal_title}|masthead)", re.IGNORECASE)
+
+    # Known valid patterns for frontmatter links:
+    pattern_str = (
+        rf"({escaped_journal_title}"
+        rf"|masthead"
+        rf"|publication information"
+        rf"|ieee\b.{'{0,80}'}information\b"
+        rf"|frontmatter)"
+    )
+    target_pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
     
-    # Find all issue result item blocks
-    results = soup.find_all('xpl-issue-results-items')
+    # IEEE sometimes uses 'result-item' classes or custom 'xpl' tags
+    results = soup.find_all(lambda tag: tag.name == 'xpl-issue-results-items' or 
+                                        (tag.has_attr('class') and 'result-item' in tag.get('class')))
     
     for result in results:
-        # Search all <h2> tags inside this item (handles mobile/desktop visual variants)
-        h2_tags = result.find_all('h2')
+        # Search all h2 (and h3 just in case) tags inside this item
+        header_tags = result.find_all(['h2', 'h3'])
         matched = False
         
-        for h2 in h2_tags:
-            # Extract clean text from the h2 (including inner <span> elements)
-            title_text = h2.get_text(separator=" ", strip=True)
+        for header in header_tags:
+            title_text = header.get_text(separator=" ", strip=True)
             
             if target_pattern.search(title_text):
                 matched = True
                 break
                 
         if matched:
-            # Find the PDF anchor tag within this xpl-issue-results-items parent block
-            pdf_btn = result.find('a', class_=re.compile(r'stats_PDF', re.IGNORECASE))
+            # Find the link by checking the href for the stamp URL
+            pdf_btn = result.find('a', href=re.compile(r'/stamp/stamp\.jsp', re.IGNORECASE))
             if pdf_btn and pdf_btn.get('href'):
-                return urljoin(BASE_DOMAIN, pdf_btn.get('href'))
+                return urljoin("https://ieeexplore.ieee.org", pdf_btn.get('href'))
                 
     return None
 
@@ -216,6 +223,9 @@ def main():
             # Store the main window handle to return to after processing each issue in a new tab
             main_window = driver.current_window_handle
             
+            # Track the lowest year we've processed so we know which decade to click next
+            lowest_year_seen = float('inf') 
+            
             while not reached_target_year:
                 year_elements = driver.find_elements(By.CSS_SELECTOR, "a[data-analytics_identifier='past_issue_selected_year']")
                 
@@ -226,11 +236,20 @@ def main():
                 years_available = []
                 for elem in year_elements:
                     try:
-                        years_available.append(int(elem.text.strip()))
+                        # CRITICAL: Only grab years that are currently visible on screen
+                        if elem.is_displayed(): 
+                            years_available.append(int(elem.text.strip()))
                     except:
                         pass
                 
+                if not years_available:
+                    logging.warning("No visible years found. Breaking loop.")
+                    break
+                    
                 years_available.sort(reverse=True)
+                
+                # Update the lowest year we've seen on the current page
+                lowest_year_seen = min(lowest_year_seen, min(years_available))
                 
                 for year in years_available:
                     if year < MIN_YEAR:
@@ -262,7 +281,7 @@ def main():
                             
                         logging.info(f"Navigating to {issue_name} ({year})")
                         
-                        # Open the issue in a NEW TAB to preserve the "All Issues" Angular state
+                        # Open the issue in a NEW TAB
                         driver.execute_script("window.open(arguments[0], '_blank');", issue_url)
                         driver.switch_to.window(driver.window_handles[-1])
                         
@@ -270,6 +289,8 @@ def main():
                             driver.close()
                             driver.switch_to.window(main_window)
                             return
+                            
+                        time.sleep(2) # Wait for Angular to populate hrefs
                             
                         stamp_url = extract_frontmatter_link(driver.page_source, journal_title)
                         
@@ -284,45 +305,53 @@ def main():
                             pdf_filepath = data_dir / pdf_filename
                             
                             if not pdf_filepath.exists():
-                                logging.info(f"  -> Downloading Front Matter: {pdf_filename}")
+                                logging.info(f"   -> Downloading Front Matter: {pdf_filename}")
                                 success = download_pdf(driver, stamp_url, pdf_filepath)
                                 if success:
                                     time.sleep(2)
                             else:
-                                logging.info(f"  -> File already exists: {pdf_filename}. Skipping.")
+                                logging.info(f"   -> File already exists: {pdf_filename}. Skipping.")
                                 
                         state['completed_issues'].append(issue_url)
                         save_progress(progress_file, state)
                         
-                        # Close the issue tab and return to the main tab
                         driver.close()
                         driver.switch_to.window(main_window)
 
-                        # Check consecutive missing limit
                         if consecutive_missing_pdfs >= MAX_CONSECUTIVE_MISSING:
                             logging.warning(f"Skipping rest of journal: {MAX_CONSECUTIVE_MISSING} consecutive issues missing PDFs.")
                             reached_target_year = True
                             break
+                
+                if reached_target_year:
+                    break 
                     
-                    if reached_target_year:
-                        break # Break the year loop if cutoff or missing limit is hit
-                        
+                # DECADE NAVIGATION FIX
                 if not reached_target_year:
-                    decade_elements = driver.find_elements(By.XPATH, "//li/a[contains(text(), 's') and string-length(text()) = 5]")
+                    decade_elements = driver.find_elements(By.XPATH, "//a[contains(text(), '0s')]")
                     clicked_decade = False
                     
                     for decade_elem in decade_elements:
                         decade_text = decade_elem.text.strip()
                         try:
+                            # Extract the decade (e.g., "2010" from "2010s")
                             decade_year = int(decade_text[:4])
+                            
+                            # Skip this decade if its max year is >= the lowest year we've already done
+                            if decade_year + 9 >= lowest_year_seen:
+                                continue
+                                
+                            # If we haven't done it, and it contains years above MIN_YEAR, click it
                             if decade_year + 9 >= MIN_YEAR:
+                                logging.info(f"--- Switching to Decade: {decade_text} ---")
                                 driver.execute_script("arguments[0].click();", decade_elem)
-                                time.sleep(3)
+                                time.sleep(4) 
                                 clicked_decade = True
                                 break
-                        except:
+                        except Exception as e:
                             pass
                             
+                    # If we looped through all decades and didn't click one, we're done
                     if not clicked_decade:
                         reached_target_year = True
 
