@@ -133,7 +133,7 @@ def extract_proceeding_metadata(html_source):
 
     return pdf_url, proceeding_title, isbn, published_year
 
-# PHASE 1: ENDPOINT DISCOVERY & FAST FETCHING 
+# --- PHASE 1: ENDPOINT DISCOVERY & FAST FETCHING ---
 
 def gather_proceeding_links(driver, state, progress_file):
     """Finds all endpoints from the main page and attempts to fetch them via requests."""
@@ -161,7 +161,6 @@ def gather_proceeding_links(driver, state, progress_file):
     conf_tabs = soup.find_all('a', attrs={'data-ajaxurl': True})
     logging.info(f"Found {len(conf_tabs)} total conference endpoints.")
 
-    # Safety Check for lazy-loading failures
     if len(conf_tabs) < len(state["processed_endpoints"]):
         logging.error(f"Found fewer endpoints ({len(conf_tabs)}) than already processed. Page likely didn't load fully. Aborting.")
         return False
@@ -171,7 +170,6 @@ def gather_proceeding_links(driver, state, progress_file):
     for idx, tab in enumerate(conf_tabs):
         ajax_url = tab.get('data-ajaxurl')
         
-        # Skip if we already know about this endpoint
         if not ajax_url or ajax_url in state["processed_endpoints"]:
             continue
             
@@ -181,13 +179,24 @@ def gather_proceeding_links(driver, state, progress_file):
             res = requests.get(full_url, cookies=cookies, headers=headers, timeout=15)
             
             if res.status_code == 200:
-                snippet_soup = BeautifulSoup(res.text, 'html.parser')
-                for a_tag in snippet_soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
-                    link = urljoin(BASE_DOMAIN, a_tag['href'])
-                    if link not in state["gathered_links"]:
-                        state["gathered_links"].append(link)
+                # Attempt to parse as JSON first
+                try:
+                    json_data = res.json()
+                    proceedings = json_data.get("data", {}).get("proceedings", [])
+                    for proc in proceedings:
+                        link = proc.get("link")
+                        if link:
+                            full_link = urljoin(BASE_DOMAIN, link)
+                            if full_link not in state["gathered_links"]:
+                                state["gathered_links"].append(full_link)
+                except json.JSONDecodeError:
+                    # Fallback if it actually returned HTML
+                    snippet_soup = BeautifulSoup(res.text, 'html.parser')
+                    for a_tag in snippet_soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
+                        link = urljoin(BASE_DOMAIN, a_tag['href'])
+                        if link not in state["gathered_links"]:
+                            state["gathered_links"].append(link)
                 
-                # MARK AS BOTH QUEUED (PROCESSED) AND COMPLETED (EXTRACTED)
                 state["processed_endpoints"].append(ajax_url)
                 if ajax_url not in state["extracted_endpoints"]:
                     state["extracted_endpoints"].append(ajax_url)
@@ -196,7 +205,7 @@ def gather_proceeding_links(driver, state, progress_file):
             elif res.status_code in [403, 429]:
                 logging.warning(f"HTTP {res.status_code} blocked! Stopping Phase 1 requests. Passing the baton to Phase 1.5...")
                 interrupted = True
-                break  # Break out of the requests loop
+                break
             else:
                 logging.warning(f"HTTP {res.status_code} for {tab.get('title', 'Unknown')}")
                 
@@ -210,8 +219,6 @@ def gather_proceeding_links(driver, state, progress_file):
         if (idx + 1) % 25 == 0:
             logging.info(f"  ...Checked {len(state['processed_endpoints'])}/{len(conf_tabs)} endpoints...")
 
-    # Regardless of interruption, we have found all endpoints on the page.
-    # Add any un-requested endpoints to the 'processed_endpoints' queue for Phase 1.5 to handle.
     for tab in conf_tabs:
         url = tab.get('data-ajaxurl')
         if url and url not in state["processed_endpoints"]:
@@ -227,7 +234,7 @@ def gather_proceeding_links(driver, state, progress_file):
         
     return True
 
-# PHASE 1.5: ENDPOINT TO LINK CONVERTER VIA SELENIUM
+# --- PHASE 1.5: ENDPOINT TO LINK CONVERTER VIA SELENIUM ---
 
 def convert_endpoints_to_links(driver, state, progress_file):
     """Uses Selenium to safely visit any endpoints that Phase 1 couldn't successfully extract."""
@@ -247,14 +254,30 @@ def convert_endpoints_to_links(driver, state, progress_file):
             logging.warning("Captcha or Cloudflare block detected! Please solve it in the browser.")
             time.sleep(10)
             
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
         links_found = 0
         
-        for a_tag in soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
-            link = urljoin(BASE_DOMAIN, a_tag['href'])
-            if link not in state["gathered_links"]:
-                state["gathered_links"].append(link)
-                links_found += 1
+        # Extract raw text from the browser body (bypasses Chrome's HTML wrappers)
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            json_data = json.loads(body_text)
+            proceedings = json_data.get("data", {}).get("proceedings", [])
+            
+            for proc in proceedings:
+                link = proc.get("link")
+                if link:
+                    full_link = urljoin(BASE_DOMAIN, link)
+                    if full_link not in state["gathered_links"]:
+                        state["gathered_links"].append(full_link)
+                        links_found += 1
+                        
+        except (json.JSONDecodeError, Exception) as e:
+            # Fallback if it's somehow not JSON
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            for a_tag in soup.find_all('a', href=re.compile(r'/doi/proceedings/')):
+                link = urljoin(BASE_DOMAIN, a_tag['href'])
+                if link not in state["gathered_links"]:
+                    state["gathered_links"].append(link)
+                    links_found += 1
                 
         if links_found > 0:
             logging.info(f"  -> Found {links_found} proceedings links.")
