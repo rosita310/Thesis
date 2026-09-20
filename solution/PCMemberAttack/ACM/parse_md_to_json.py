@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 2                           # Set to None to process all valid files
-OVERWRITE_EXISTING = True               # True: re-parse and overwrite. False: skip if JSON exists.
+MAX_FILES = None                        # Set to None to process all valid files
+OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = ()                      # Clear for now; add prefixes if you notice junk files
 
 
@@ -39,6 +39,8 @@ IGNORED_SECTIONS = [
     "full papers",
     "work-in-progress",
     "sponsors",
+    "author index",
+    "message from",
 ]
 
 NAME_MIN_WORDS = 2
@@ -87,6 +89,14 @@ def parse_markdown_file(md_path: Path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
         
+    # Extract metadata from filename
+    filename = md_path.stem
+    isbn_match = re.search(r'_(\d{3}-\d-\d{4}-\d{4}-\d|\d{1}-\d{5}-\d{3}-\d)', filename)
+    isbn = isbn_match.group(1) if isbn_match else None
+    
+    title = filename.rsplit('_', 1)[0] if isbn_match else filename
+    title = title.replace('..', '').strip()
+        
     # Normalize unicode to handle weird ligatures
     text = unicodedata.normalize("NFKC", raw_content)
     lines = text.split('\n')
@@ -100,11 +110,11 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not line_clean:
             continue
             
-        # Clean the line for section header detection by removing markdown bolding
-        header_check = line_clean.replace("**", "").strip().lower()
+        # Clean the line for section header detection by removing markdown bolding and hashes
+        header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
         
         # 1. Check if we are entering a wanted section
-        if any(wanted in header_check for wanted in WANTED_SECTIONS):
+        if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
             capture = True
             current_section = header_check.title()
             continue
@@ -116,16 +126,17 @@ def parse_markdown_file(md_path: Path) -> dict:
             
         # 3. If we are in a valid section, try to extract the person
         if capture:
-            # Matches formats like: - **Anatoliy Gruzd**, Ryerson University, Canada — Conference Chair
-            # Group 1: Name, Group 2: Association (optional), Group 3: Role (optional)
-            match = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
+            # We need to handle two formats:
+            # Format A (Bullet points): - **Name**, Association — Role
+            # Format B (Plain text lines): Name, Association, Country
             
-            if match:
-                name = clean_person_name(match.group(1))
-                association = match.group(2).strip() if match.group(2) else ""
-                
-                # If a specific role is on the line (after the dash), use it. Otherwise default to the section name.
-                role = match.group(3).strip() if match.group(3) else current_section
+            # Try Format A first (Strict Markdown formatting)
+            match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
+            
+            if match_a:
+                name = clean_person_name(match_a.group(1))
+                association = match_a.group(2).strip() if match_a.group(2) else ""
+                role = match_a.group(3).strip() if match_a.group(3) else current_section
                 
                 if is_person_name(name):
                     extracted_people.append({
@@ -133,10 +144,28 @@ def parse_markdown_file(md_path: Path) -> dict:
                         "role": role,
                         "association": association
                     })
+                continue
+                
+            # Try Format B (Plain text comma separation)
+            # Make sure it's not a generic sentence by enforcing length and lack of full stops
+            if len(line_clean) < 150 and not line_clean.endswith('.'):
+                parts = line_clean.split(',')
+                if len(parts) >= 2:
+                    name = clean_person_name(parts[0])
+                    association = ", ".join([p.strip() for p in parts[1:]])
+                    
+                    if is_person_name(name):
+                        extracted_people.append({
+                            "name": name,
+                            "role": current_section,
+                            "association": association
+                        })
                     
     return {
+        "conference_title": title,
+        "isbn": isbn,
         "conference_file": md_path.name,
-        "organizers": extracted_people,
+        "persons_of_interest": extracted_people,
     }
 
 # ==========================================
