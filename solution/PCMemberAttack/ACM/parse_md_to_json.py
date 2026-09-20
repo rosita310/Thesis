@@ -12,16 +12,15 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = None                        # Set to None to process all valid files
-OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
-SKIP_PREFIXES = ()                      # Clear for now; add prefixes if you notice junk files
+MAX_FILES = 3                       
+OVERWRITE_EXISTING = True              
+SKIP_PREFIXES = ()                      
 
 
 # ==========================================
 # PARSER CONFIGURATION
 # ==========================================
 
-# Sections we actively want to capture people from.
 WANTED_SECTIONS = [
     "organizing committee",
     "program committee",
@@ -29,7 +28,6 @@ WANTED_SECTIONS = [
     "track chairs",
 ]
 
-# Sections that tell the parser to stop looking for organizers.
 IGNORED_SECTIONS = [
     "advisory board",
     "organizer",
@@ -65,14 +63,12 @@ logging.getLogger().addHandler(console_handler)
 # ==========================================
 
 def clean_person_name(name: str) -> str:
-    """Tidies a name: drops surrounding punctuation and collapses spacing."""
     name = name.replace("*", " ").replace("_", " ")
     name = " ".join(name.split()).strip(" ,;:-")
     name = re.sub(r"\.(?=[A-Za-z])", ". ", name)
     return " ".join(name.split())
 
 def is_person_name(name: str) -> bool:
-    """Basic validation to ensure the extracted string looks like a human name."""
     if not name:
         return False
     if any(character.isdigit() for character in name):
@@ -89,15 +85,14 @@ def parse_markdown_file(md_path: Path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
         
-    # Extract metadata from filename
+    # More flexible ISBN Regex: matches an underscore followed by groups of numbers separated by hyphens
     filename = md_path.stem
-    isbn_match = re.search(r'_(\d{3}-\d-\d{4}-\d{4}-\d|\d{1}-\d{5}-\d{3}-\d)', filename)
+    isbn_match = re.search(r'_([0-9]+(?:-[0-9]+)+)', filename)
     isbn = isbn_match.group(1) if isbn_match else None
     
     title = filename.rsplit('_', 1)[0] if isbn_match else filename
     title = title.replace('..', '').strip()
         
-    # Normalize unicode to handle weird ligatures
     text = unicodedata.normalize("NFKC", raw_content)
     lines = text.split('\n')
     
@@ -110,27 +105,24 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not line_clean:
             continue
             
-        # Clean the line for section header detection by removing markdown bolding and hashes
         header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
         
-        # 1. Check if we are entering a wanted section
-        if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
-            capture = True
-            current_section = header_check.title()
-            continue
+        # Check if the line is a Table of Contents entry (contains 3 or more dots)
+        is_toc_line = bool(re.search(r'\.{3,}', line_clean))
+        
+        # Only evaluate section changes if it's NOT a ToC line
+        if not is_toc_line:
+            if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
+                capture = True
+                current_section = header_check.title()
+                continue
+                
+            if any(ignored in header_check for ignored in IGNORED_SECTIONS):
+                capture = False
+                continue
             
-        # 2. Check if we hit a section where we should stop capturing
-        if any(ignored in header_check for ignored in IGNORED_SECTIONS):
-            capture = False
-            continue
-            
-        # 3. If we are in a valid section, try to extract the person
         if capture:
-            # We need to handle two formats:
             # Format A (Bullet points): - **Name**, Association — Role
-            # Format B (Plain text lines): Name, Association, Country
-            
-            # Try Format A first (Strict Markdown formatting)
             match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
             
             if match_a:
@@ -146,8 +138,7 @@ def parse_markdown_file(md_path: Path) -> dict:
                     })
                 continue
                 
-            # Try Format B (Plain text comma separation)
-            # Make sure it's not a generic sentence by enforcing length and lack of full stops
+            # Format B (Plain text comma separation)
             if len(line_clean) < 150 and not line_clean.endswith('.'):
                 parts = line_clean.split(',')
                 if len(parts) >= 2:
