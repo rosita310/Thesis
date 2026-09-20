@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 4                     
+MAX_FILES = 5                      
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -24,9 +24,15 @@ SKIP_PREFIXES = ()
 WANTED_SECTIONS = [
     "organizing committee",
     "program committee",
+    "programme committee",
     "steering committee",
     "track chairs",
     "organization",
+    "workshop chair",
+    "program chair",
+    "programme chair",
+    "general chair",
+    "proceedings production editor",
 ]
 
 IGNORED_SECTIONS = [
@@ -40,6 +46,9 @@ IGNORED_SECTIONS = [
     "sponsors",
     "author index",
     "message from",
+    "reviewers",
+    "additional reviewers",
+    "preface",
 ]
 
 NAME_MIN_WORDS = 2
@@ -113,7 +122,7 @@ def parse_markdown_file(md_path: Path) -> dict:
             if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
                 capture = True
                 current_section = header_check.title()
-                current_inline_role = None # Reset inline role on new section
+                current_inline_role = None
                 continue
                 
             if any(ignored in header_check for ignored in IGNORED_SECTIONS):
@@ -151,6 +160,20 @@ def parse_markdown_file(md_path: Path) -> dict:
                     extracted_people.append({
                         "name": name,
                         "role": role,
+                        "association": association
+                    })
+                continue
+                
+            # Format D: Name (Association) without bullet points
+            match_d = re.match(r'^([^\(]+?)\s*\((.+?)\)$', line_clean)
+            if match_d:
+                name = clean_person_name(match_d.group(1))
+                association = match_d.group(2).strip()
+                
+                if is_person_name(name):
+                    extracted_people.append({
+                        "name": name,
+                        "role": current_section,
                         "association": association
                     })
                 continue
