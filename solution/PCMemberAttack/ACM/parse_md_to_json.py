@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 3                       
+MAX_FILES = 4                     
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -26,6 +26,7 @@ WANTED_SECTIONS = [
     "program committee",
     "steering committee",
     "track chairs",
+    "organization",
 ]
 
 IGNORED_SECTIONS = [
@@ -85,7 +86,6 @@ def parse_markdown_file(md_path: Path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
         
-    # More flexible ISBN Regex: matches an underscore followed by groups of numbers separated by hyphens
     filename = md_path.stem
     isbn_match = re.search(r'_([0-9]+(?:-[0-9]+)+)', filename)
     isbn = isbn_match.group(1) if isbn_match else None
@@ -99,6 +99,7 @@ def parse_markdown_file(md_path: Path) -> dict:
     extracted_people = []
     capture = False
     current_section = "Committee Member"
+    current_inline_role = None
     
     for line in lines:
         line_clean = line.strip()
@@ -106,15 +107,13 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue
             
         header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
-        
-        # Check if the line is a Table of Contents entry (contains 3 or more dots)
         is_toc_line = bool(re.search(r'\.{3,}', line_clean))
         
-        # Only evaluate section changes if it's NOT a ToC line
         if not is_toc_line:
             if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
                 capture = True
                 current_section = header_check.title()
+                current_inline_role = None # Reset inline role on new section
                 continue
                 
             if any(ignored in header_check for ignored in IGNORED_SECTIONS):
@@ -122,9 +121,27 @@ def parse_markdown_file(md_path: Path) -> dict:
                 continue
             
         if capture:
+            # Format C (Inline Roles with Parentheses): **Role:** Name ( _Association_ )
+            match_c = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*\(\s*_*([^)]+?)_*\s*\)$', line_clean)
+            if match_c:
+                role_inline = match_c.group(1)
+                if role_inline:
+                    current_inline_role = role_inline.strip().title()
+                
+                name = clean_person_name(match_c.group(2))
+                association = match_c.group(3).strip()
+                role = current_inline_role if current_inline_role else current_section
+                
+                if is_person_name(name):
+                    extracted_people.append({
+                        "name": name,
+                        "role": role,
+                        "association": association
+                    })
+                continue
+
             # Format A (Bullet points): - **Name**, Association — Role
             match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
-            
             if match_a:
                 name = clean_person_name(match_a.group(1))
                 association = match_a.group(2).strip() if match_a.group(2) else ""
