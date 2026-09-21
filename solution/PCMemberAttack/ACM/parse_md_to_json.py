@@ -12,10 +12,9 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 5                      
+MAX_FILES = 15                       
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
-
 
 # ==========================================
 # PARSER CONFIGURATION
@@ -32,23 +31,6 @@ WANTED_SECTIONS = [
     "program chair",
     "programme chair",
     "general chair",
-    "proceedings production editor",
-]
-
-IGNORED_SECTIONS = [
-    "advisory board",
-    "organizer",
-    "organizing partners",
-    "table of contents",
-    "copyright",
-    "full papers",
-    "work-in-progress",
-    "sponsors",
-    "author index",
-    "message from",
-    "reviewers",
-    "additional reviewers",
-    "preface",
 ]
 
 NAME_MIN_WORDS = 2
@@ -85,6 +67,13 @@ def is_person_name(name: str) -> bool:
         return False
     if not any(character.isalpha() for character in name):
         return False
+    # Reject strings with unbalanced parentheses (prevents bad comma splits)
+    if name.count('(') != name.count(')'):
+        return False
+    # Reject paper titles masquerading as names
+    if any(c in name for c in ['”', '“', '"']):
+        return False
+        
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
 # ==========================================
@@ -115,19 +104,25 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not line_clean:
             continue
             
-        header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
         is_toc_line = bool(re.search(r'\.{3,}', line_clean))
+        if is_toc_line:
+            continue
+
+        # Check if the line is a standalone structural header (starts with # or wrapped in **)
+        is_standalone_header = bool(re.match(r'^#+\s', line_clean)) or bool(re.match(r'^\*\*[^\*]+\*\*\s*$', line_clean))
         
-        if not is_toc_line:
+        if is_standalone_header:
+            header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
+            
+            # If the header is wanted, turn capture ON. If it's ANYTHING ELSE, turn capture OFF.
             if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
-                continue
-                
-            if any(ignored in header_check for ignored in IGNORED_SECTIONS):
+            else:
                 capture = False
-                continue
+                
+            continue # Skip processing the header line itself as a person
             
         if capture:
             # Format C (Inline Roles with Parentheses): **Role:** Name ( _Association_ )
@@ -142,11 +137,7 @@ def parse_markdown_file(md_path: Path) -> dict:
                 role = current_inline_role if current_inline_role else current_section
                 
                 if is_person_name(name):
-                    extracted_people.append({
-                        "name": name,
-                        "role": role,
-                        "association": association
-                    })
+                    extracted_people.append({"name": name, "role": role, "association": association})
                 continue
 
             # Format A (Bullet points): - **Name**, Association — Role
@@ -157,12 +148,19 @@ def parse_markdown_file(md_path: Path) -> dict:
                 role = match_a.group(3).strip() if match_a.group(3) else current_section
                 
                 if is_person_name(name):
-                    extracted_people.append({
-                        "name": name,
-                        "role": role,
-                        "association": association
-                    })
+                    extracted_people.append({"name": name, "role": role, "association": association})
                 continue
+                
+            # Format B (Plain text comma separation) -> MOVED ABOVE FORMAT D
+            if len(line_clean) < 150 and not line_clean.endswith('.'):
+                parts = line_clean.split(',')
+                if len(parts) >= 2:
+                    name = clean_person_name(parts[0])
+                    association = ", ".join([p.strip() for p in parts[1:]])
+                    
+                    if is_person_name(name):
+                        extracted_people.append({"name": name, "role": current_section, "association": association})
+                        continue # If successful, skip Format D
                 
             # Format D: Name (Association) without bullet points
             match_d = re.match(r'^([^\(]+?)\s*\((.+?)\)$', line_clean)
@@ -171,26 +169,8 @@ def parse_markdown_file(md_path: Path) -> dict:
                 association = match_d.group(2).strip()
                 
                 if is_person_name(name):
-                    extracted_people.append({
-                        "name": name,
-                        "role": current_section,
-                        "association": association
-                    })
+                    extracted_people.append({"name": name, "role": current_section, "association": association})
                 continue
-                
-            # Format B (Plain text comma separation)
-            if len(line_clean) < 150 and not line_clean.endswith('.'):
-                parts = line_clean.split(',')
-                if len(parts) >= 2:
-                    name = clean_person_name(parts[0])
-                    association = ", ".join([p.strip() for p in parts[1:]])
-                    
-                    if is_person_name(name):
-                        extracted_people.append({
-                            "name": name,
-                            "role": current_section,
-                            "association": association
-                        })
                     
     return {
         "conference_title": title,
