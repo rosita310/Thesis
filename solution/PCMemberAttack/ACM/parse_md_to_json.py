@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 15                       
+MAX_FILES = 20                        
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -31,6 +31,27 @@ WANTED_SECTIONS = [
     "program chair",
     "programme chair",
     "general chair",
+    "workshop co-chair",
+    "program co-chair",
+    "programme co-chair",
+    "general co-chair",
+]
+
+IGNORED_SECTIONS = [
+    "advisory board",
+    "organizer",
+    "organizing partners",
+    "table of contents",
+    "copyright",
+    "full papers",
+    "work-in-progress",
+    "sponsors",
+    "author index",
+    "message from",
+    "welcome message",
+    "reviewers",
+    "additional reviewers",
+    "preface",
 ]
 
 NAME_MIN_WORDS = 2
@@ -114,8 +135,11 @@ def parse_markdown_file(md_path: Path) -> dict:
         if is_standalone_header:
             header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
             
-            # If the header is wanted, turn capture ON. If it's ANYTHING ELSE, turn capture OFF.
-            if any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
+            # PRIORITY 1: Is this an ignored section?
+            if any(ignored in header_check for ignored in IGNORED_SECTIONS):
+                capture = False
+            # PRIORITY 2: Is this a wanted section?
+            elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
@@ -125,22 +149,23 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue # Skip processing the header line itself as a person
             
         if capture:
-            # Format C (Inline Roles with Parentheses): **Role:** Name ( _Association_ )
-            match_c = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*\(\s*_*([^)]+?)_*\s*\)$', line_clean)
-            if match_c:
-                role_inline = match_c.group(1)
+            # FORMAT C & D Unified (Names with Parentheses / Inline Roles):
+            # Matches: "**Role:** Name (Association)" OR "Name _(Association)_" OR "Name (Association)"
+            match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', line_clean)
+            if match_cd:
+                role_inline = match_cd.group(1)
                 if role_inline:
                     current_inline_role = role_inline.strip().title()
                 
-                name = clean_person_name(match_c.group(2))
-                association = match_c.group(3).strip()
+                name = clean_person_name(match_cd.group(2))
+                association = match_cd.group(3).strip()
                 role = current_inline_role if current_inline_role else current_section
                 
                 if is_person_name(name):
                     extracted_people.append({"name": name, "role": role, "association": association})
                 continue
 
-            # Format A (Bullet points): - **Name**, Association — Role
+            # FORMAT A (Bullet points): - **Name**, Association — Role
             match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
             if match_a:
                 name = clean_person_name(match_a.group(1))
@@ -151,7 +176,7 @@ def parse_markdown_file(md_path: Path) -> dict:
                     extracted_people.append({"name": name, "role": role, "association": association})
                 continue
                 
-            # Format B (Plain text comma separation) -> MOVED ABOVE FORMAT D
+            # FORMAT B (Plain text comma separation)
             if len(line_clean) < 150 and not line_clean.endswith('.'):
                 parts = line_clean.split(',')
                 if len(parts) >= 2:
@@ -160,17 +185,7 @@ def parse_markdown_file(md_path: Path) -> dict:
                     
                     if is_person_name(name):
                         extracted_people.append({"name": name, "role": current_section, "association": association})
-                        continue # If successful, skip Format D
-                
-            # Format D: Name (Association) without bullet points
-            match_d = re.match(r'^([^\(]+?)\s*\((.+?)\)$', line_clean)
-            if match_d:
-                name = clean_person_name(match_d.group(1))
-                association = match_d.group(2).strip()
-                
-                if is_person_name(name):
-                    extracted_people.append({"name": name, "role": current_section, "association": association})
-                continue
+                        continue 
                     
     return {
         "conference_title": title,
