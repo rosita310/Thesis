@@ -35,8 +35,8 @@ MIN_YEAR = 2016
 
 # Crossref's "polite pool": without a contact address you land in the shared
 # pool and hit 429s much sooner.
-CONTACT_EMAIL = "r.sijm@salco.nl"
-USER_AGENT = f"VAFAF-thesis-collector/1.0 (mailto:{CONTACT_EMAIL})"
+CONTACT_EMAIL = "placeholder@email.com"
+USER_AGENT = f"thesis-collector/1.0 (mailto:{CONTACT_EMAIL})"
 
 ROWS_PER_PAGE = 500
 MAX_RETRIES = 5
