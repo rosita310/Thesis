@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 20                        
+MAX_FILES = None                        
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -35,6 +35,11 @@ WANTED_SECTIONS = [
     "program co-chair",
     "programme co-chair",
     "general co-chair",
+    "conference committee",
+    "publication chair",
+    "organizing chair",
+    "publicity chair",
+    "local organizing chair"
 ]
 
 IGNORED_SECTIONS = [
@@ -52,6 +57,12 @@ IGNORED_SECTIONS = [
     "reviewers",
     "additional reviewers",
     "preface",
+]
+
+INSTITUTION_KEYWORDS = [
+    'University', 'Academy', 'TU ', 'Institute', 
+    'College', 'School', 'Labs', 'Research', 
+    'Corporation', 'Inc.', 'National'
 ]
 
 NAME_MIN_WORDS = 2
@@ -96,6 +107,15 @@ def is_person_name(name: str) -> bool:
         return False
         
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
+
+def split_merged_name(text: str):
+    """Intelligently separates a name from an institution when no comma exists."""
+    if any(kw in text for kw in INSTITUTION_KEYWORDS):
+        # Captures optional title (Prof/Dr) + First Name + Optional Middle Initial + Last Name
+        match = re.match(r'^((?:Prof\.\s+|Dr\.\s+)?[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text)
+        if match:
+            return match.group(1), match.group(2)
+    return text, ""
 
 # ==========================================
 # PARSING LOGIC
@@ -149,8 +169,14 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue # Skip processing the header line itself as a person
             
         if capture:
-            # FORMAT C & D Unified (Names with Parentheses / Inline Roles):
-            # Matches: "**Role:** Name (Association)" OR "Name _(Association)_" OR "Name (Association)"
+            # INTERCEPT: Plain-text role sub-headers (e.g. "General Chair(s)")
+            if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
+                # Ensure it lacks person formatting markers like commas before treating it as a role
+                if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
+                    current_inline_role = line_clean.title().replace('(S)', '(s)')
+                    continue
+                    
+            # FORMAT C & D Unified: Names with Parentheses / Inline Roles
             match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', line_clean)
             if match_cd:
                 role_inline = match_cd.group(1)
@@ -176,16 +202,27 @@ def parse_markdown_file(md_path: Path) -> dict:
                     extracted_people.append({"name": name, "role": role, "association": association})
                 continue
                 
-            # FORMAT B (Plain text comma separation)
+            # FORMAT B (Plain text comma separation OR merged without commas)
             if len(line_clean) < 150 and not line_clean.endswith('.'):
                 parts = line_clean.split(',')
-                if len(parts) >= 2:
-                    name = clean_person_name(parts[0])
+                
+                # Check for merged names in the first part
+                name_candidate, merged_assoc = split_merged_name(parts[0].strip())
+                
+                if merged_assoc:
+                    association = merged_assoc
+                    if len(parts) > 1:
+                        association += ", " + ", ".join([p.strip() for p in parts[1:]])
+                else:
                     association = ", ".join([p.strip() for p in parts[1:]])
-                    
-                    if is_person_name(name):
-                        extracted_people.append({"name": name, "role": current_section, "association": association})
-                        continue 
+                
+                name = clean_person_name(name_candidate)
+                role = current_inline_role if current_inline_role else current_section
+                
+                # Ensure it's a person and either has an association or was explicitly comma separated
+                if is_person_name(name) and (association or len(parts) >= 2):
+                    extracted_people.append({"name": name, "role": role, "association": association})
+                    continue 
                     
     return {
         "conference_title": title,
