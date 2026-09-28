@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 50                        
-OVERWRITE_EXISTING = True            
+MAX_FILES = None                        
+OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
 # ==========================================
@@ -28,7 +28,8 @@ WANTED_SECTIONS = [
     "programme co-chair", "general co-chair", "conference committee",
     "publication chair", "organizing chair", "publicity chair",
     "local organizing chair", "conference chair", "conference co-chair",
-    "technical program chair", "international committee", "committee member"
+    "technical program chair", "international committee", "committee member",
+    "local arrangements chair"
 ]
 
 IGNORED_SECTIONS = [
@@ -69,13 +70,17 @@ logging.getLogger().addHandler(console_handler)
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
     
-    # Remove academic/professional titles
-    title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Dr\.|Mr\.|Ms\.|Mrs\.|Miss)\s+'
+    # Aggressive stripping for academic/professional titles
+    title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
     name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
     
     name = " ".join(name.split()).strip(" ,;:-")
     name = re.sub(r"\.(?=[A-Za-z])", ". ", name)
     return " ".join(name.split())
+
+def clean_association(assoc: str) -> str:
+    """Removes lingering markdown formatting from the association string."""
+    return re.sub(r'[*_]', '', assoc).strip(" ,;:-")
 
 def is_person_name(name: str) -> bool:
     if not name: return False
@@ -87,10 +92,24 @@ def is_person_name(name: str) -> bool:
 
 def split_merged_name(text: str):
     if any(kw in text for kw in INSTITUTION_KEYWORDS):
-        match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text)
+        match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text, re.IGNORECASE)
         if match:
             return match.group(1), match.group(2)
     return text, ""
+
+def is_junk_line(line: str) -> bool:
+    """Detects page footers, stray numbers, or all-caps headers to prevent association bleed."""
+    line_lower = line.strip().lower()
+    # Matches solitary page numbers (e.g. '14', 'xi', 'iv')
+    if re.match(r'^([ivxlcdm]+|\d+)$', line_lower): return True
+    
+    # Matches all-caps junk blocks (allows for numbers and standard punctuation)
+    alpha_count = sum(1 for c in line if c.isalpha())
+    upper_count = sum(1 for c in line if c.isupper())
+    if alpha_count > 5 and (upper_count / alpha_count) > 0.8:
+        return True
+        
+    return False
 
 # ==========================================
 # PARSING LOGIC
@@ -119,8 +138,7 @@ def parse_markdown_file(md_path: Path) -> dict:
     def finalize_pending():
         nonlocal pending_person
         if pending_person:
-            # Clean up multi-line whitespace in associations
-            pending_person["association"] = " ".join(pending_person["association"].split()).strip(" ,;:-")
+            pending_person["association"] = clean_association(" ".join(pending_person["association"].split()))
             extracted_people.append(pending_person)
             pending_person = None
     
@@ -156,8 +174,14 @@ def parse_markdown_file(md_path: Path) -> dict:
                     finalize_pending()
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
+                    
+            # INLINE ROLE EXTRACTOR (e.g. "**General Chair:** Clinton Jeffery, ...")
+            inline_match = re.match(r'^\*\*(.*?):\*\*\s*(.*)$', line_clean)
+            if inline_match:
+                current_inline_role = inline_match.group(1).strip().title()
+                line_clean = inline_match.group(2).strip()
 
-            # CONTINUATION CHECK: If we have an unfinished parenthesis, blindly append the next line
+            # CONTINUATION CHECK
             if pending_person:
                 unbalanced = pending_person["association"].count('(') - pending_person["association"].count(')')
                 if unbalanced > 0:
@@ -208,10 +232,10 @@ def parse_markdown_file(md_path: Path) -> dict:
                 finalize_pending()
                 pending_person = parsed
             elif pending_person:
-                # If it doesn't match a new person format, append to the active person
-                pending_person["association"] += " " + line_clean
+                if not is_junk_line(line_clean):
+                    pending_person["association"] += " " + line_clean
 
-    finalize_pending() # Save the last person
+    finalize_pending() 
     
     return {
         "conference_title": title,
