@@ -70,8 +70,8 @@ logging.getLogger().addHandler(console_handler)
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
     
-    # Aggressive stripping for academic/professional titles
-    title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
+    # Aggressive stripping for academic/professional titles, including 'Chair Prof.'
+    title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
     name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
     
     name = " ".join(name.split()).strip(" ,;:-")
@@ -88,11 +88,17 @@ def is_person_name(name: str) -> bool:
     if not any(character.isalpha() for character in name): return False
     if name.count('(') != name.count(')'): return False
     if any(c in name for c in ['”', '“', '"']): return False
+    
+    # Reject strings containing common prose stopwords
+    stopwords = {'in', 'of', 'with', 'the', 'and', 'for', 'to', 'this', 'that', 'such', 'as'}
+    name_words = set(name.lower().split())
+    if stopwords.intersection(name_words): return False
+        
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
 def split_merged_name(text: str):
     if any(kw in text for kw in INSTITUTION_KEYWORDS):
-        match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text, re.IGNORECASE)
+        match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text, re.IGNORECASE)
         if match:
             return match.group(1), match.group(2)
     return text, ""
@@ -100,10 +106,8 @@ def split_merged_name(text: str):
 def is_junk_line(line: str) -> bool:
     """Detects page footers, stray numbers, or all-caps headers to prevent association bleed."""
     line_lower = line.strip().lower()
-    # Matches solitary page numbers (e.g. '14', 'xi', 'iv')
     if re.match(r'^([ivxlcdm]+|\d+)$', line_lower): return True
     
-    # Matches all-caps junk blocks (allows for numbers and standard punctuation)
     alpha_count = sum(1 for c in line if c.isalpha())
     upper_count = sum(1 for c in line if c.isupper())
     if alpha_count > 5 and (upper_count / alpha_count) > 0.8:
@@ -147,6 +151,9 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not line_clean:
             continue
             
+        # Strip trailing periods so country abbreviations like 'U.S.' don't cause the line to be rejected as a sentence
+        line_clean = re.sub(r'\.+$', '', line_clean).strip()
+            
         is_toc_line = bool(re.search(r'\.{3,}', line_clean))
         if is_toc_line:
             continue
@@ -175,11 +182,14 @@ def parse_markdown_file(md_path: Path) -> dict:
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
                     
-            # INLINE ROLE EXTRACTOR (e.g. "**General Chair:** Clinton Jeffery, ...")
+            # INLINE ROLE EXTRACTOR
             inline_match = re.match(r'^\*\*(.*?):\*\*\s*(.*)$', line_clean)
             if inline_match:
                 current_inline_role = inline_match.group(1).strip().title()
                 line_clean = inline_match.group(2).strip()
+
+            # PRE-PROCESS: Strip professional memberships in parentheses (e.g., "(IEEE Fellow, ACM Member)")
+            line_clean = re.sub(r'\([^)]*(?:Fellow|Member)[^)]*\)', '', line_clean, flags=re.IGNORECASE).strip()
 
             # CONTINUATION CHECK
             if pending_person:
@@ -213,7 +223,7 @@ def parse_markdown_file(md_path: Path) -> dict:
             
             # FORMAT B
             if not parsed:
-                if len(line_clean) < 150 and not line_clean.endswith('.'):
+                if len(line_clean) < 150: # Check length without period check
                     parts = line_clean.split(',')
                     name_candidate, merged_assoc = split_merged_name(parts[0].strip())
                     
