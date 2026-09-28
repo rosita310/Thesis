@@ -1,5 +1,5 @@
 import logging
-from helpers import clean_value
+from solution.PCMemberAttack.Springer.lncs.scraper.helpers import clean_value
 
 def get_affiliations(soup) -> list:
     logging.debug("get_affiliations")

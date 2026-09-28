@@ -9,11 +9,11 @@ import sys
 sys.path.append('./solution/python_packages/database')
 from database import Postgress, Saver 
 import configparser
-from helpers import clean_value
-from person_affiliation import get_affiliations
+from solution.PCMemberAttack.Springer.lncs.scraper.helpers import clean_value
+from solution.PCMemberAttack.Springer.lncs.scraper.person_affiliation import get_affiliations
 import pyodbc
 import os
-import paper
+import solution.PCMemberAttack.Springer.lncs.scraper.paper as paper
 
 logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
 
