@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = None                        
-OVERWRITE_EXISTING = True              
+MAX_FILES = 50                        
+OVERWRITE_EXISTING = True            
 SKIP_PREFIXES = ()                      
 
 # ==========================================
@@ -21,48 +21,28 @@ SKIP_PREFIXES = ()
 # ==========================================
 
 WANTED_SECTIONS = [
-    "organizing committee",
-    "program committee",
-    "programme committee",
-    "steering committee",
-    "track chairs",
-    "organization",
-    "workshop chair",
-    "program chair",
-    "programme chair",
-    "general chair",
-    "workshop co-chair",
-    "program co-chair",
-    "programme co-chair",
-    "general co-chair",
-    "conference committee",
-    "publication chair",
-    "organizing chair",
-    "publicity chair",
-    "local organizing chair"
+    "organizing committee", "program committee", "programme committee",
+    "steering committee", "track chairs", "organization",
+    "workshop chair", "program chair", "programme chair",
+    "general chair", "workshop co-chair", "program co-chair",
+    "programme co-chair", "general co-chair", "conference committee",
+    "publication chair", "organizing chair", "publicity chair",
+    "local organizing chair", "conference chair", "conference co-chair",
+    "technical program chair", "international committee", "committee member"
 ]
 
 IGNORED_SECTIONS = [
-    "advisory board",
-    "organizer",
-    "organizing partners",
-    "table of contents",
-    "copyright",
-    "full papers",
-    "work-in-progress",
-    "sponsors",
-    "author index",
-    "message from",
-    "welcome message",
-    "reviewers",
-    "additional reviewers",
-    "preface",
+    "advisory board", "organizer", "organizing partners",
+    "table of contents", "copyright", "full papers",
+    "work-in-progress", "sponsors", "author index",
+    "message from", "welcome message", "reviewers",
+    "additional reviewers", "preface"
 ]
 
 INSTITUTION_KEYWORDS = [
     'University', 'Academy', 'TU ', 'Institute', 
     'College', 'School', 'Labs', 'Research', 
-    'Corporation', 'Inc.', 'National'
+    'Corporation', 'Inc.', 'National', 'Center', 'Centre'
 ]
 
 NAME_MIN_WORDS = 2
@@ -88,31 +68,26 @@ logging.getLogger().addHandler(console_handler)
 
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
+    
+    # Remove academic/professional titles
+    title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Dr\.|Mr\.|Ms\.|Mrs\.|Miss)\s+'
+    name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
+    
     name = " ".join(name.split()).strip(" ,;:-")
     name = re.sub(r"\.(?=[A-Za-z])", ". ", name)
     return " ".join(name.split())
 
 def is_person_name(name: str) -> bool:
-    if not name:
-        return False
-    if any(character.isdigit() for character in name):
-        return False
-    if not any(character.isalpha() for character in name):
-        return False
-    # Reject strings with unbalanced parentheses (prevents bad comma splits)
-    if name.count('(') != name.count(')'):
-        return False
-    # Reject paper titles masquerading as names
-    if any(c in name for c in ['”', '“', '"']):
-        return False
-        
+    if not name: return False
+    if any(character.isdigit() for character in name): return False
+    if not any(character.isalpha() for character in name): return False
+    if name.count('(') != name.count(')'): return False
+    if any(c in name for c in ['”', '“', '"']): return False
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
 def split_merged_name(text: str):
-    """Intelligently separates a name from an institution when no comma exists."""
     if any(kw in text for kw in INSTITUTION_KEYWORDS):
-        # Captures optional title (Prof/Dr) + First Name + Optional Middle Initial + Last Name
-        match = re.match(r'^((?:Prof\.\s+|Dr\.\s+)?[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text)
+        match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate)\s+)?(?:Prof\.|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text)
         if match:
             return match.group(1), match.group(2)
     return text, ""
@@ -139,6 +114,15 @@ def parse_markdown_file(md_path: Path) -> dict:
     capture = False
     current_section = "Committee Member"
     current_inline_role = None
+    pending_person = None
+    
+    def finalize_pending():
+        nonlocal pending_person
+        if pending_person:
+            # Clean up multi-line whitespace in associations
+            pending_person["association"] = " ".join(pending_person["association"].split()).strip(" ,;:-")
+            extracted_people.append(pending_person)
+            pending_person = None
     
     for line in lines:
         line_clean = line.strip()
@@ -149,81 +133,86 @@ def parse_markdown_file(md_path: Path) -> dict:
         if is_toc_line:
             continue
 
-        # Check if the line is a standalone structural header (starts with # or wrapped in **)
         is_standalone_header = bool(re.match(r'^#+\s', line_clean)) or bool(re.match(r'^\*\*[^\*]+\*\*\s*$', line_clean))
         
         if is_standalone_header:
+            finalize_pending()
             header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
             
-            # PRIORITY 1: Is this an ignored section?
             if any(ignored in header_check for ignored in IGNORED_SECTIONS):
                 capture = False
-            # PRIORITY 2: Is this a wanted section?
             elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
             else:
                 capture = False
-                
-            continue # Skip processing the header line itself as a person
+            continue 
             
         if capture:
             # INTERCEPT: Plain-text role sub-headers (e.g. "General Chair(s)")
             if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
-                # Ensure it lacks person formatting markers like commas before treating it as a role
                 if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
+                    finalize_pending()
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
-                    
-            # FORMAT C & D Unified: Names with Parentheses / Inline Roles
+
+            # CONTINUATION CHECK: If we have an unfinished parenthesis, blindly append the next line
+            if pending_person:
+                unbalanced = pending_person["association"].count('(') - pending_person["association"].count(')')
+                if unbalanced > 0:
+                    pending_person["association"] += " " + line_clean
+                    continue
+
+            parsed = None
+            
+            # FORMAT C & D Unified
             match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', line_clean)
             if match_cd:
                 role_inline = match_cd.group(1)
                 if role_inline:
                     current_inline_role = role_inline.strip().title()
-                
                 name = clean_person_name(match_cd.group(2))
-                association = match_cd.group(3).strip()
-                role = current_inline_role if current_inline_role else current_section
-                
+                assoc = match_cd.group(3).strip()
                 if is_person_name(name):
-                    extracted_people.append({"name": name, "role": role, "association": association})
-                continue
+                    parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
-            # FORMAT A (Bullet points): - **Name**, Association — Role
-            match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
-            if match_a:
-                name = clean_person_name(match_a.group(1))
-                association = match_a.group(2).strip() if match_a.group(2) else ""
-                role = match_a.group(3).strip() if match_a.group(3) else current_section
-                
-                if is_person_name(name):
-                    extracted_people.append({"name": name, "role": role, "association": association})
-                continue
-                
-            # FORMAT B (Plain text comma separation OR merged without commas)
-            if len(line_clean) < 150 and not line_clean.endswith('.'):
-                parts = line_clean.split(',')
-                
-                # Check for merged names in the first part
-                name_candidate, merged_assoc = split_merged_name(parts[0].strip())
-                
-                if merged_assoc:
-                    association = merged_assoc
-                    if len(parts) > 1:
-                        association += ", " + ", ".join([p.strip() for p in parts[1:]])
-                else:
-                    association = ", ".join([p.strip() for p in parts[1:]])
-                
-                name = clean_person_name(name_candidate)
-                role = current_inline_role if current_inline_role else current_section
-                
-                # Ensure it's a person and either has an association or was explicitly comma separated
-                if is_person_name(name) and (association or len(parts) >= 2):
-                    extracted_people.append({"name": name, "role": role, "association": association})
-                    continue 
+            # FORMAT A
+            if not parsed:
+                match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
+                if match_a:
+                    name = clean_person_name(match_a.group(1))
+                    assoc = match_a.group(2).strip() if match_a.group(2) else ""
+                    role = match_a.group(3).strip() if match_a.group(3) else current_section
+                    if is_person_name(name):
+                        parsed = {"name": name, "role": role, "association": assoc}
+            
+            # FORMAT B
+            if not parsed:
+                if len(line_clean) < 150 and not line_clean.endswith('.'):
+                    parts = line_clean.split(',')
+                    name_candidate, merged_assoc = split_merged_name(parts[0].strip())
                     
+                    if merged_assoc:
+                        assoc = merged_assoc
+                        if len(parts) > 1:
+                            assoc += ", " + ", ".join([p.strip() for p in parts[1:]])
+                    else:
+                        assoc = ", ".join([p.strip() for p in parts[1:]])
+                    
+                    name = clean_person_name(name_candidate)
+                    if is_person_name(name) and (assoc or len(parts) >= 2):
+                        parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
+
+            if parsed:
+                finalize_pending()
+                pending_person = parsed
+            elif pending_person:
+                # If it doesn't match a new person format, append to the active person
+                pending_person["association"] += " " + line_clean
+
+    finalize_pending() # Save the last person
+    
     return {
         "conference_title": title,
         "isbn": isbn,
