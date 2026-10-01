@@ -78,8 +78,7 @@ NAME_PARTICLES = {
 
 # A name that appears in this many journals is IEEE corporate staff or an officer,
 # not an editor. Checked on the 2026-09 corpus: from 12 journals up it is all
-# officers and staff (Yoffa, Ruggieri, Hourican, Kempf, ...); at 10-11 the first
-# real editors appear.
+# officers and staff; at 10-11 the first real editors appear.
 MAX_JOURNALS_PER_NAME = 12
 
 # A board without any role caption is still accepted (role "Unknown") when this
@@ -600,7 +599,7 @@ def is_valid_name(name_str: str) -> bool:
         lower = word.lower().strip(",")
         if lower in NON_NAME_WORDS:
             return False
-        word = word.lstrip("(")  # a nickname: 'CHIN-TENG (CT) LIN'
+        word = word.lstrip("(")  # a nickname: 'JOHN (JJ) DOE'
         if not word or not word[0].isupper() and lower not in NAME_PARTICLES:
             return False
     return True
@@ -663,7 +662,7 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
 
     return None
 
-# Two initial-style names on one line: 'W. WIESBECK M. T. HALLIKAINEN'
+# Two initial-style names on one line: 'J. DOE A. B. SMITH'
 DOUBLE_NAME = re.compile(r"((?:[A-Z]\.\s*)+[A-Z][\w'-]+)\s+((?:[A-Z]\.\s*)+[A-Z][\w'-]+)")
 
 def split_double_names(editors: list[dict]) -> list[dict]:
@@ -882,8 +881,8 @@ def journal_of(file_name: str) -> str:
     return re.sub(r"_\d{4}_Issue_.*$", "", file_name)
 
 def name_key(name: str) -> str:
-    """'SOPHIA A. MUIRHEAD, Secretary' and 'Sophia Muirhead' -> 'sophia muirhead'.
-    Drops middle initials only; a first initial stays, so 'J. Xu' != 'Y. Xu'."""
+    """'JANE A. DOE, Secretary' and 'Jane Doe' -> 'jane doe'.
+    Drops middle initials only; a first initial stays, so 'J. Doe' != 'A. Doe'."""
     words = [w.strip(".") for w in name.split(",")[0].lower().replace(".", ". ").split()
              if w not in ("dr.", "prof.")]
     if len(words) < 3:
