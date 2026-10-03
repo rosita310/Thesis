@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = None                        
+MAX_FILES = 500                       
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -29,7 +29,7 @@ WANTED_SECTIONS = [
     "publication chair", "organizing chair", "publicity chair",
     "local organizing chair", "conference chair", "conference co-chair",
     "technical program chair", "international committee", "committee member",
-    "local arrangements chair"
+    "local arrangements chair", "chairs", "members", "pc co-chairs", "webmaster"
 ]
 
 IGNORED_SECTIONS = [
@@ -43,7 +43,8 @@ IGNORED_SECTIONS = [
 INSTITUTION_KEYWORDS = [
     'University', 'Academy', 'TU ', 'Institute', 
     'College', 'School', 'Labs', 'Research', 
-    'Corporation', 'Inc.', 'National', 'Center', 'Centre'
+    'Corporation', 'Inc.', 'National', 'Center', 'Centre',
+    'Microsoft', 'Google', 'IBM', 'Alibaba'
 ]
 
 NAME_MIN_WORDS = 2
@@ -70,7 +71,7 @@ logging.getLogger().addHandler(console_handler)
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
     
-    # Aggressive stripping for academic/professional titles, including 'Chair Prof.'
+    # Aggressive stripping for academic/professional titles
     title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
     name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
     
@@ -79,7 +80,6 @@ def clean_person_name(name: str) -> str:
     return " ".join(name.split())
 
 def clean_association(assoc: str) -> str:
-    """Removes lingering markdown formatting from the association string."""
     return re.sub(r'[*_]', '', assoc).strip(" ,;:-")
 
 def is_person_name(name: str) -> bool:
@@ -97,14 +97,23 @@ def is_person_name(name: str) -> bool:
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
 def split_merged_name(text: str):
-    if any(kw in text for kw in INSTITUTION_KEYWORDS):
+    # Strip solitary asterisks attached to names (e.g. "Aaditeshwar Seth*")
+    text = re.sub(r'(?<!\*)\*(?!\*)', '', text)
+    
+    # 1. Institution Keyword Split
+    if any(kw.lower() in text.lower() for kw in INSTITUTION_KEYWORDS):
         match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text, re.IGNORECASE)
         if match:
             return match.group(1), match.group(2)
+            
+    # 2. Fallback: Assume the first 2 words (ignoring titles) are the name, and the rest is the association
+    fallback_match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+\s+(?:[A-Z]\.\s+)?[A-Z][A-Za-z\-]+)\s+(.+)$', text, re.IGNORECASE)
+    if fallback_match:
+        return fallback_match.group(1), fallback_match.group(2)
+        
     return text, ""
 
 def is_junk_line(line: str) -> bool:
-    """Detects page footers, stray numbers, or all-caps headers to prevent association bleed."""
     line_lower = line.strip().lower()
     if re.match(r'^([ivxlcdm]+|\d+)$', line_lower): return True
     
@@ -151,8 +160,8 @@ def parse_markdown_file(md_path: Path) -> dict:
         if not line_clean:
             continue
             
-        # Strip trailing periods so country abbreviations like 'U.S.' don't cause the line to be rejected as a sentence
-        line_clean = re.sub(r'\.+$', '', line_clean).strip()
+        # Strip trailing periods AND commas to catch formats like "Newton Lee (USA),"
+        line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
         is_toc_line = bool(re.search(r'\.{3,}', line_clean))
         if is_toc_line:
@@ -175,23 +184,19 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue 
             
         if capture:
-            # INTERCEPT: Plain-text role sub-headers (e.g. "General Chair(s)")
             if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
                 if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
                     finalize_pending()
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
                     
-            # INLINE ROLE EXTRACTOR
             inline_match = re.match(r'^\*\*(.*?):\*\*\s*(.*)$', line_clean)
             if inline_match:
                 current_inline_role = inline_match.group(1).strip().title()
                 line_clean = inline_match.group(2).strip()
 
-            # PRE-PROCESS: Strip professional memberships in parentheses (e.g., "(IEEE Fellow, ACM Member)")
             line_clean = re.sub(r'\([^)]*(?:Fellow|Member)[^)]*\)', '', line_clean, flags=re.IGNORECASE).strip()
 
-            # CONTINUATION CHECK
             if pending_person:
                 unbalanced = pending_person["association"].count('(') - pending_person["association"].count(')')
                 if unbalanced > 0:
@@ -200,7 +205,6 @@ def parse_markdown_file(md_path: Path) -> dict:
 
             parsed = None
             
-            # FORMAT C & D Unified
             match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', line_clean)
             if match_cd:
                 role_inline = match_cd.group(1)
@@ -211,7 +215,6 @@ def parse_markdown_file(md_path: Path) -> dict:
                 if is_person_name(name):
                     parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
-            # FORMAT A
             if not parsed:
                 match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
                 if match_a:
@@ -221,9 +224,8 @@ def parse_markdown_file(md_path: Path) -> dict:
                     if is_person_name(name):
                         parsed = {"name": name, "role": role, "association": assoc}
             
-            # FORMAT B
             if not parsed:
-                if len(line_clean) < 150: # Check length without period check
+                if len(line_clean) < 150: 
                     parts = line_clean.split(',')
                     name_candidate, merged_assoc = split_merged_name(parts[0].strip())
                     
