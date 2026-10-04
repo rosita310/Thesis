@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = None                        
+MAX_FILES = 2000                        
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -22,8 +22,8 @@ SKIP_PREFIXES = ()
 
 WANTED_SECTIONS = [
     "organizing committee", "program committee", "programme committee",
-    "steering committee", "track chairs", "organization",
-    "workshop chair", "program chair", "programme chair",
+    "programming committee", "steering committee", "track chairs", 
+    "organization", "workshop chair", "program chair", "programme chair",
     "general chair", "workshop co-chair", "program co-chair",
     "programme co-chair", "general co-chair", "conference committee",
     "publication chair", "organizing chair", "publicity chair",
@@ -138,7 +138,6 @@ def parse_markdown_file(md_path: Path) -> dict:
     text = unicodedata.normalize("NFKC", raw_content)
     
     # PRE-PROCESSING: Collapse single newlines that incorrectly shatter names across lines.
-    # Replaces a newline with a space UNLESS it's adjacent to another newline or a structural marker (- or #)
     text = re.sub(r'(?<!\n)\n(?!\n|\s*[\-#\*])', ' ', text)
     
     lines = text.split('\n')
@@ -158,8 +157,6 @@ def parse_markdown_file(md_path: Path) -> dict:
     
     for line in lines:
         line_clean = line.strip()
-        
-        # Clean hidden PDF characters like backspaces
         line_clean = line_clean.replace('\x08', '')
         
         if not line_clean:
@@ -167,7 +164,7 @@ def parse_markdown_file(md_path: Path) -> dict:
             
         line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
-        # ToC detection (Dots OR large gap of spaces followed by page number)
+        # ToC detection
         is_toc_line = bool(re.search(r'\.{3,}', line_clean)) or bool(re.search(r'\s{5,}[ivxlcdm0-9]+\**$', line_clean, re.IGNORECASE))
         if is_toc_line:
             continue
@@ -178,6 +175,10 @@ def parse_markdown_file(md_path: Path) -> dict:
             finalize_pending()
             header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
             
+            # Prevent page breaks from disabling capture logic
+            if 'continued' in header_check:
+                continue
+                
             if any(ignored in header_check for ignored in IGNORED_SECTIONS):
                 capture = False
             elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
@@ -195,10 +196,13 @@ def parse_markdown_file(md_path: Path) -> dict:
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
                     
-            inline_match = re.match(r'^\*\*(.*?):\*\*\s*(.*)$', line_clean)
+            # INLINE ROLE EXTRACTOR: Gracefully handles colons, hyphens, and pure space
+            inline_match = re.match(r'^\*\*(.*?)\*\*\s*[:-]?\s*(.*)$', line_clean)
             if inline_match:
-                current_inline_role = inline_match.group(1).strip().title()
-                line_clean = inline_match.group(2).strip()
+                role_cand = inline_match.group(1).strip(" :")
+                if len(role_cand) < 60:
+                    current_inline_role = role_cand.title()
+                    line_clean = inline_match.group(2).strip()
 
             line_clean = re.sub(r'\([^)]*(?:Fellow|Member)[^)]*\)', '', line_clean, flags=re.IGNORECASE).strip()
 
