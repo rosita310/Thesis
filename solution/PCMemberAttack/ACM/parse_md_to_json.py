@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 2000                        
+MAX_FILES = 2000                       
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -21,20 +21,20 @@ SKIP_PREFIXES = ()
 # ==========================================
 
 WANTED_SECTIONS = [
-    "organizing committee", "program committee", "programme committee",
+    "organizing committee", "organising committee", "program committee", "programme committee",
     "programming committee", "steering committee", "track chairs", 
     "organization", "workshop chair", "program chair", "programme chair",
     "general chair", "workshop co-chair", "program co-chair",
     "programme co-chair", "general co-chair", "conference committee",
-    "publication chair", "organizing chair", "publicity chair",
-    "local organizing chair", "conference chair", "conference co-chair",
+    "publication chair", "organizing chair", "organising chair", "publicity chair",
+    "local organizing chair", "local organising chair", "conference chair", "conference co-chair",
     "technical program chair", "technical committee", "international committee", 
     "committee member", "local arrangements chair", "chairs", "members", 
     "pc co-chairs", "webmaster", "workshop organizers"
 ]
 
 IGNORED_SECTIONS = [
-    "advisory board", "organizer", "organizing partners",
+    "advisory board", "organizing partners",
     "table of contents", "copyright", "full papers",
     "work-in-progress", "sponsors", "author index",
     "message from", "welcome message", "reviewers",
@@ -95,7 +95,7 @@ def is_person_name(name: str) -> bool:
         
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
-def split_merged_name(text: str):
+def split_merged_name(text: str, has_comma: bool):
     text = re.sub(r'(?<!\*)\*(?!\*)', '', text)
     
     if any(kw.lower() in text.lower() for kw in INSTITUTION_KEYWORDS):
@@ -103,9 +103,10 @@ def split_merged_name(text: str):
         if match:
             return match.group(1), match.group(2)
             
-    fallback_match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+\s+(?:[A-Z]\.\s+)?[A-Z][A-Za-z\-]+)\s+(.+)$', text, re.IGNORECASE)
-    if fallback_match:
-        return fallback_match.group(1), fallback_match.group(2)
+    if not has_comma:
+        fallback_match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+\s+(?:[A-Z]\.\s+)?[A-Z][A-Za-z\-]+)\s+(.+)$', text, re.IGNORECASE)
+        if fallback_match:
+            return fallback_match.group(1), fallback_match.group(2)
         
     return text, ""
 
@@ -136,10 +137,6 @@ def parse_markdown_file(md_path: Path) -> dict:
     title = title.replace('..', '').strip()
         
     text = unicodedata.normalize("NFKC", raw_content)
-    
-    # PRE-PROCESSING: Collapse single newlines that incorrectly shatter names across lines.
-    text = re.sub(r'(?<!\n)\n(?!\n|\s*[\-#\*])', ' ', text)
-    
     lines = text.split('\n')
     
     extracted_people = []
@@ -148,25 +145,28 @@ def parse_markdown_file(md_path: Path) -> dict:
     current_inline_role = None
     pending_person = None
     
+    line_buffer = ""
+    
     def finalize_pending():
-        nonlocal pending_person
+        nonlocal pending_person, line_buffer
         if pending_person:
             pending_person["association"] = clean_association(" ".join(pending_person["association"].split()))
             extracted_people.append(pending_person)
             pending_person = None
+        line_buffer = ""
     
-    for line in lines:
-        line_clean = line.strip()
-        line_clean = line_clean.replace('\x08', '')
+    for original_line in lines:
+        line_clean = original_line.strip().replace('\x08', '')
         
         if not line_clean:
+            finalize_pending()
             continue
             
         line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
-        # ToC detection
         is_toc_line = bool(re.search(r'\.{3,}', line_clean)) or bool(re.search(r'\s{5,}[ivxlcdm0-9]+\**$', line_clean, re.IGNORECASE))
         if is_toc_line:
+            line_buffer = ""
             continue
 
         is_standalone_header = bool(re.match(r'^#+\s', line_clean)) or bool(re.match(r'^\*\*[^\*]+\*\*\s*$', line_clean))
@@ -175,13 +175,12 @@ def parse_markdown_file(md_path: Path) -> dict:
             finalize_pending()
             header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
             
-            # Prevent page breaks from disabling capture logic
             if 'continued' in header_check:
                 continue
                 
             if any(ignored in header_check for ignored in IGNORED_SECTIONS):
                 capture = False
-            elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 10:
+            elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 20:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
@@ -196,7 +195,6 @@ def parse_markdown_file(md_path: Path) -> dict:
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
                     continue
                     
-            # INLINE ROLE EXTRACTOR: Gracefully handles colons, hyphens, and pure space
             inline_match = re.match(r'^\*\*(.*?)\*\*\s*[:-]?\s*(.*)$', line_clean)
             if inline_match:
                 role_cand = inline_match.group(1).strip(" :")
@@ -212,9 +210,11 @@ def parse_markdown_file(md_path: Path) -> dict:
                     pending_person["association"] += " " + line_clean
                     continue
 
+            # Try parsing with current line and any accumulated buffer fragments
+            target_line = (line_buffer + " " + line_clean).strip() if line_buffer else line_clean
             parsed = None
             
-            match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', line_clean)
+            match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', target_line)
             if match_cd:
                 role_inline = match_cd.group(1)
                 if role_inline:
@@ -225,7 +225,7 @@ def parse_markdown_file(md_path: Path) -> dict:
                     parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
             if not parsed:
-                match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', line_clean)
+                match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', target_line)
                 if match_a:
                     name = clean_person_name(match_a.group(1))
                     assoc = match_a.group(2).strip() if match_a.group(2) else ""
@@ -234,27 +234,35 @@ def parse_markdown_file(md_path: Path) -> dict:
                         parsed = {"name": name, "role": role, "association": assoc}
             
             if not parsed:
-                if len(line_clean) < 150: 
-                    parts = line_clean.split(',')
-                    name_candidate, merged_assoc = split_merged_name(parts[0].strip())
+                if len(target_line) < 150: 
+                    parts = target_line.split(',')
+                    has_comma = len(parts) > 1
+                    name_candidate, merged_assoc = split_merged_name(parts[0].strip(), has_comma)
                     
                     if merged_assoc:
                         assoc = merged_assoc
-                        if len(parts) > 1:
+                        if has_comma:
                             assoc += ", " + ", ".join([p.strip() for p in parts[1:]])
                     else:
                         assoc = ", ".join([p.strip() for p in parts[1:]])
                     
                     name = clean_person_name(name_candidate)
-                    if is_person_name(name) and (assoc or len(parts) >= 2):
+                    if is_person_name(name) and (assoc or has_comma):
                         parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
             if parsed:
                 finalize_pending()
                 pending_person = parsed
-            elif pending_person:
-                if not is_junk_line(line_clean):
-                    pending_person["association"] += " " + line_clean
+            else:
+                if pending_person:
+                    if not is_junk_line(line_clean):
+                        pending_person["association"] += " " + line_clean
+                else:
+                    # Line didn't parse and no pending person. Keep it in buffer to try with next line.
+                    if len(target_line) < 100:
+                        line_buffer = target_line
+                    else:
+                        line_buffer = ""
 
     finalize_pending() 
     
