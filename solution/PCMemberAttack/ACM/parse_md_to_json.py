@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 2000                       
-OVERWRITE_EXISTING = True              
+MAX_FILES = 3000                       
+OVERWRITE_EXISTING = False             
 SKIP_PREFIXES = ()                      
 
 # ==========================================
@@ -21,24 +21,25 @@ SKIP_PREFIXES = ()
 # ==========================================
 
 WANTED_SECTIONS = [
-    "organizing committee", "organising committee", "program committee", "programme committee",
-    "programming committee", "steering committee", "track chairs", 
-    "organization", "workshop chair", "program chair", "programme chair",
-    "general chair", "workshop co-chair", "program co-chair",
-    "programme co-chair", "general co-chair", "conference committee",
-    "publication chair", "organizing chair", "organising chair", "publicity chair",
-    "local organizing chair", "local organising chair", "conference chair", "conference co-chair",
-    "technical program chair", "technical committee", "international committee", 
-    "committee member", "local arrangements chair", "chairs", "members", 
-    "pc co-chairs", "webmaster", "workshop organizers"
+    "organizingcommittee", "organisingcommittee", "programcommittee", "programmecommittee",
+    "programmingcommittee", "steeringcommittee", "trackchairs", 
+    "organization", "workshopchair", "programchair", "programmechair",
+    "generalchair", "workshopcochair", "programcochair",
+    "programmecochair", "generalcochair", "conferencecommittee",
+    "publicationchair", "organizingchair", "organisingchair", "publicitychair",
+    "localorganizingchair", "localorganisingchair", "conferencechair", "conferencecochair",
+    "technicalprogramchair", "technicalcommittee", "internationalcommittee", 
+    "committeemember", "localarrangementschair", "chairs", "members", 
+    "pccochairs", "webmaster", "workshoporganizers"
 ]
 
 IGNORED_SECTIONS = [
-    "advisory board", "organizing partners",
-    "table of contents", "copyright", "full papers",
-    "work-in-progress", "sponsors", "author index",
-    "message from", "welcome message", "reviewers",
-    "additional reviewers", "preface"
+    "advisoryboard", "organizingpartners",
+    "tableofcontents", "copyright", "fullpapers",
+    "workinprogress", "sponsors", "authorindex",
+    "messagefrom", "welcomemessage", "reviewers",
+    "additionalreviewers", "preface", "welcome",
+    "session", "introduction", "invitedtalk", "keynote", "paper"
 ]
 
 INSTITUTION_KEYWORDS = [
@@ -95,7 +96,7 @@ def is_person_name(name: str) -> bool:
         
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
-def split_merged_name(text: str, has_comma: bool):
+def split_merged_name(text: str, has_separator: bool):
     text = re.sub(r'(?<!\*)\*(?!\*)', '', text)
     
     if any(kw.lower() in text.lower() for kw in INSTITUTION_KEYWORDS):
@@ -103,7 +104,7 @@ def split_merged_name(text: str, has_comma: bool):
         if match:
             return match.group(1), match.group(2)
             
-    if not has_comma:
+    if not has_separator:
         fallback_match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+\s+(?:[A-Z]\.\s+)?[A-Z][A-Za-z\-]+)\s+(.+)$', text, re.IGNORECASE)
         if fallback_match:
             return fallback_match.group(1), fallback_match.group(2)
@@ -172,15 +173,23 @@ def parse_markdown_file(md_path: Path) -> dict:
         is_standalone_header = bool(re.match(r'^#+\s', line_clean)) or bool(re.match(r'^\*\*[^\*]+\*\*\s*$', line_clean))
         
         if is_standalone_header:
-            finalize_pending()
-            header_check = re.sub(r'[*#]', '', line_clean).strip().lower()
+            header_check = re.sub(r'[*#]', '', line_clean).strip()
             
-            if 'continued' in header_check:
+            # Normalize for lookup by stripping all non-alphabetic characters (fixes spaced headings like "W ORKSHOP")
+            header_check_alpha = re.sub(r'[^a-z]', '', header_check.lower())
+            
+            # Ignore structural headers that contain no letters (like "**-**" empty bullets)
+            if not any(c.isalpha() for c in header_check_alpha):
                 continue
                 
-            if any(ignored in header_check for ignored in IGNORED_SECTIONS):
+            finalize_pending()
+            
+            if 'continued' in header_check_alpha:
+                continue
+                
+            if any(ignored in header_check_alpha for ignored in IGNORED_SECTIONS):
                 capture = False
-            elif any(wanted in header_check for wanted in WANTED_SECTIONS) and len(header_check.split()) < 20:
+            elif any(wanted in header_check_alpha for wanted in WANTED_SECTIONS) and len(header_check.split()) < 20:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
@@ -189,7 +198,8 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue 
             
         if capture:
-            if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
+            line_alpha = re.sub(r'[^a-z]', '', line_clean.lower())
+            if len(line_clean) < 60 and any(wanted in line_alpha for wanted in WANTED_SECTIONS):
                 if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
                     finalize_pending()
                     current_inline_role = line_clean.title().replace('(S)', '(s)')
@@ -210,7 +220,6 @@ def parse_markdown_file(md_path: Path) -> dict:
                     pending_person["association"] += " " + line_clean
                     continue
 
-            # Try parsing with current line and any accumulated buffer fragments
             target_line = (line_buffer + " " + line_clean).strip() if line_buffer else line_clean
             parsed = None
             
@@ -235,19 +244,20 @@ def parse_markdown_file(md_path: Path) -> dict:
             
             if not parsed:
                 if len(target_line) < 150: 
-                    parts = target_line.split(',')
-                    has_comma = len(parts) > 1
-                    name_candidate, merged_assoc = split_merged_name(parts[0].strip(), has_comma)
+                    # Splits smartly on comma OR dashed hyphens separating names and associations
+                    parts = [p.strip() for p in re.split(r',\s*|\s+[-–—]\s+', target_line) if p.strip()]
+                    has_separator = len(parts) > 1
+                    name_candidate, merged_assoc = split_merged_name(parts[0], has_separator)
                     
                     if merged_assoc:
                         assoc = merged_assoc
-                        if has_comma:
-                            assoc += ", " + ", ".join([p.strip() for p in parts[1:]])
+                        if has_separator:
+                            assoc += ", " + ", ".join(parts[1:])
                     else:
-                        assoc = ", ".join([p.strip() for p in parts[1:]])
+                        assoc = ", ".join(parts[1:])
                     
                     name = clean_person_name(name_candidate)
-                    if is_person_name(name) and (assoc or has_comma):
+                    if is_person_name(name) and (assoc or has_separator):
                         parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
             if parsed:
@@ -258,7 +268,6 @@ def parse_markdown_file(md_path: Path) -> dict:
                     if not is_junk_line(line_clean):
                         pending_person["association"] += " " + line_clean
                 else:
-                    # Line didn't parse and no pending person. Keep it in buffer to try with next line.
                     if len(target_line) < 100:
                         line_buffer = target_line
                     else:
