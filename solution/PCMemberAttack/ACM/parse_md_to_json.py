@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 500                       
+MAX_FILES = None                        
 OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
@@ -28,8 +28,9 @@ WANTED_SECTIONS = [
     "programme co-chair", "general co-chair", "conference committee",
     "publication chair", "organizing chair", "publicity chair",
     "local organizing chair", "conference chair", "conference co-chair",
-    "technical program chair", "international committee", "committee member",
-    "local arrangements chair", "chairs", "members", "pc co-chairs", "webmaster"
+    "technical program chair", "technical committee", "international committee", 
+    "committee member", "local arrangements chair", "chairs", "members", 
+    "pc co-chairs", "webmaster", "workshop organizers"
 ]
 
 IGNORED_SECTIONS = [
@@ -71,7 +72,6 @@ logging.getLogger().addHandler(console_handler)
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
     
-    # Aggressive stripping for academic/professional titles
     title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
     name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
     
@@ -89,7 +89,6 @@ def is_person_name(name: str) -> bool:
     if name.count('(') != name.count(')'): return False
     if any(c in name for c in ['”', '“', '"']): return False
     
-    # Reject strings containing common prose stopwords
     stopwords = {'in', 'of', 'with', 'the', 'and', 'for', 'to', 'this', 'that', 'such', 'as'}
     name_words = set(name.lower().split())
     if stopwords.intersection(name_words): return False
@@ -97,16 +96,13 @@ def is_person_name(name: str) -> bool:
     return NAME_MIN_WORDS <= len(name.split()) <= NAME_MAX_WORDS
 
 def split_merged_name(text: str):
-    # Strip solitary asterisks attached to names (e.g. "Aaditeshwar Seth*")
     text = re.sub(r'(?<!\*)\*(?!\*)', '', text)
     
-    # 1. Institution Keyword Split
     if any(kw.lower() in text.lower() for kw in INSTITUTION_KEYWORDS):
         match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z\-]+)?)\s+(.*)$', text, re.IGNORECASE)
         if match:
             return match.group(1), match.group(2)
             
-    # 2. Fallback: Assume the first 2 words (ignoring titles) are the name, and the rest is the association
     fallback_match = re.match(r'^((?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.)?(?:\s+Dr\.)?\s*[A-Z][A-Za-z\-]+\s+(?:[A-Z]\.\s+)?[A-Z][A-Za-z\-]+)\s+(.+)$', text, re.IGNORECASE)
     if fallback_match:
         return fallback_match.group(1), fallback_match.group(2)
@@ -140,6 +136,11 @@ def parse_markdown_file(md_path: Path) -> dict:
     title = title.replace('..', '').strip()
         
     text = unicodedata.normalize("NFKC", raw_content)
+    
+    # PRE-PROCESSING: Collapse single newlines that incorrectly shatter names across lines.
+    # Replaces a newline with a space UNLESS it's adjacent to another newline or a structural marker (- or #)
+    text = re.sub(r'(?<!\n)\n(?!\n|\s*[\-#\*])', ' ', text)
+    
     lines = text.split('\n')
     
     extracted_people = []
@@ -157,13 +158,17 @@ def parse_markdown_file(md_path: Path) -> dict:
     
     for line in lines:
         line_clean = line.strip()
+        
+        # Clean hidden PDF characters like backspaces
+        line_clean = line_clean.replace('\x08', '')
+        
         if not line_clean:
             continue
             
-        # Strip trailing periods AND commas to catch formats like "Newton Lee (USA),"
         line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
-        is_toc_line = bool(re.search(r'\.{3,}', line_clean))
+        # ToC detection (Dots OR large gap of spaces followed by page number)
+        is_toc_line = bool(re.search(r'\.{3,}', line_clean)) or bool(re.search(r'\s{5,}[ivxlcdm0-9]+\**$', line_clean, re.IGNORECASE))
         if is_toc_line:
             continue
 
