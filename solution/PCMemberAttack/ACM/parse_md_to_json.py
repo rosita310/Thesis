@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 3000                       
+MAX_FILES = 2000                        
 OVERWRITE_EXISTING = False             
 SKIP_PREFIXES = ()                      
 
@@ -30,7 +30,7 @@ WANTED_SECTIONS = [
     "localorganizingchair", "localorganisingchair", "conferencechair", "conferencecochair",
     "technicalprogramchair", "technicalcommittee", "internationalcommittee", 
     "committeemember", "localarrangementschair", "chairs", "members", 
-    "pccochairs", "webmaster", "workshoporganizers"
+    "pccochairs", "webmaster", "workshoporganizers", "posterscommittee", "paperscommittee"
 ]
 
 IGNORED_SECTIONS = [
@@ -46,7 +46,7 @@ INSTITUTION_KEYWORDS = [
     'University', 'Academy', 'TU ', 'Institute', 
     'College', 'School', 'Labs', 'Research', 
     'Corporation', 'Inc.', 'National', 'Center', 'Centre',
-    'Microsoft', 'Google', 'IBM', 'Alibaba'
+    'Microsoft', 'Google', 'IBM', 'Alibaba', 'MIT'
 ]
 
 NAME_MIN_WORDS = 2
@@ -163,6 +163,8 @@ def parse_markdown_file(md_path: Path) -> dict:
             finalize_pending()
             continue
             
+        # Strip markdown hyperlinks: e.g. [Sven Apel](url) -> Sven Apel
+        line_clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', line_clean)
         line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
         is_toc_line = bool(re.search(r'\.{3,}', line_clean)) or bool(re.search(r'\s{5,}[ivxlcdm0-9]+\**$', line_clean, re.IGNORECASE))
@@ -174,11 +176,8 @@ def parse_markdown_file(md_path: Path) -> dict:
         
         if is_standalone_header:
             header_check = re.sub(r'[*#]', '', line_clean).strip()
-            
-            # Normalize for lookup by stripping all non-alphabetic characters (fixes spaced headings like "W ORKSHOP")
             header_check_alpha = re.sub(r'[^a-z]', '', header_check.lower())
             
-            # Ignore structural headers that contain no letters (like "**-**" empty bullets)
             if not any(c.isalpha() for c in header_check_alpha):
                 continue
                 
@@ -187,9 +186,16 @@ def parse_markdown_file(md_path: Path) -> dict:
             if 'continued' in header_check_alpha:
                 continue
                 
-            if any(ignored in header_check_alpha for ignored in IGNORED_SECTIONS):
+            ignored = any(ig in header_check_alpha for ig in IGNORED_SECTIONS)
+            wanted = any(wt in header_check_alpha for wt in WANTED_SECTIONS)
+            
+            # Prevent paper sections from killing valid committees (e.g. "Full Papers Program Committee")
+            if ignored and 'committee' in header_check_alpha:
+                ignored = False
+                
+            if ignored:
                 capture = False
-            elif any(wanted in header_check_alpha for wanted in WANTED_SECTIONS) and len(header_check.split()) < 20:
+            elif wanted and len(header_check.split()) < 20:
                 capture = True
                 current_section = header_check.title()
                 current_inline_role = None
@@ -197,81 +203,104 @@ def parse_markdown_file(md_path: Path) -> dict:
                 capture = False
             continue 
             
-        if capture:
-            line_alpha = re.sub(r'[^a-z]', '', line_clean.lower())
-            if len(line_clean) < 60 and any(wanted in line_alpha for wanted in WANTED_SECTIONS):
-                if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
-                    finalize_pending()
-                    current_inline_role = line_clean.title().replace('(S)', '(s)')
-                    continue
-                    
-            inline_match = re.match(r'^\*\*(.*?)\*\*\s*[:-]?\s*(.*)$', line_clean)
-            if inline_match:
-                role_cand = inline_match.group(1).strip(" :")
-                if len(role_cand) < 60:
-                    current_inline_role = role_cand.title()
-                    line_clean = inline_match.group(2).strip()
+        # Intercept plain-text sub-headers before capture check
+        is_plain_subheader = False
+        if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
+            if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
+                is_plain_subheader = True
 
-            line_clean = re.sub(r'\([^)]*(?:Fellow|Member)[^)]*\)', '', line_clean, flags=re.IGNORECASE).strip()
+        inline_match = re.match(r'^\*\*(.*?)\*\*\s*[:-]?\s*(.*)$', line_clean)
 
-            if pending_person:
-                unbalanced = pending_person["association"].count('(') - pending_person["association"].count(')')
-                if unbalanced > 0:
-                    pending_person["association"] += " " + line_clean
-                    continue
-
-            target_line = (line_buffer + " " + line_clean).strip() if line_buffer else line_clean
-            parsed = None
+        if inline_match:
+            role_cand = inline_match.group(1).strip(" :")
+            role_cand_alpha = re.sub(r'[^a-z]', '', role_cand.lower())
             
-            match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', target_line)
-            if match_cd:
-                role_inline = match_cd.group(1)
-                if role_inline:
-                    current_inline_role = role_inline.strip().title()
-                name = clean_person_name(match_cd.group(2))
-                assoc = match_cd.group(3).strip()
+            ignored = any(ig in role_cand_alpha for ig in IGNORED_SECTIONS)
+            if ignored and 'committee' in role_cand_alpha:
+                ignored = False
+                
+            wanted = any(wt in role_cand_alpha for wt in WANTED_SECTIONS)
+            
+            if wanted and not ignored and len(role_cand) < 60:
+                capture = True 
+                current_inline_role = role_cand.title()
+                line_clean = inline_match.group(2).strip()
+                if not line_clean:
+                    continue
+        elif is_plain_subheader:
+            role_cand_alpha = re.sub(r'[^a-z]', '', line_clean.lower())
+            ignored = any(ig in role_cand_alpha for ig in IGNORED_SECTIONS)
+            if ignored and 'committee' in role_cand_alpha:
+                ignored = False
+                
+            if not ignored:
+                capture = True
+                finalize_pending()
+                current_inline_role = line_clean.title().replace('(S)', '(s)')
+                continue
+                
+        if not capture:
+            continue
+
+        line_clean = re.sub(r'\([^)]*(?:Fellow|Member)[^)]*\)', '', line_clean, flags=re.IGNORECASE).strip()
+
+        if pending_person:
+            unbalanced = pending_person["association"].count('(') - pending_person["association"].count(')')
+            if unbalanced > 0:
+                pending_person["association"] += " " + line_clean
+                continue
+
+        target_line = (line_buffer + " " + line_clean).strip() if line_buffer else line_clean
+        parsed = None
+        
+        match_cd = re.match(r'^(?:\*\*(.*?):\*\*)?\s*([A-Za-z\.\s\-]+)\s*_*\(+\s*_*([^)]+?)_*\s*\)+_*$', target_line)
+        if match_cd:
+            role_inline = match_cd.group(1)
+            if role_inline:
+                current_inline_role = role_inline.strip().title()
+            name = clean_person_name(match_cd.group(2))
+            assoc = match_cd.group(3).strip()
+            if is_person_name(name):
+                parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
+
+        if not parsed:
+            match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', target_line)
+            if match_a:
+                name = clean_person_name(match_a.group(1))
+                assoc = match_a.group(2).strip() if match_a.group(2) else ""
+                role = match_a.group(3).strip() if match_a.group(3) else current_section
                 if is_person_name(name):
+                    parsed = {"name": name, "role": role, "association": assoc}
+        
+        if not parsed:
+            if len(target_line) < 150: 
+                parts = [p.strip() for p in re.split(r',\s*|\s+[-–—]\s+', target_line) if p.strip()]
+                has_separator = len(parts) > 1
+                name_candidate, merged_assoc = split_merged_name(parts[0], has_separator)
+                
+                if merged_assoc:
+                    assoc = merged_assoc
+                    if has_separator:
+                        assoc += ", " + ", ".join(parts[1:])
+                else:
+                    assoc = ", ".join(parts[1:])
+                
+                name = clean_person_name(name_candidate)
+                if is_person_name(name) and (assoc or has_separator):
                     parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
 
-            if not parsed:
-                match_a = re.match(r'^[\-\*]\s*\*\*(.*?)\*\*(?:,\s*(.*?))?(?:\s*[—\-\u2014]\s*(.*))?$', target_line)
-                if match_a:
-                    name = clean_person_name(match_a.group(1))
-                    assoc = match_a.group(2).strip() if match_a.group(2) else ""
-                    role = match_a.group(3).strip() if match_a.group(3) else current_section
-                    if is_person_name(name):
-                        parsed = {"name": name, "role": role, "association": assoc}
-            
-            if not parsed:
-                if len(target_line) < 150: 
-                    # Splits smartly on comma OR dashed hyphens separating names and associations
-                    parts = [p.strip() for p in re.split(r',\s*|\s+[-–—]\s+', target_line) if p.strip()]
-                    has_separator = len(parts) > 1
-                    name_candidate, merged_assoc = split_merged_name(parts[0], has_separator)
-                    
-                    if merged_assoc:
-                        assoc = merged_assoc
-                        if has_separator:
-                            assoc += ", " + ", ".join(parts[1:])
-                    else:
-                        assoc = ", ".join(parts[1:])
-                    
-                    name = clean_person_name(name_candidate)
-                    if is_person_name(name) and (assoc or has_separator):
-                        parsed = {"name": name, "role": current_inline_role or current_section, "association": assoc}
-
-            if parsed:
-                finalize_pending()
-                pending_person = parsed
+        if parsed:
+            finalize_pending()
+            pending_person = parsed
+        else:
+            if pending_person:
+                if not is_junk_line(line_clean):
+                    pending_person["association"] += " " + line_clean
             else:
-                if pending_person:
-                    if not is_junk_line(line_clean):
-                        pending_person["association"] += " " + line_clean
+                if len(target_line) < 100:
+                    line_buffer = target_line
                 else:
-                    if len(target_line) < 100:
-                        line_buffer = target_line
-                    else:
-                        line_buffer = ""
+                    line_buffer = ""
 
     finalize_pending() 
     
