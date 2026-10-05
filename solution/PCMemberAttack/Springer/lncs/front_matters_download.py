@@ -20,7 +20,7 @@ SLEEP_SECONDS = 1
 MAX_RETRIES = 5
 
 BASE_URL = 'https://link.springer.com'
-SOLUTION_DIR = Path(__file__).resolve().parents[4]
+SOLUTION_DIR = Path(__file__).resolve().parents[3]
 FRONT_MATTER_LINK = re.compile(r'/content/pdf/bfm:[^"/]+/1(?=")')
 
 SUCCEEDED = 'SUCCEEDED'
