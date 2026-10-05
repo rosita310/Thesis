@@ -22,7 +22,7 @@ def read_config(path) -> configparser.SectionProxy:
     return config['SECTION']
 
 
-config = read_config('../.env')
+config = read_config('../../../.env')
 db = Postgress(
     server=config['POSTGRES_SERVER'], 
     database=config['POSTGRES_DB'],
@@ -56,12 +56,12 @@ def parse(content, dts, url) -> list:
     
 
 if __name__ == '__main__':
-    types = ['jnl-ranks', 'conf-ranks']
+    types = ['conf-ranks']
     for t in types:
         logging.info(f"Working on {t}")
         for i in range(1, 20):
             logging.info(f"site: {i}")
-            url = f"http://portal.core.edu.au/{t}/?search=&by=all&source=CORE2020&sort=atitle&page={i}"
+            url = f"http://portal.core.edu.au/{t}/?search=&by=all&source=CORE2026&sort=atitle&page={i}"
             timestamp = str(datetime.datetime.now())
             response = requests.get(url)
             if response.status_code != 200:
