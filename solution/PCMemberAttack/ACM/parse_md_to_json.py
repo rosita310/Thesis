@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = 2000                        
-OVERWRITE_EXISTING = False             
+MAX_FILES = None                        
+OVERWRITE_EXISTING = True              
 SKIP_PREFIXES = ()                      
 
 # ==========================================
@@ -30,7 +30,8 @@ WANTED_SECTIONS = [
     "localorganizingchair", "localorganisingchair", "conferencechair", "conferencecochair",
     "technicalprogramchair", "technicalcommittee", "internationalcommittee", 
     "committeemember", "localarrangementschair", "chairs", "members", 
-    "pccochairs", "webmaster", "workshoporganizers", "posterscommittee", "paperscommittee"
+    "pccochairs", "webmaster", "workshoporganizers", "posterscommittee", "paperscommittee",
+    "organizationalteam"
 ]
 
 IGNORED_SECTIONS = [
@@ -72,6 +73,10 @@ logging.getLogger().addHandler(console_handler)
 
 def clean_person_name(name: str) -> str:
     name = name.replace("*", " ").replace("_", " ")
+    
+    # Fix unicode replacement characters masking as dots after initials
+    name = re.sub(r'\b([A-Z])\ufffd', r'\1.', name)
+    name = name.replace('\ufffd', '')
     
     title_pattern = r'^(?:(?:Assoc\.|Assis\.|Assistant|Associate|Chair)\s+)?(?:Prof\.|Professor|Dr\.|Mr\.|Ms\.|Mrs\.|Miss\.?)(?:\s+Dr\.)?\s+'
     name = re.sub(title_pattern, '', name, flags=re.IGNORECASE)
@@ -163,7 +168,6 @@ def parse_markdown_file(md_path: Path) -> dict:
             finalize_pending()
             continue
             
-        # Strip markdown hyperlinks: e.g. [Sven Apel](url) -> Sven Apel
         line_clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', line_clean)
         line_clean = re.sub(r'[\.,]+$', '', line_clean).strip()
             
@@ -189,8 +193,7 @@ def parse_markdown_file(md_path: Path) -> dict:
             ignored = any(ig in header_check_alpha for ig in IGNORED_SECTIONS)
             wanted = any(wt in header_check_alpha for wt in WANTED_SECTIONS)
             
-            # Prevent paper sections from killing valid committees (e.g. "Full Papers Program Committee")
-            if ignored and 'committee' in header_check_alpha:
+            if ignored and ('committee' in header_check_alpha or 'team' in header_check_alpha):
                 ignored = False
                 
             if ignored:
@@ -203,11 +206,16 @@ def parse_markdown_file(md_path: Path) -> dict:
                 capture = False
             continue 
             
-        # Intercept plain-text sub-headers before capture check
         is_plain_subheader = False
-        if len(line_clean) < 60 and any(wanted in line_clean.lower() for wanted in WANTED_SECTIONS):
+        if len(line_clean) < 60 and any(wanted in re.sub(r'[^a-z]', '', line_clean.lower()) for wanted in WANTED_SECTIONS):
             if ',' not in line_clean and '(' not in line_clean.replace('(s)', '').replace('(S)', ''):
-                is_plain_subheader = True
+                words = line_clean.split()
+                if words:
+                    stopwords = {'the', 'and', 'we', 'this', 'our', 'to', 'in', 'of'}
+                    if words[0].lower() not in stopwords:
+                        lower_words = [w for w in words if w.islower() and len(w) > 2]
+                        if len(lower_words) <= len(words) / 2:
+                            is_plain_subheader = True
 
         inline_match = re.match(r'^\*\*(.*?)\*\*\s*[:-]?\s*(.*)$', line_clean)
 
@@ -216,7 +224,7 @@ def parse_markdown_file(md_path: Path) -> dict:
             role_cand_alpha = re.sub(r'[^a-z]', '', role_cand.lower())
             
             ignored = any(ig in role_cand_alpha for ig in IGNORED_SECTIONS)
-            if ignored and 'committee' in role_cand_alpha:
+            if ignored and ('committee' in role_cand_alpha or 'team' in role_cand_alpha):
                 ignored = False
                 
             wanted = any(wt in role_cand_alpha for wt in WANTED_SECTIONS)
@@ -230,7 +238,7 @@ def parse_markdown_file(md_path: Path) -> dict:
         elif is_plain_subheader:
             role_cand_alpha = re.sub(r'[^a-z]', '', line_clean.lower())
             ignored = any(ig in role_cand_alpha for ig in IGNORED_SECTIONS)
-            if ignored and 'committee' in role_cand_alpha:
+            if ignored and ('committee' in role_cand_alpha or 'team' in role_cand_alpha):
                 ignored = False
                 
             if not ignored:
@@ -269,6 +277,15 @@ def parse_markdown_file(md_path: Path) -> dict:
                 name = clean_person_name(match_a.group(1))
                 assoc = match_a.group(2).strip() if match_a.group(2) else ""
                 role = match_a.group(3).strip() if match_a.group(3) else current_section
+                if is_person_name(name):
+                    parsed = {"name": name, "role": role, "association": assoc}
+                    
+        if not parsed:
+            match_e = re.match(r'^\*\*(.*?)\*\*(?:[, \-–—]+)?\s*(.*)$', target_line)
+            if match_e:
+                name = clean_person_name(match_e.group(1))
+                assoc = match_e.group(2).strip()
+                role = current_inline_role or current_section
                 if is_person_name(name):
                     parsed = {"name": name, "role": role, "association": assoc}
         
