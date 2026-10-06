@@ -14,7 +14,7 @@ RECORD_PREFIX = b'<https://dblp.org/rec/conf/'
 SIGNATURE_PREFIX = b'_:Sig_'
 RECORD = re.compile(r'^<https://dblp\.org/rec/(\S+)> <https://dblp\.org/rdf/schema#(\w+)> (.+) \.$')
 SIGNATURE = re.compile(r'^_:(Sig_\S+) <https://dblp\.org/rdf/schema#(\w+)> (.+) \.$')
-RECORD_PREDICATES = {'publishedAsPartOf', 'doi', 'title', 'yearOfPublication', 'pagination', 'hasSignature'}
+RECORD_PREDICATES = {'publishedAsPartOf', 'publishedIn', 'bibtexType', 'doi', 'title', 'yearOfPublication', 'pagination', 'hasSignature'}
 SIGNATURE_PREDICATES = {'signatureDblpName', 'signatureCreator', 'signatureOrdinal', 'signatureOrcid'}
 
 LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"')
@@ -42,24 +42,36 @@ def get_volume_keys() -> set:
     return {r['dblp_key'] for r in db.execute_query_result(query)}
 
 
+def volume_of(record: dict) -> str:
+    return record.get('publishedAsPartOf', '').replace('https://dblp.org/rec/', '')
+
+
 def read_dump(path: Path, volume_keys: set) -> list:
     """
     Returns the papers that are part of one of the given volumes, with their signatures (authors).
+    """
+    records = read_records(path, lambda record: volume_of(record) in volume_keys)
+    logging.info(f"Found {len(records)} papers in {len(volume_keys)} volumes")
+    return [(subject, volume_of(record), record, signatures) for subject, record, signatures in records]
+
+
+def read_records(path: Path, keep, record_prefix: bytes = RECORD_PREFIX) -> list:
+    """
+    Returns (dblp key, record, signatures) for the records for which keep(record) is true.
     Assumes the triples of a record, including its signatures, are contiguous.
     """
     logging.info(f"Reading {path}")
     opener = gzip.open if path.suffix == '.gz' else open
-    articles = []
+    records = []
     subject, record, signatures = None, {}, {}
 
     def flush():
-        volume = record.get('publishedAsPartOf', '').replace('https://dblp.org/rec/', '')
-        if volume in volume_keys:
-            articles.append((subject, volume, record, signatures))
+        if subject is not None and keep(record):
+            records.append((subject, record, signatures))
 
     with opener(path, 'rb') as f:
         for line in f:
-            if line.startswith(RECORD_PREFIX):
+            if line.startswith(record_prefix):
                 m = RECORD.match(line.decode('utf-8').rstrip())
                 if m is None or m.group(2) not in RECORD_PREDICATES:
                     continue
@@ -76,13 +88,29 @@ def read_dump(path: Path, volume_keys: set) -> list:
                 signature, predicate, obj = m.groups()
                 signatures.setdefault(signature, {})[predicate] = value_of(obj)
     flush()
-    logging.info(f"Found {len(articles)} papers in {len(volume_keys)} volumes")
-    return articles
+    return records
+
+
+def author_rows(dblp_key: str, signatures: dict, key_column: str, timestamp: str, source: str) -> list:
+    rows = []
+    for signature in signatures.values():
+        dblp_name = signature.get('signatureDblpName')
+        rows.append({
+            key_column: dblp_key,
+            'ordinal': signature.get('signatureOrdinal'),
+            'dblp_pid': signature.get('signatureCreator', '').replace('https://dblp.org/pid/', '') or None,
+            'dblp_name': dblp_name,
+            'name': HOMONYM_NUMBER.sub('', dblp_name) if dblp_name else None,
+            'orcid': signature.get('signatureOrcid', '').replace('https://orcid.org/', '') or None,
+            '$_extract_dts': timestamp,
+            '$_rec_src': source,
+        })
+    return rows
 
 
 def to_rows(articles: list, source: str) -> tuple:
     timestamp = str(datetime.datetime.now())
-    article_rows, author_rows = [], []
+    article_rows, authors = [], []
     for dblp_key, volume, record, signatures in articles:
         doi = record.get('doi')
         article_rows.append({
@@ -96,19 +124,8 @@ def to_rows(articles: list, source: str) -> tuple:
             '$_extract_dts': timestamp,
             '$_rec_src': source,
         })
-        for signature in signatures.values():
-            dblp_name = signature.get('signatureDblpName')
-            author_rows.append({
-                'article_dblp_key': dblp_key,
-                'ordinal': signature.get('signatureOrdinal'),
-                'dblp_pid': signature.get('signatureCreator', '').replace('https://dblp.org/pid/', '') or None,
-                'dblp_name': dblp_name,
-                'name': HOMONYM_NUMBER.sub('', dblp_name) if dblp_name else None,
-                'orcid': signature.get('signatureOrcid', '').replace('https://orcid.org/', '') or None,
-                '$_extract_dts': timestamp,
-                '$_rec_src': source,
-            })
-    return article_rows, author_rows
+        authors.extend(author_rows(dblp_key, signatures, 'article_dblp_key', timestamp, source))
+    return article_rows, authors
 
 
 def main():

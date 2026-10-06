@@ -24,7 +24,15 @@ conferences gets a row for each.
 
 Author affiliations are not in dblp (nor in Crossref for LNCS chapters).
 
+## Cited publications
+
+`cited_publications.py` builds, for the DOIs cited in `opencitations_dump.reference`
+(see `../opencitations`), `dblp_dump.cited_publication` (dblp key, DOI, title, year, type, venue)
+and `dblp_dump.cited_publication_author` (same columns as `lncs_article_author`). Cited works that
+are not in dblp are not included.
+
 ```
 python lncs_volumes.py
 python lncs_articles.py
+python cited_publications.py    # after ../opencitations/references.py
 ```
