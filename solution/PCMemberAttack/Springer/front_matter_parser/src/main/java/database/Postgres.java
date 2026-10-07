@@ -40,6 +40,13 @@ public class Postgres implements Database {
         createTableFile();
         createTableSection();
         createTableMember();
+        createIndex("file", "filename");
+        createIndex("section", "file_id");
+        createIndex("member", "section_id");
+    }
+
+    private void createIndex(String table, String column) {
+        executeQueryNonResult("CREATE INDEX IF NOT EXISTS " + table + "_" + column + "_idx ON " + SCHEMA_NAME + "." + table + " (" + column + ")");
     }
 
     private void createSchema() {

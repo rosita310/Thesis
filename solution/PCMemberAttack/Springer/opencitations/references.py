@@ -138,6 +138,8 @@ def main():
     for start in range(0, len(rows), BATCH):
         saver.save(SCHEMA, TABLE, rows[start:start + BATCH])
         logging.info(f"Saved {min(start + BATCH, len(rows))} of {len(rows)} citations")
+    for column in ('citing', 'cited'):
+        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{TABLE}" ("{column}")')
     logging.info("Done")
 
 

@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from lncs_articles import author_rows, read_records
-from lncs_volumes import DEFAULT_DUMP, SCHEMA, db, saver
+from lncs_volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
 
 PUBLICATION_TABLE = 'cited_publication'
 AUTHOR_TABLE = 'cited_publication_author'
@@ -54,6 +54,8 @@ def main():
 
     save(PUBLICATION_TABLE, publications)
     save(AUTHOR_TABLE, authors)
+    create_indexes(PUBLICATION_TABLE, ('dblp_key', 'doi'))
+    create_indexes(AUTHOR_TABLE, ('publication_dblp_key', 'dblp_pid'))
     logging.info(f"Saved {len(publications)} publications and {len(authors)} authorships")
 
 

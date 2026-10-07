@@ -5,7 +5,7 @@ import logging
 import re
 from pathlib import Path
 
-from lncs_volumes import DEFAULT_DUMP, SCHEMA, db, saver
+from lncs_volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
 
 ARTICLE_TABLE = 'lncs_article'
 AUTHOR_TABLE = 'lncs_article_author'
@@ -116,7 +116,7 @@ def to_rows(articles: list, source: str) -> tuple:
         article_rows.append({
             'dblp_key': dblp_key,
             'volume_dblp_key': volume,
-            'doi': doi.replace('https://doi.org/', '') if doi else None,
+            'doi': doi.replace('https://doi.org/', '').lower() if doi else None,
             'title': record.get('title'),
             'year': record.get('yearOfPublication'),
             'pagination': record.get('pagination'),
@@ -140,6 +140,8 @@ def main():
     for table, rows in ((ARTICLE_TABLE, article_rows), (AUTHOR_TABLE, author_rows)):
         db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
         saver.save(SCHEMA, table, rows)
+    create_indexes(ARTICLE_TABLE, ('dblp_key', 'volume_dblp_key', 'doi'))
+    create_indexes(AUTHOR_TABLE, ('article_dblp_key', 'dblp_pid'))
     logging.info("Done")
 
 

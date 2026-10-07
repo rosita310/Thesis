@@ -46,6 +46,11 @@ db = Postgress(
 saver = Saver(db)
 
 
+def create_indexes(table: str, columns: tuple):
+    for column in columns:
+        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{table}" ("{column}")')
+
+
 def get_core_conferences() -> dict:
     logging.info("Fetch CORE conferences from database")
     ranks = ", ".join(f"'{r}'" for r in CORE_RANKS)
@@ -139,6 +144,7 @@ def main():
 
     db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{TABLE}"')
     saver.save(SCHEMA, TABLE, rows)
+    create_indexes(TABLE, ('dblp_key', 'stream'))
     logging.info("Done")
 
 
