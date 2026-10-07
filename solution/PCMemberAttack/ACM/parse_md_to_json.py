@@ -30,7 +30,7 @@ WANTED_SECTIONS = [
     "localorganizingchair", "localorganisingchair", "conferencechair", "conferencecochair",
     "technicalprogramchair", "technicalcommittee", "internationalcommittee", 
     "committeemember", "localarrangementschair", "chairs", "members", 
-    "pccochairs", "webmaster", "workshoporganizers", "posterscommittee", "paperscommittee",
+    "pccochairs", "workshoporganizers", "posterscommittee", "paperscommittee",
     "organizationalteam"
 ]
 
@@ -40,14 +40,27 @@ IGNORED_SECTIONS = [
     "workinprogress", "sponsors", "authorindex",
     "messagefrom", "welcomemessage", "reviewers",
     "additionalreviewers", "preface", "welcome",
-    "session", "introduction", "invitedtalk", "keynote", "paper"
+    "session", "introduction", "invitedtalk", "keynote", "paper",
+    "webmaster"
 ]
 
 INSTITUTION_KEYWORDS = [
-    'University', 'Academy', 'TU ', 'Institute', 
-    'College', 'School', 'Labs', 'Research', 
-    'Corporation', 'Inc.', 'National', 'Center', 'Centre',
-    'Microsoft', 'Google', 'IBM', 'Alibaba', 'MIT'
+    # General Academic & Research
+    'University', 'Univ.', 'Academy', 'TU ', 'Institute', 'Technology', 
+    'College', 'School', 'Polytechnic', 'Labs', 'Laboratory', 'Research', 
+    'National', 'Center', 'Centre', 'Department', 'Dept.', 'Foundation', 'Council',
+    
+    # Common International CS Institutes
+    'MIT', 'ETH', 'EPFL', 'KAIST', 'KTH', 'INRIA', 'CNRS', 'CSIRO',
+    
+    # Generic Corporate Suffixes
+    'Corporation', 'Corp', 'Inc.', 'GmbH', 'Ltd', 'LLC',
+    
+    # Major Tech Companies
+    'Microsoft', 'Google', 'IBM', 'Alibaba', 'Amazon', 'Apple', 
+    'Meta', 'Facebook', 'Intel', 'Nvidia', 'Tencent', 'Baidu', 
+    'Huawei', 'Samsung', 'Cisco', 'Oracle', 'Adobe', 'SAP', 
+    'Siemens', 'Nokia', 'Hewlett'
 ]
 
 NAME_MIN_WORDS = 2
