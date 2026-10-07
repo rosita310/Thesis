@@ -131,26 +131,24 @@ def is_junk_line(line: str) -> bool:
 # PARSING LOGIC
 # ==========================================
 
-def parse_markdown_file(md_path: Path) -> dict:
+def parse_markdown_file(md_path: Path, lenient: bool = False) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         raw_content = file.read()
         
     filename = md_path.stem
     isbn_match = re.search(r'_([0-9]+(?:-[0-9]+)+)', filename)
     isbn = isbn_match.group(1) if isbn_match else None
-    
     title = filename.rsplit('_', 1)[0] if isbn_match else filename
     title = title.replace('..', '').strip()
         
     text = unicodedata.normalize("NFKC", raw_content)
-    lines = text.split('\n')
+    lines_raw = text.split('\n')
     
     extracted_people = []
     capture = False
     current_section = "Committee Member"
     current_inline_role = None
     pending_person = None
-    
     line_buffer = ""
     
     def finalize_pending():
@@ -161,6 +159,14 @@ def parse_markdown_file(md_path: Path) -> dict:
             pending_person = None
         line_buffer = ""
     
+    # Pre-process lines to split "Run-on" titles (Pattern 1)
+    lines = []
+    for line in lines_raw:
+        splits = re.split(r'(?=\b(?:Prof\.|Professor|Dr\.|Assoc\.|Asst\.|Mr\.|Ms\.)\s+[A-Z])', line)
+        for s in splits:
+            if s.strip():
+                lines.append(s.strip())
+
     for original_line in lines:
         line_clean = original_line.strip().replace('\x08', '')
         
@@ -178,8 +184,16 @@ def parse_markdown_file(md_path: Path) -> dict:
 
         is_standalone_header = bool(re.match(r'^#+\s', line_clean)) or bool(re.match(r'^\*\*[^\*]+\*\*\s*$', line_clean))
         
+        # PATTERN 2 OVERRIDE: Elevate plain/italicized text to Header Status if lenient
+        if lenient and not is_standalone_header and len(line_clean) < 40:
+            header_alpha_test = re.sub(r'[^a-z]', '', line_clean.lower())
+            # Ensure it's not prose
+            if not any(stop in line_clean.lower().split() for stop in {'the', 'and', 'this', 'we', 'is'}):
+                if any(wt in header_alpha_test for wt in WANTED_SECTIONS) or header_alpha_test == "committee":
+                    is_standalone_header = True
+
         if is_standalone_header:
-            header_check = re.sub(r'[*#]', '', line_clean).strip()
+            header_check = re.sub(r'[*#_]', '', line_clean).strip() # Added underscore strip for italics
             header_check_alpha = re.sub(r'[^a-z]', '', header_check.lower())
             
             if not any(c.isalpha() for c in header_check_alpha):
@@ -192,6 +206,9 @@ def parse_markdown_file(md_path: Path) -> dict:
                 
             ignored = any(ig in header_check_alpha for ig in IGNORED_SECTIONS)
             wanted = any(wt in header_check_alpha for wt in WANTED_SECTIONS)
+            
+            if lenient and header_check_alpha == "committee":
+                wanted = True # Accept standalone "Committee" in lenient mode
             
             if ignored and ('committee' in header_check_alpha or 'team' in header_check_alpha):
                 ignored = False
@@ -338,31 +355,27 @@ def main():
         return
 
     logging.info("--- Starting new parsing run ---")
-    
     processed_count = 0
     
     for md_path in DATA_DIR.glob("*.md"):
-        
         if MAX_FILES is not None and processed_count >= MAX_FILES:
-            logging.info(f"Reached maximum file limit ({MAX_FILES}). Stopping.")
             break
-
         if md_path.name.startswith(SKIP_PREFIXES):
-            logging.debug(f"Skipping {md_path.name} (Matches SKIP_PREFIXES).")
             continue
             
         json_path = md_path.with_suffix(".json")
-        
-        if json_path.exists():
-            if OVERWRITE_EXISTING:
-                logging.info(f"Overwriting existing JSON for: {md_path.name}")
-            else:
-                logging.debug(f"Skipping {md_path.name} (JSON already exists).")
-                continue
+        if json_path.exists() and not OVERWRITE_EXISTING:
+            continue
 
-        logging.info(f"Parsing: {md_path.name}")
+        logging.info(f"Parsing (Strict): {md_path.name}")
         try:
-            extracted_data = parse_markdown_file(md_path)
+            # PASS 1: Strict Mode
+            extracted_data = parse_markdown_file(md_path, lenient=False)
+            
+            # PASS 2: Lenient Fallback (If Strict finds 0 people)
+            if len(extracted_data["persons_of_interest"]) == 0:
+                logging.info(f"Strict pass yielded 0 names. Attempting Lenient Fallback for {md_path.name}...")
+                extracted_data = parse_markdown_file(md_path, lenient=True)
             
             with open(json_path, "w", encoding="utf-8") as json_file:
                 json.dump(extracted_data, json_file, indent=4, ensure_ascii=False)
