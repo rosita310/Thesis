@@ -1,7 +1,7 @@
 """
 BBN inference for the self-review case study (SQ1.1).
 
-Reads the corpus JSON from bbn_extract_v3.py. The entry gate is Westerbaan's
+Reads the corpus JSON from bbn_extract.py. The entry gate is Westerbaan's
 outlier cut: an author becomes a candidate as soon as one of their papers has
 z < ENTRY_GATE_Z (default -3.0). A candidate is scored only if their record holds
 at least MIN_RECORD gaps (n_min); below that they are unscorable.
@@ -27,15 +27,15 @@ a fallback to a coarser context (FALLBACK_MIN_N checked on post-exclusion counts
 page_class=unknown is treated as missing:
     journal:type+pages  ->  journal:type (pages marginal)  ->  pooled:type
 
-Outputs (bbn_baselines/): bbn_v4_ranking.csv (all scored authors, summary rows)
-and bbn_v4_scored.json (ALL scored authors with the full per-gap evidence
+Outputs (bbn_baselines/): bbn_ranking.csv (all scored authors, summary rows)
+and bbn_scored.json (ALL scored authors with the full per-gap evidence
 breakdown, least genuine first; each carries a `shortlisted` flag for the
 P(genuine) < threshold subset).
 
 Run from this directory (BBN/), any venv (stdlib only):
-    python bbn_infer_v4.py                  # score the corpus
-    python bbn_infer_v4.py --in bbn_baselines/bbn_v3_corpus_10623.json
-    python bbn_infer_v4.py --selftest       # synthetic validation, no data file
+    python bbn_infer.py                  # score the corpus
+    python bbn_infer.py --in bbn_baselines/bbn_corpus_10623.json
+    python bbn_infer.py --selftest       # synthetic validation, no data file
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def _is_orcid(s):
 # CONFIG
 # ---------------------------------------------------------------------------
 
-DEFAULT_IN = os.path.join(os.path.dirname(__file__), "bbn_baselines", "bbn_v3_corpus.json")
+DEFAULT_IN = os.path.join(os.path.dirname(__file__), "bbn_baselines", "bbn_corpus.json")
 OUT_DIR = os.path.join(os.path.dirname(__file__), "bbn_baselines")
 
 ENTRY_GATE_Z = -3.0                      # entry gate (Westerbaan's outlier cut): >=1 paper with z
@@ -356,7 +356,7 @@ def fmt_p(p):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="BBN V4 author-centric inference.")
+    parser = argparse.ArgumentParser(description="BBN author-centric inference.")
     parser.add_argument("--in", dest="in_path", default=DEFAULT_IN, help="corpus JSON from extract")
     parser.add_argument("--threshold", type=float, default=SHORTLIST_THRESHOLD,
                         help="P(genuine) below which an author is shortlisted")
@@ -371,7 +371,7 @@ def main():
         return selftest()
 
     if not os.path.exists(args.in_path):
-        raise SystemExit(f"Run bbn_extract_v3.py first; {args.in_path} not found.")
+        raise SystemExit(f"Run bbn_extract.py first; {args.in_path} not found.")
     with open(args.in_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -391,7 +391,7 @@ def main():
     # --- ranking CSV (all scored authors) ---------------------------------
     # woe (weight of evidence) is the primary, non-saturating sort key;
     # p_genuine is written with full precision so tiny posteriors never read 0.
-    rank_path = os.path.join(OUT_DIR, "bbn_v4_ranking.csv")
+    rank_path = os.path.join(OUT_DIR, "bbn_ranking.csv")
     cols = ["name", "orcid", "p_genuine", "woe", "n_gaps", "n_non_typical", "n_journals",
             "lowest_z", "lowest_bin"]
     with open(rank_path, "w", encoding="utf-8", newline="") as f:
@@ -421,7 +421,7 @@ def main():
             "n_journals": r["n_journals"],
             "gaps": detail,
         })
-    json_path = os.path.join(OUT_DIR, "bbn_v4_scored.json")
+    json_path = os.path.join(OUT_DIR, "bbn_scored.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"entry_gate_z": args.entry_gate_z, "alpha": ALPHA, "prior": PRIOR,
                    "shortlist_threshold": args.threshold, "manip_dist": MANIP_DIST,
@@ -585,7 +585,7 @@ def selftest():
     A = [gap("very_extreme", -5.0, "A1")]
     C = [gap("typical", 0.2, "C1")]
     # z=-3.5 (not -3.0) so this gap is unambiguously past the ENTRY_GATE_Z
-    # boundary and stays a V4 candidate; the label "extreme" here is just a
+    # boundary and stays a candidate; the label "extreme" here is just a
     # synthetic bin tag for exercising the fallback, unrelated to the real corpus's
     # percentile-derived bin edges.
     D = [gap("extreme", -3.5, "D1", t="fast_type", p="short")]

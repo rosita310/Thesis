@@ -35,8 +35,8 @@ when the name maps to exactly one ORCID corpus-wide; else the name string. Falls
 back to name-only identities if springer.author_orcid is absent.
 
 Run from this directory (BBN/) with the scraper venv (DB via pyodbc):
-    python bbn_extract_v3.py                 # whole corpus
-    python bbn_extract_v3.py --journal 10623 # restrict to one journal's authors
+    python bbn_extract.py                 # whole corpus
+    python bbn_extract.py --journal 10623 # restrict to one journal's authors
 """
 
 from __future__ import annotations
@@ -201,7 +201,7 @@ def make_bin_z(z_edges):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="BBN V3 corpus extraction.")
+    parser = argparse.ArgumentParser(description="BBN corpus extraction.")
     parser.add_argument("--journal", default=None,
                         help="restrict the emitted papers/author_index to one journal_id "
                              "(the genuine baselines are always corpus-wide).")
@@ -402,9 +402,9 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(
-        OUT_DIR, f"bbn_v3_corpus{('_' + args.journal) if args.journal else ''}.json")
+        OUT_DIR, f"bbn_corpus{('_' + args.journal) if args.journal else ''}.json")
     out = {
-        "model": "v3_per_gap_corpus",
+        "model": "per_gap_corpus",
         "journal_filter": args.journal,
         "config": {
             "gap_ceiling_days": GAP_CEILING_DAYS, "gap_floor_days": GAP_FLOOR_DAYS,
