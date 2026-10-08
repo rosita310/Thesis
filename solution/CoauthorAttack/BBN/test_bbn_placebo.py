@@ -97,19 +97,11 @@ def test_permutation_null():
     check("an editor's p does not depend on who else is in the run, or in what order",
           alone == with_f)
     results = placebo.exact_test(flat + extreme, samples=2000)
-    check("results are sorted most significant first, which the BH ranks rely on",
+    check("results are sorted most significant first",
           [r["editor"] for r in results] == ["E", "F"]
           and results[0]["n_papers"] == 4)
     check("observed and expected are summed over the editor's papers",
           approx(results[0]["observed"], 4.0) and approx(results[0]["expected"], 4 * 2 / 3))
-
-    q = placebo.bh_q([0.01, 0.02] + [0.5] * 8)
-    check("Benjamini-Hochberg scales a p by n over its rank",
-          approx(q[0], 0.1) and approx(q[1], 0.1))
-    check("...and never exceeds 1", placebo.bh_q([0.9, 0.95]) == [0.95, 0.95])
-    q = placebo.bh_q([0.02, 0.03])
-    check("...and is monotone: a later rank can lower an earlier q",
-          approx(q[0], 0.03) and approx(q[1], 0.03))
 
 
 def test_partner_patterns():

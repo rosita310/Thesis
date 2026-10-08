@@ -84,23 +84,51 @@ def initials_match(a: str, b: str) -> bool:
     return x == y or (len(x) == 1 and y.startswith(x)) or (len(y) == 1 and x.startswith(y))
 
 
+class PeopleIndex:
+    """The people behind the signatures, to tell whether an initialled name
+    such as 'c douligeris' can stand for only one of them."""
+
+    def __init__(self, signatures=()):
+        self.by_surname = defaultdict(set)
+        for s in signatures:
+            key = name_key(s["name"])
+            if key:
+                self.by_surname[key.split()[-1]].add((key, person_id(s["pid"], s["name"])))
+        self._cache: dict[str, bool] = {}
+
+    def is_unique(self, key: str) -> bool:
+        """True if exactly one person has this name key or one it initials_match."""
+        if key not in self._cache:
+            people = {pid for k, pid in self.by_surname.get(key.split()[-1], ())
+                      if k == key or initials_match(key, k)}
+            self._cache[key] = len(people) == 1
+        return self._cache[key]
+
+
 class BoardIndex:
     """The names on a board, to look up a signer's name in."""
 
-    def __init__(self, names=()):
+    def __init__(self, names=(), people: PeopleIndex | None = None):
         self.keys = {name_key(n) for n in names} - {""}
+        self.people = people
         self.by_surname = defaultdict(list)
         for key in sorted(self.keys):
             self.by_surname[key.split()[-1]].append(key)
 
     def match(self, name) -> str | None:
         """The board key this name matches: the same key, else the one key that
-        initials_match it. None when there is none, or more than one."""
+        initials_match it. A match that rests on an initial also needs the board
+        key to fit only one person in `people`, when given. None otherwise."""
         key = name_key(name)
         if not key or key in self.keys:
             return key or None
         hits = [k for k in self.by_surname.get(key.split()[-1], ()) if initials_match(k, key)]
-        return hits[0] if len(hits) == 1 else None
+        if len(hits) != 1:
+            return None
+        hit = hits[0]
+        if self.people and hit.split()[0] != key.split()[0] and not self.people.is_unique(hit):
+            return None
+        return hit
 
 
 def venue_of(rec_uri: str) -> tuple[str, str]:
@@ -408,8 +436,10 @@ class PairsCollector:
     board of that article's own issue (BoardIndex.match).
     """
 
-    def __init__(self, board_of_journal):
-        self.board_of_journal = {j: BoardIndex(names) for j, names in board_of_journal.items()}
+    def __init__(self, board_of_journal, people: PeopleIndex | None = None):
+        self.people = people
+        self.board_of_journal = {j: BoardIndex(names, people)
+                                 for j, names in board_of_journal.items()}
         self.papers: list[dict] = []          # one row per (suspect paper x editor)
         self.rows: list[dict] = []            # suspect co-authorship rows
         self.tenure_years = defaultdict(list)      # (journal, editor id) -> issue years
@@ -420,7 +450,7 @@ class PairsCollector:
         self.n_no_pid = 0
 
     def add_issue(self, journal, year, board, articles, authors_of) -> None:
-        index = BoardIndex(board)
+        index = BoardIndex(board, self.people)
         # Keyed by name: a board member who never signed anything has no PID.
         if year:
             for key in index.keys:
@@ -562,7 +592,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
     print(f"\n=== PAIRS: {len(issues)} front-matter issues, "
           f"{len(board_of_journal)} journals with a board ===")
 
-    pairs = PairsCollector(board_of_journal)
+    pairs = PairsCollector(board_of_journal, PeopleIndex(signatures))
     issue_stats = Counter()
     for journal, year, board, arts in dated_issues(issues, mapping, issue_index,
                                                    board_of_issue, issue_stats):

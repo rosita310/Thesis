@@ -67,6 +67,20 @@ def test_name_matching():
           board.match("Jane Smith") is None)
     check("an empty board matches nobody", extract.BoardIndex().match("Ed X") is None)
 
+    people = extract.PeopleIndex([
+        sig("https://dblp.org/pid/cd", "Christos Douligeris"),
+        sig("https://dblp.org/pid/lz1", "Lei Zhang 0001"),
+        sig("https://dblp.org/pid/lz2", "Li Zhang"),
+        sig("https://dblp.org/pid/az", "Albert Y. Zomaya"),
+        sig("https://dblp.org/pid/az2", "Albert Zomaya")])
+    board = extract.BoardIndex({"C. DOULIGERIS", "L. ZHANG", "Albert Zomaya"}, people)
+    check("an initialled board name that fits one person is matched",
+          board.match("Christos Douligeris") == "c douligeris")
+    check("an initialled board name that fits several people is not",
+          board.match("Lei Zhang 0001") is None)
+    check("a match on the full first name needs no such check",
+          board.match("Albert Y. Zomaya") == "albert zomaya")
+
 
 def test_identity_and_venue():
     print("\n-- names, identity and venues --")

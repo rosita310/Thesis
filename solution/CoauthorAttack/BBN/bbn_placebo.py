@@ -24,14 +24,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
-from bbn_extract import (BoardIndex, band_of, collaboration_networks, is_inside,
-                         midrank_pct, person_id, publications_of)
+from bbn_extract import (BoardIndex, PeopleIndex, band_of, collaboration_networks,
+                         is_inside, midrank_pct, person_id, publications_of)
 from cs2_config import (BBN_DIR, FIT_MIN_COLLABS, NETWORK_BANDS, PLACEBO_RECORD_BANDS,
                         PLACEBO_SAMPLES, PLACEBO_SEED, REPORTS_DIR)
 from dblp_extract import as_bool, load_mapping, pct, read_csv
-
-TOP_N = 12      # console only: the editors listed under the permutation test
-
 
 class Pool(NamedTuple):
     """One suspect paper x editor. `signers[0]` is the editor, the rest are non-board signers."""
@@ -239,16 +236,6 @@ def exact_test(units, samples=PLACEBO_SAMPLES) -> list[dict]:
     return results
 
 
-def bh_q(ps) -> list[float]:
-    """Benjamini-Hochberg adjusted p-values, for p-values sorted ascending."""
-    n = len(ps)
-    q, running = [0.0] * n, 1.0
-    for i in range(n - 1, -1, -1):
-        running = min(running, ps[i] * n / (i + 1))
-        q[i] = running
-    return q
-
-
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -308,38 +295,28 @@ def report_pattern_fit(pools, net_path) -> None:
                [u["matched"][m] if u["matched"] else None for u in units])
 
 
-def report_exact_test(results, labels, samples) -> None:
+def report_exact_test(results, samples) -> None:
+    """The share of editors at or below each p, against the share chance gives."""
     n = len(results)
     print(f"\n  exact permutation null over {n} editors "
           f"({samples} draws each), on the venue-locked statistic:")
-    ps = sorted(r["p"] for r in results)
+    ps = [r["p"] for r in results]
     for q in (0.01, 0.05, 0.10, 0.25):
         print(f"    P(p <= {q:<5}) = {sum(1 for x in ps if x <= q) / n:>7.4f}"
               f"   (expected {q})")
-    qs = bh_q(ps)
-    print(f"    editors surviving Benjamini-Hochberg q <= 0.25: "
-          f"{sum(1 for q in qs if q <= 0.25)}")
-
-    print(f"\n  {'p':>9}{'BH q':>8}{'papers':>8}{'obs':>8}{'exp':>8}  editor")
-    for r, q in zip(results[:TOP_N], qs):
-        print(f"  {r['p']:>9.5f}{q:>8.3f}"
-              f"{r['n_papers']:>8}{r['observed']:>8.2f}{r['expected']:>8.2f}  "
-              f"{labels.get(r['editor'], r['editor'])[:34]}")
 
 
 def write_results_csv(path, results, labels) -> None:
-    qs = bh_q([r["p"] for r in results])
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["name", "n_papers", "observed",
-                                               "expected", "p", "bh_q"])
+                                               "expected", "p"])
         writer.writeheader()
-        for r, q in zip(results, qs):
+        for r in results:
             writer.writerow({"name": labels.get(r["editor"], r["editor"]),
                              "n_papers": r["n_papers"],
                              "observed": round(r["observed"], 4),
                              "expected": round(r["expected"], 4),
-                             "p": round(r["p"], 6),
-                             "bh_q": round(q, 4)})
+                             "p": round(r["p"], 6)})
 
 
 def editor_labels(corpus_path) -> dict:
@@ -367,7 +344,8 @@ def main():
     roster = defaultdict(set)
     for r in read_csv(in_dir / "board_roster.csv"):
         roster[r["journal"]].add(r["name"])
-    roster = {journal: BoardIndex(names) for journal, names in roster.items()}
+    people = PeopleIndex(signatures)
+    roster = {journal: BoardIndex(names, people) for journal, names in roster.items()}
 
     print("=== WITHIN-PAPER PLACEBO ===")
     pools = suspect_pools(in_dir, mapping, roster, articles, signatures)
@@ -387,11 +365,10 @@ def main():
               "`python bbn_extract.py --stage signer_authors` first.")
 
     results = exact_test(units)
-    labels = editor_labels(in_dir / "bbn_cs2_corpus.json")
-    report_exact_test(results, labels, PLACEBO_SAMPLES)
+    report_exact_test(results, PLACEBO_SAMPLES)
 
     out_path = in_dir / "bbn_cs2_placebo.csv"
-    write_results_csv(out_path, results, labels)
+    write_results_csv(out_path, results, editor_labels(in_dir / "bbn_cs2_corpus.json"))
     print(f"\nWrote {out_path}")
 
 
