@@ -9,7 +9,10 @@ Gaps are the conditionally-independent unit of evidence.
 
 Per paper: gap_days (d_i) -> log_gap (x_i) =
 ln(max(gap_days, GAP_FLOOR_DAYS)), standardized within its own journal to
-z = (log_gap - ref_mean_j) / ref_std_j (mu_j, sigma_j; sample stats). z is
+z = (log_gap - ref_mean_j) / ref_std_j (mu_j, sigma_j; sample stats). A journal
+with fewer than Z_REFERENCE_MIN_N gaps (or zero spread) falls back to the corpus
+reference: mu and sigma of the log gap pooled over all journals. Every journal
+records which one it used (`z_reference`: "journal" | "corpus"). z is
 discretized with edges set to the pooled percentiles of z over all journals --
 fast (left) tail refined, slow side coarse:
     ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
@@ -18,11 +21,12 @@ The edges used are written to config.z_edges, so inference reads the precomputed
 z_bin and never re-bins.
 
 Papers above the ceiling (gap_days > GAP_CEILING_DAYS, tau) are kept in the
-corpus with `above_ceiling: true`. They get a z from their journal's mu_j/sigma_j
+corpus with `above_ceiling: true`. They get a z from their journal's reference
 and a bin from the unchanged edges (always TYPICAL), count in their authors'
 records (n_gaps, n_min, LR) and count in the genuine baseline (the per-bin peer
-counts). They are left out of what shapes z and the bins: mu_j and sigma_j, and
-the pooled percentiles behind the bin edges, so the slow tail cannot bend them.
+counts). They are left out of what shapes z and the bins: mu_j and sigma_j, the
+corpus reference, the gap count that decides between them, and the pooled
+percentiles behind the bin edges, so the slow tail cannot bend them.
 
 Output (one corpus JSON in bbn_baselines/):
     journals      -- per-journal genuine baseline counts P(bin | article_type, page_class),
@@ -66,7 +70,9 @@ SCHEMA = "springer"
 
 GAP_CEILING_DAYS = 924          # tau: longer gaps stay out of mu_j/sigma_j and the edges
 GAP_FLOOR_DAYS = 0.5            # delta: floor on the gap, keeps zero-day gaps finite
-MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to define z
+Z_REFERENCE_MIN_N = 30          # gaps <= tau a journal needs (and std > 0) for its own
+                                # mu_j/sigma_j; below it, z falls back to the corpus
+                                # reference. Mirrors FALLBACK_MIN_N in bbn_infer.py.
 
 # z-bin edges are the pooled percentiles of the standardized log-gap z.
 # Edges are upper z-thresholds, fastest first. Refined on the fast (left) tail so
@@ -203,22 +209,37 @@ def make_bin_z(z_edges):
     return bin_z
 
 
-def journal_reference(papers):
-    """{journal_id: (mu_j, sigma_j)} of the log gap, over the gaps <= tau only.
+def corpus_reference(papers):
+    """(mu, sigma) of the log gap pooled over every journal's gaps <= tau, or None
+    if the corpus has fewer than two such gaps or no spread."""
+    vals = [p["log_gap"] for p in papers.values() if not p["above_ceiling"]]
+    if len(vals) < 2:
+        return None
+    sd = statistics.stdev(vals)
+    return (statistics.fmean(vals), sd) if sd > 0 else None
 
-    Above-ceiling papers never enter, so they cannot bend z. A journal needs
-    MIN_JOURNAL_REF such gaps and a positive std to get a reference."""
+
+def journal_reference(papers):
+    """{journal_id: (mu, sigma, source)}: the z reference of every journal in `papers`.
+
+    source "journal": the journal's own mu_j/sigma_j, used when it has at least
+    Z_REFERENCE_MIN_N gaps <= tau and a positive std. Otherwise source "corpus": the
+    fallback to corpus_reference(). Above-ceiling papers never enter either
+    reference (nor the gap count that chooses between them), so they cannot bend z.
+    A journal is left without a reference only if the corpus reference is None."""
     log_gaps = defaultdict(list)
     for p in papers.values():
+        log_gaps[p["journal_id"]]                       # every journal gets an entry
         if not p["above_ceiling"]:
             log_gaps[p["journal_id"]].append(p["log_gap"])
+    corpus = corpus_reference(papers)
     ref = {}
     for jid, vals in log_gaps.items():
-        if len(vals) < MIN_JOURNAL_REF:
-            continue
-        sd = statistics.stdev(vals)
+        sd = statistics.stdev(vals) if len(vals) >= Z_REFERENCE_MIN_N else 0.0
         if sd > 0:
-            ref[jid] = (statistics.fmean(vals), sd)
+            ref[jid] = (statistics.fmean(vals), sd, "journal")
+        elif corpus is not None:
+            ref[jid] = (corpus[0], corpus[1], "corpus")
     return ref
 
 
@@ -324,7 +345,10 @@ def main():
             "above_ceiling": above_ceiling,
         }
 
-    journal_ref = journal_reference(papers)          # mu_j, sigma_j over gaps <= tau
+    # z reference per journal: its own mu_j/sigma_j, or the corpus fallback when it has
+    # fewer than Z_REFERENCE_MIN_N gaps <= tau
+    journal_ref = journal_reference(papers)
+    corpus_ref = corpus_reference(papers)
 
     for p in papers.values():
         ref = journal_ref.get(p["journal_id"])
@@ -355,6 +379,15 @@ def main():
           f"above it (0-day floored: {zero_gaps}; missing date excluded: "
           f"{missing_gaps}; negative excluded: {neg_gaps}); journals with z reference: "
           f"{len(journal_ref)}")
+    for source in ("journal", "corpus"):
+        jids = {j for j, r in journal_ref.items() if r[2] == source}
+        n_gaps = sum(1 for p in usable if p["journal_id"] in jids)
+        n_below = sum(1 for p in below if p["journal_id"] in jids)
+        print(f"z reference '{source}': {len(jids)} journals, {n_gaps} usable gaps "
+              f"({n_below} at or below the ceiling)")
+    if corpus_ref:
+        print(f"Corpus reference (fallback below {Z_REFERENCE_MIN_N} gaps): "
+              f"mu={corpus_ref[0]:.4f} sigma={corpus_ref[1]:.4f}")
     if above:
         print(f"Above-ceiling papers: all {len(above)} in typical; lowest z = "
               f"{min(p['z'] for p in above):+.3f}")
@@ -400,6 +433,7 @@ def main():
                     for context, bins in counts.get(jid, {}).items()}
         journals_out[jid] = {
             "ref_mean": ref[0], "ref_std": ref[1],            # mu_j, sigma_j of the log gap
+            "z_reference": ref[2],                            # "journal" | "corpus" (fallback)
             "n_papers": sum(sum(b.values()) for b in baseline.values()),
             "baseline_counts": baseline,
         }
@@ -454,7 +488,9 @@ def main():
         "journal_filter": args.journal,
         "config": {
             "gap_ceiling_days": GAP_CEILING_DAYS, "gap_floor_days": GAP_FLOOR_DAYS,
-            "min_journal_ref": MIN_JOURNAL_REF,
+            "z_reference_min_n": Z_REFERENCE_MIN_N,
+            "corpus_ref_mean": corpus_ref[0] if corpus_ref else None,
+            "corpus_ref_std": corpus_ref[1] if corpus_ref else None,
             "z_edges": [[e if e != float("inf") else "inf", lbl] for e, lbl in z_edges],
             "z_bins": Z_BINS,
             "z_percentiles": percentiles,
@@ -477,7 +513,8 @@ def main():
 # ---------------------------------------------------------------------------
 
 def selftest():
-    """The ceiling rule: an above-tau paper never moves mu_j, sigma_j or the edges."""
+    """The z reference: own mu_j/sigma_j from Z_REFERENCE_MIN_N gaps <= tau, else the
+    corpus fallback; an above-tau paper never moves either reference or the edges."""
     ok = True
 
     def check(name, cond):
@@ -490,28 +527,42 @@ def selftest():
                 "log_gap": math.log(max(gap_days, GAP_FLOOR_DAYS)),
                 "above_ceiling": gap_days > GAP_CEILING_DAYS}
 
-    below = {f"P{i}": paper(f"P{i}", "J1", d)
-             for i, d in enumerate([0, 2, 30, 60, 90, 120, 150, 200, 300, 500])}
+    n = Z_REFERENCE_MIN_N
+    below = {f"P{i}": paper(f"P{i}", "J1", 10 + 15 * i) for i in range(n)}     # exactly n
     below.update({f"Q{i}": paper(f"Q{i}", "J2", d) for i, d in enumerate([10, 40, 80, 900])})
+    below.update({f"R{i}": paper(f"R{i}", "J4", 20 + 7 * i) for i in range(n - 1)})  # n - 1
+    below.update({f"F{i}": paper(f"F{i}", "J5", 60) for i in range(n)})       # no spread
     slow = {"S1": paper("S1", "J1", 2000), "S2": paper("S2", "J2", 5000),
             "S3": paper("S3", "J3", 3000)}       # J3 holds only an above-ceiling paper
+    slow.update({f"T{i}": paper(f"T{i}", "J4", 1500 + i) for i in range(3)})   # J4 reaches n
     both = {**below, **slow}
 
+    allv = [p["log_gap"] for p in below.values()]
+    corpus = (statistics.fmean(allv), statistics.stdev(allv))
     ref_b, ref_a = journal_reference(below), journal_reference(both)
-    check("above-ceiling papers never move mu_j / sigma_j", ref_a == ref_b)
-    check("a journal with only above-ceiling papers gets no reference", "J3" not in ref_a)
+    j1 = [p["log_gap"] for p in below.values() if p["journal_id"] == "J1"]
+    check(f"a journal with exactly {n} gaps gets its own mu_j/sigma_j",
+          ref_a["J1"] == (statistics.fmean(j1), statistics.stdev(j1), "journal"))
+    check(f"a journal with fewer than {n} gaps gets the corpus mu/sigma",
+          ref_a["J2"] == (*corpus, "corpus") and corpus_reference(both) == corpus)
+    check(f"above-ceiling papers do not count toward the {n} (J4: {n - 1} + 3 -> corpus)",
+          ref_a["J4"][2] == "corpus")
+    check("a journal with zero spread falls back to the corpus", ref_a["J5"][2] == "corpus")
+    check("a journal with only above-ceiling papers gets the corpus reference",
+          ref_a["J3"] == (*corpus, "corpus"))
+    check("above-ceiling papers never move mu_j/sigma_j or the corpus reference",
+          all(ref_a[j] == ref_b[j] for j in ref_b) and corpus_reference(both) == corpus_reference(below))
 
     for ps in (below, both):
         for p in ps.values():
-            r = ref_a.get(p["journal_id"])
-            p["z"] = (p["log_gap"] - r[0]) / r[1] if r else None
+            r = ref_a[p["journal_id"]]
+            p["z"] = (p["log_gap"] - r[0]) / r[1]
     check("above-ceiling papers never move the edge sample",
           edge_sample(below) == edge_sample(both))
     edges = build_z_edges(edge_sample(both))
     check("... so the bin edges are identical", edges == build_z_edges(edge_sample(below)))
     bin_z = make_bin_z(edges)
-    check("above-ceiling papers with a reference fall in TYPICAL",
-          all(bin_z(p["z"]) == "typical" for p in slow.values() if p["z"] is not None))
+    check("above-ceiling papers fall in TYPICAL", all(bin_z(p["z"]) == "typical" for p in slow.values()))
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     if not ok:
