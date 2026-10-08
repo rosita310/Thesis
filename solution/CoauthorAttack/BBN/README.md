@@ -64,4 +64,5 @@ python bbn_placebo.py
 ```
 
 Only the two loaders, `dblp_extract.py` and `bbn_extract.py --stage pairs` need the database; the
-rest runs on the standard library. Each `bbn_*.py` has a `test_bbn_*.py` that runs without data.
+rest runs on the standard library. `dblp_extract.py` and each `bbn_*.py` have a `test_*.py` that
+runs without data.
