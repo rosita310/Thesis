@@ -9,22 +9,28 @@ Gaps are the conditionally-independent unit of evidence.
 
 Per paper: gap_days (d_i) -> log_gap (x_i) =
 ln(max(gap_days, GAP_FLOOR_DAYS)), standardized within its own journal to
-z = (log_gap - ref_mean_j) / ref_std_j (mu_j, sigma_j; sample stats). Papers with
-gap_days > GAP_CEILING_DAYS (tau) are dropped from the corpus altogether, so they
-are neither in the journal reference nor scored. z is discretized with edges set
-to the pooled percentiles of z over all journals -- fast (left) tail refined,
-slow side coarse:
+z = (log_gap - ref_mean_j) / ref_std_j (mu_j, sigma_j; sample stats). z is
+discretized with edges set to the pooled percentiles of z over all journals --
+fast (left) tail refined, slow side coarse:
     ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
     < mild_fast <= p15 < typical
 The edges used are written to config.z_edges, so inference reads the precomputed
 z_bin and never re-bins.
 
+Papers above the ceiling (gap_days > GAP_CEILING_DAYS, tau) are kept in the
+corpus with `above_ceiling: true`. They get a z from their journal's mu_j/sigma_j
+and a bin from the unchanged edges (always TYPICAL), count in their authors'
+records (n_gaps, n_min, LR) and count in the genuine baseline (the per-bin peer
+counts). They are left out of what shapes z and the bins: mu_j and sigma_j, and
+the pooled percentiles behind the bin edges, so the slow tail cannot bend them.
+
 Output (one corpus JSON in bbn_baselines/):
     journals      -- per-journal genuine baseline counts P(bin | article_type, page_class),
-                     over every usable paper (no exclusion here; leave-one-author
-                     exclusion is applied at inference time)
+                     over every usable paper, above-ceiling ones included (no author
+                     exclusion here; leave-one-author exclusion is applied at
+                     inference time)
     papers        -- one entry per usable DOI (journal, gap_days, z, z_bin,
-                     article_type, page_class)
+                     article_type, page_class, above_ceiling)
     author_index  -- author identity -> [doi, ...] (cross-journal)
     author_labels -- identity -> representative display name
     suspects      -- the 3 case-study names, as a validation anchor
@@ -58,7 +64,7 @@ from collections import Counter, defaultdict
 
 SCHEMA = "springer"
 
-GAP_CEILING_DAYS = 924          # tau: papers with a longer gap are dropped from the corpus
+GAP_CEILING_DAYS = 924          # tau: longer gaps stay out of mu_j/sigma_j and the edges
 GAP_FLOOR_DAYS = 0.5            # delta: floor on the gap, keeps zero-day gaps finite
 MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to define z
 
@@ -196,6 +202,32 @@ def make_bin_z(z_edges):
         return Z_BINS[0]
     return bin_z
 
+
+def journal_reference(papers):
+    """{journal_id: (mu_j, sigma_j)} of the log gap, over the gaps <= tau only.
+
+    Above-ceiling papers never enter, so they cannot bend z. A journal needs
+    MIN_JOURNAL_REF such gaps and a positive std to get a reference."""
+    log_gaps = defaultdict(list)
+    for p in papers.values():
+        if not p["above_ceiling"]:
+            log_gaps[p["journal_id"]].append(p["log_gap"])
+    ref = {}
+    for jid, vals in log_gaps.items():
+        if len(vals) < MIN_JOURNAL_REF:
+            continue
+        sd = statistics.stdev(vals)
+        if sd > 0:
+            ref[jid] = (statistics.fmean(vals), sd)
+    return ref
+
+
+def edge_sample(papers):
+    """Ascending z of the gaps <= tau: the pooled sample behind the bin edges."""
+    return sorted(p["z"] for p in papers.values()
+                  if p["z"] is not None and not p["above_ceiling"])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -205,7 +237,11 @@ def main():
     parser.add_argument("--journal", default=None,
                         help="restrict the emitted papers/author_index to one journal_id "
                              "(the genuine baselines are always corpus-wide).")
+    parser.add_argument("--selftest", action="store_true",
+                        help="check the ceiling rule on synthetic papers (no DB) and exit")
     args = parser.parse_args()
+    if args.selftest:
+        return selftest()
 
     # DB import kept inside main() so the pure helpers stay importable without pyodbc.
     from database import Postgress
@@ -253,7 +289,6 @@ def main():
     # --- pass 1: per-paper transform + per-journal reference ----------------
     # The DB column `review_days` is the gap d_i; `article_type` is the raw type metadata.
     papers = {}
-    journal_log_gaps = defaultdict(list)
     missing_gaps = neg_gaps = zero_gaps = 0
     n_title_relabelled = 0
     title_relabel_sample = []
@@ -267,8 +302,9 @@ def main():
             continue
         if gap_days == 0:
             zero_gaps += 1
-        if gap_days > GAP_CEILING_DAYS:     # above the ceiling: dropped from the corpus
-            continue
+        # above the ceiling: kept out of mu_j/sigma_j and the edges below, but counted
+        # in the authors' records and in the baseline counts
+        above_ceiling = gap_days > GAP_CEILING_DAYS
         log_gap = math.log(max(gap_days, GAP_FLOOR_DAYS))
         title = a["title"]
         type_from_field = article_type_of(a["article_type"])  # type metadata only
@@ -285,25 +321,18 @@ def main():
             "type_metadata": a["article_type"], "title": title,
             "article_type": article_type, "relabelled_by_title": via_title,
             "page_count": page_count_of(a["first_page"], a["last_page"]),
+            "above_ceiling": above_ceiling,
         }
-        journal_log_gaps[a["journal_id"]].append(log_gap)
 
-    # journal reference (mu_j, sigma_j) of the log gap
-    journal_ref = {}
-    for jid, vals in journal_log_gaps.items():
-        if len(vals) < MIN_JOURNAL_REF:
-            continue
-        sd = statistics.stdev(vals)
-        if sd > 0:
-            journal_ref[jid] = (statistics.fmean(vals), sd)
+    journal_ref = journal_reference(papers)          # mu_j, sigma_j over gaps <= tau
 
     for p in papers.values():
         ref = journal_ref.get(p["journal_id"])
         p["z"] = (p["log_gap"] - ref[0]) / ref[1] if ref else None
         p["page_class"] = page_class_of(p["page_count"])
 
-    # --- derive z-edges from pooled standardized z ----------------
-    sorted_z = sorted(p["z"] for p in papers.values() if p["z"] is not None)
+    # --- derive z-edges from pooled standardized z (gaps <= tau only) ----------
+    sorted_z = edge_sample(papers)
     if not sorted_z:
         raise SystemExit("No usable z values; cannot derive bin edges.")
     z_edges = build_z_edges(sorted_z)
@@ -316,17 +345,31 @@ def main():
         p["z_bin"] = bin_z(p["z"]) if p["z"] is not None else None
 
     usable = [p for p in papers.values() if p["z_bin"] is not None]
-    print(f"Usable gaps: {len(usable)} (0-day floored: {zero_gaps}; missing date excluded: {missing_gaps}; "
-          f"negative excluded: {neg_gaps}); journals with z reference: {len(journal_ref)}")
+    below = [p for p in usable if not p["above_ceiling"]]          # shape mu_j/sigma_j and the edges
+    above = [p for p in usable if p["above_ceiling"]]
+    not_typical_above = [p for p in above if p["z_bin"] != "typical"]
+    assert not not_typical_above, (
+        f"{len(not_typical_above)} above-ceiling papers fall outside TYPICAL, e.g. "
+        f"{not_typical_above[0]['doi']} z={not_typical_above[0]['z']:.3f}")
+    print(f"Usable gaps: {len(usable)} = {len(below)} at or below the ceiling + {len(above)} "
+          f"above it (0-day floored: {zero_gaps}; missing date excluded: "
+          f"{missing_gaps}; negative excluded: {neg_gaps}); journals with z reference: "
+          f"{len(journal_ref)}")
+    if above:
+        print(f"Above-ceiling papers: all {len(above)} in typical; lowest z = "
+              f"{min(p['z'] for p in above):+.3f}")
     print("Pooled z percentiles: " + ", ".join(f"{k}={v:+.2f}" for k, v in percentiles.items()))
     print("z-edges in use:       "
           + ", ".join(f"{lbl}<=({e:+.3f})" if e != float('inf') else f"{lbl}=rest"
                       for e, lbl in z_edges))
-    pooled_bins = defaultdict(int)
-    for p in usable:
-        pooled_bins[p["z_bin"]] += 1
-    print("Pooled bin shares:    "
-          + ", ".join(f"{b}={pooled_bins[b]/len(usable):.4f}" for b in Z_BINS))
+    for label, group in (("gaps <= ceiling, define the edges", below),
+                         ("all usable gaps, the genuine baseline", usable)):
+        pooled_bins = defaultdict(int)
+        for p in group:
+            pooled_bins[p["z_bin"]] += 1
+        print("Pooled bin shares:    "
+              + ", ".join(f"{b}={pooled_bins[b]/len(group):.4f}" for b in Z_BINS)
+              + f"  ({label})")
 
     # Editorial-title leak: papers rescued from a wrong "normal_type" baseline.
     # rescued_fast are the actual false positives this fix removes -- editorial
@@ -336,15 +379,17 @@ def main():
     rescued_fast = [p for p in rescued if p["z_bin"] in fast_bins]
     print(f"Editorial-title relabelling: {n_title_relabelled} papers filed under a "
           f"non-fast type metadata but flagged editorial by title;")
-    print(f"   {len(rescued)} are usable gaps, of which {len(rescued_fast)} fall in a fast "
-          f"bin (the false positives this fix removes).")
+    n_rescued_above = sum(1 for p in rescued if p["above_ceiling"])
+    print(f"   {len(rescued)} are usable gaps ({n_rescued_above} above the ceiling), of which "
+          f"{len(rescued_fast)} fall in a fast bin (the false positives this fix removes).")
     for doi, at, tt in title_relabel_sample[:15]:
         shown = (tt[:70] + "...") if tt and len(tt) > 70 else (tt or "")
         print(f"     [{at or '?'}] {shown}  ({doi})")
 
     # --- JOURNAL-SPECIFIC genuine baseline counts P(bin | article_type, page_class) --
-    # No exclusion here: every usable paper counts. Leave-one-author exclusion is
-    # applied at inference time. counts[journal_id][context_key][z_bin].
+    # Every usable paper counts, above-ceiling ones included (they only stay out of
+    # mu_j/sigma_j and the edges). Leave-one-author exclusion is applied at inference
+    # time. counts[journal_id][context_key][z_bin].
     counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for p in usable:
         counts[p["journal_id"]][context_key(p["article_type"], p["page_class"])][p["z_bin"]] += 1
@@ -374,6 +419,7 @@ def main():
             "article_type": p["article_type"], "page_class": p["page_class"],
             "type_metadata": p["type_metadata"], "title": p["title"],
             "relabelled_by_title": p["relabelled_by_title"],
+            "above_ceiling": p["above_ceiling"],
         }
 
     # group authorships into identities (ORCID-or-name); label = most common name
@@ -424,6 +470,52 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2, default=str)
     print(f"\nWrote {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Self-test (synthetic papers; no DB needed)
+# ---------------------------------------------------------------------------
+
+def selftest():
+    """The ceiling rule: an above-tau paper never moves mu_j, sigma_j or the edges."""
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+        ok = ok and cond
+
+    def paper(doi, jid, gap_days):
+        return {"doi": doi, "journal_id": jid, "gap_days": gap_days,
+                "log_gap": math.log(max(gap_days, GAP_FLOOR_DAYS)),
+                "above_ceiling": gap_days > GAP_CEILING_DAYS}
+
+    below = {f"P{i}": paper(f"P{i}", "J1", d)
+             for i, d in enumerate([0, 2, 30, 60, 90, 120, 150, 200, 300, 500])}
+    below.update({f"Q{i}": paper(f"Q{i}", "J2", d) for i, d in enumerate([10, 40, 80, 900])})
+    slow = {"S1": paper("S1", "J1", 2000), "S2": paper("S2", "J2", 5000),
+            "S3": paper("S3", "J3", 3000)}       # J3 holds only an above-ceiling paper
+    both = {**below, **slow}
+
+    ref_b, ref_a = journal_reference(below), journal_reference(both)
+    check("above-ceiling papers never move mu_j / sigma_j", ref_a == ref_b)
+    check("a journal with only above-ceiling papers gets no reference", "J3" not in ref_a)
+
+    for ps in (below, both):
+        for p in ps.values():
+            r = ref_a.get(p["journal_id"])
+            p["z"] = (p["log_gap"] - r[0]) / r[1] if r else None
+    check("above-ceiling papers never move the edge sample",
+          edge_sample(below) == edge_sample(both))
+    edges = build_z_edges(edge_sample(both))
+    check("... so the bin edges are identical", edges == build_z_edges(edge_sample(below)))
+    bin_z = make_bin_z(edges)
+    check("above-ceiling papers with a reference fall in TYPICAL",
+          all(bin_z(p["z"]) == "typical" for p in slow.values() if p["z"] is not None))
+
+    print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
+    if not ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

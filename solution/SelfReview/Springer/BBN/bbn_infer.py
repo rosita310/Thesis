@@ -27,6 +27,12 @@ a fallback to a coarser context (FALLBACK_MIN_N checked on post-exclusion counts
 page_class=unknown is treated as missing:
     journal:type+pages  ->  journal:type (pages marginal)  ->  pooled:type
 
+Above-ceiling papers (`above_ceiling: true`, gap_days > tau) are items in their
+authors' records like any other gap -- they count toward n_gaps and n_min and get
+an LR -- and they are in the baseline counts, so the leave-one-author subtraction
+takes them out like any other own paper. They only stay out of mu_j/sigma_j and
+the bin edges, which the extract fixes (rebin_corpus reuses those edges).
+
 Outputs (bbn_baselines/): bbn_ranking.csv (all scored authors, summary rows)
 and bbn_scored.json (ALL scored authors with the full per-gap evidence
 breakdown, least genuine first; each carries a `shortlisted` flag for the
@@ -124,11 +130,13 @@ def build_pooled(journals, bins):
 
 
 def _subtract(counts, own, match, bins):
-    """Return a fresh {bin: count} = counts minus the author's matching papers."""
+    """Return a fresh {bin: count} = counts minus the author's matching papers
+    (above-ceiling ones included: they are in the counts too)."""
     out = {b: counts.get(b, 0) for b in bins}
     for p in own:
         if match(p):
             out[p["z_bin"]] = out.get(p["z_bin"], 0) - 1
+    assert all(v >= 0 for v in out.values()), f"negative leave-one-author count: {out}"
     return out
 
 
@@ -203,6 +211,7 @@ def score_author(gaps, journals, pooled, bins, alpha, prior, want_detail=False,
                 "fallback_level": fallback_level,
                 "genuine": round(genuine_col[gap["z_bin"]], 6),     # g_i
                 "lr": round(lr, 6),
+                "above_ceiling": gap.get("above_ceiling", False),
             })
     return log_odds_to_p(log_odds), log_odds, detail
 
@@ -282,7 +291,7 @@ def rebin_corpus(data, outer_pct):
 
     counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for p in new_papers.values():
-        if p.get("z_bin") is None:
+        if p.get("z_bin") is None:      # above-ceiling papers count, as in the extract
             continue
         counts[p["journal_id"]][f'{p["article_type"]}|{p["page_class"]}'][p["z_bin"]] += 1
     new_journals = {
@@ -718,6 +727,60 @@ def selftest():
     check("candidate set is edge-invariant (z<-3 entry gate is on continuous z)",
           {i for i, _, _ in iter_candidates(reb15, min_record=1)}
           == {i for i, _, _ in iter_candidates(reb25, min_record=1)})
+
+    # 9. above-ceiling papers: in the author's record AND in the baseline counts (they
+    #    only stay out of mu_j/sigma_j and the edges; see bbn_extract.py --selftest).
+    #    H1 is a typical above-ceiling paper in A1's J1 context, so it is one of J1's
+    #    80 typical counts and leave-one-author must take it out like any own paper.
+    H = [dict(gap("typical", 2.5, "H1"), above_ceiling=True)]
+    g_a, _ = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", A)
+    g_ah, lvl_ah = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", A + H)
+    #    typical 80 -> 79, total 100 -> 98: g = (79 + .5) / (98 + 2.5)
+    check(f"subtracting A's above-ceiling paper changes A's genuine column "
+          f"(typical {g_a['typical']:.6f} -> {g_ah['typical']:.6f} == 0.791045)",
+          g_ah != g_a and lvl_ah == "journal:type+pages"
+          and _approx(g_ah["typical"], 79.5 / 100.5, 1e-12))
+    lr_h = gap_lr("typical", g_ah, A_T, M_T)
+    check(f"above-ceiling typical paper gets LR = 1/(1-alpha)  (got {lr_h:.8f})",
+          _approx(lr_h, 1 / (1 - A_T), 1e-9))
+    odds_ah = (PRIOR / (1 - PRIOR)) * gap_lr("very_extreme", g_ah, A_T, M_T) * lr_h
+    check(f"it counts in the author's favour: P(A+H) == {odds_ah / (1 + odds_ah):.6f} > P(A)",
+          _approx(P(A + H), odds_ah / (1 + odds_ah), 1e-12) and P(A + H) > P(A))
+    #    Consistent data: the above-ceiling paper is J3's only typical count, so
+    #    subtracting it gives 0. Inconsistent data (a count it is not in) trips the
+    #    no-negative assert instead of silently going to -1.
+    def j3(typical):
+        return {"J3": {"baseline_counts": {"normal_type|normal": {
+            "typical": typical, "mild_fast": 30, "extreme": 0, "very_extreme": 0,
+            "ultra_extreme": 0}}}}
+    H3 = [dict(gap("typical", 2.5, "H3"), journal_id="J3", above_ceiling=True)]
+    g3, lvl3 = genuine_column(j3(1), build_pooled(j3(1), bins), bins, "J3",
+                              "normal_type", "normal", H3)
+    check("leave-one-author takes the above-ceiling paper out (typical 1 -> 0)",
+          lvl3 == "journal:type+pages" and _approx(g3["typical"], 0.5 / 32.5, 1e-12))
+    try:
+        genuine_column(j3(0), build_pooled(j3(0), bins), bins, "J3", "normal_type", "normal", H3)
+        tripped = False
+    except AssertionError:
+        tripped = True
+    check("a count that would go negative trips the assert (never silently -1)", tripped)
+    #    record length counts it; the entry gate does not depend on it
+    rec = {"papers": {"A1": A[0], "H1": H[0]}, "author_index": {"AuthAH": ["A1", "H1"]}}
+    check("above-ceiling paper counts toward min_record (A1+H1 scored at min_record=2)",
+          {i for i, _, _ in iter_candidates(rec, min_record=2)} == {"AuthAH"})
+    only_h = {"papers": {"H1": H[0]}, "author_index": {"AuthH": ["H1"]}}
+    check("an above-ceiling paper alone never passes the entry gate",
+          {i for i, _, _ in iter_candidates(only_h, min_record=1)} == set())
+    #    rebin_corpus matches the extract: the above-ceiling paper is counted, and the
+    #    edges still come from config.z_percentiles (the extract's <= tau sample)
+    reb_h = rebin_corpus({**edge_data, "papers": {**edge_papers, "Q3": {
+        "journal_id": "J9", "z": 2.5, "z_bin": "typical", "article_type": "normal_type",
+        "page_class": "normal", "above_ceiling": True}}}, 15)
+    check("rebin_corpus counts above-ceiling papers in the rebuilt baseline (typical 1 -> 2)",
+          reb_h["journals"]["J9"]["baseline_counts"]["normal_type|normal"]
+          == {**c15, "typical": c15["typical"] + 1})
+    check("rebin_corpus edges ignore the above-ceiling paper (Q1, Q2 bins unchanged)",
+          all(reb_h["papers"][q]["z_bin"] == reb15["papers"][q]["z_bin"] for q in ("Q1", "Q2")))
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     if not ok:
