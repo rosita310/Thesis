@@ -1,10 +1,10 @@
 """
 BBN inference for the self-review case study (SQ1.1).
 
-Reads the corpus JSON from bbn_extract_v3.py and scores every author who has at
-least one paper with z < CANDIDATE_Z_THRESHOLD (default -3.0). This threshold
-matches Westerbaan's original outlier definition for this attack (an author is
-flagged as soon as one of their papers has a z-score below -3).
+Reads the corpus JSON from bbn_extract_v3.py. The entry gate is Westerbaan's
+outlier cut: an author becomes a candidate as soon as one of their papers has
+z < ENTRY_GATE_Z (default -3.0). A candidate is scored only if their record holds
+at least MIN_RECORD gaps (n_min); below that they are unscorable.
 
 The latent node is G = is_genuine in {genuine, not_genuine} (presumption of
 innocence): we report P(genuine | evidence) and escalate the LOWEST values for
@@ -12,20 +12,20 @@ manual review.
 
 Each gap contributes a likelihood ratio:
 
-    LR(gap) = P(b | genuine, journal, type, pages) / P(b | not_genuine, ...)
-            = genuine_b / ( alpha * MANIP_DIST[b] + (1 - alpha) * genuine_b )
+    LR(gap) = P(b | genuine, journal, article_type, page_class) / P(b | not_genuine, ...)
+            = g_b / ( alpha * MANIP_DIST[b] + (1 - alpha) * g_b )
 
-where b is the gap's z-bin and genuine_b is the journal-specific empirical
-baseline. The not_genuine branch is an alpha-mixture: a fraction `alpha` of a
-non-genuine author's papers are manipulated, the rest behave genuinely. A fast
-gap gives LR < 1 and lowers genuineness; MANIP_DIST[typical] = 0 makes
-LR_typical = 1/(1-alpha), so a typical gap is mild positive evidence.
+where b is the gap's bin and g_b is the genuine column: the journal-specific
+empirical baseline. The not_genuine column is an alpha-mixture: a fraction `alpha`
+of a non-genuine author's papers are manipulated, the rest behave genuinely. A
+fast gap gives LR < 1 and lowers genuineness; MANIP_DIST[typical] = 0 makes
+LR_typical = 1/(1-alpha), so a typical gap counts in the author's favour.
 
 Leave-one-author: when scoring author A, A's own papers are subtracted from the
-baseline A is compared against. Genuine baseline uses a Laplace-smoothed
-back-off (threshold checked on post-exclusion counts); pages=unknown is treated
-as missing:
-    journal type+pages  ->  journal type (pages marginal)  ->  pooled type
+baseline A is compared against. The genuine column gets a pseudo-count per bin and
+a fallback to a coarser context (FALLBACK_MIN_N checked on post-exclusion counts);
+page_class=unknown is treated as missing:
+    journal:type+pages  ->  journal:type (pages marginal)  ->  pooled:type
 
 Outputs (bbn_baselines/): bbn_v4_ranking.csv (all scored authors, summary rows)
 and bbn_v4_scored.json (ALL scored authors with the full per-gap evidence
@@ -61,22 +61,22 @@ def _is_orcid(s):
 DEFAULT_IN = os.path.join(os.path.dirname(__file__), "bbn_baselines", "bbn_v3_corpus.json")
 OUT_DIR = os.path.join(os.path.dirname(__file__), "bbn_baselines")
 
-CANDIDATE_Z_THRESHOLD = -3.0             # Westerbaan's outlier cut: >=1 paper with z below this
-                                         # flags the author as a candidate for scoring.
+ENTRY_GATE_Z = -3.0                      # entry gate (Westerbaan's outlier cut): >=1 paper with z
+                                         # below this makes the author a candidate for scoring.
 
-PRIOR_GENUINE = 0.95
-PRIOR_GENUINE_SWEEP = [0.99, 0.98, 0.95, 0.90, 0.80]
+PRIOR = 0.95                             # pi = P(G=1)
+PRIOR_SWEEP = [0.99, 0.98, 0.95, 0.90, 0.80]
 
 ALPHA = 0.50                             # fraction of a non-genuine author's papers that are manipulated.
-                                         # MUST be paired with MIN_GAPS_SCORED (because it sweeps in single-
+                                         # MUST be paired with MIN_RECORD (because it sweeps in single-
                                          # paper authors)
 ALPHA_SWEEP = [0.10, 0.20, 0.30, 0.40, 0.50]
 
-# What a manipulated paper's gap looks like (the not_genuine component). 
-# Sensitivity to this shape is reported via the m_b sweep.
+# m(b): what a manipulated paper's gap looks like (the not_genuine component).
+# Sensitivity to this shape is reported via the m(b) sweep.
 MANIP_DIST = {"typical": 0.0, "mild_fast": 0.10, "extreme": 0.25,
               "very_extreme": 0.40, "ultra_extreme": 0.25}
-# Alternative manipulation shapes for the m_b sensitivity sweep.
+# Alternative manipulation shapes for the m(b) sensitivity sweep.
 MANIP_SWEEP = {
     "baseline":  {"typical": 0.0, "mild_fast": 0.10, "extreme": 0.25, "very_extreme": 0.40, "ultra_extreme": 0.25},
     "deep-tail": {"typical": 0.0, "mild_fast": 0.05, "extreme": 0.15, "very_extreme": 0.30, "ultra_extreme": 0.50},
@@ -84,12 +84,12 @@ MANIP_SWEEP = {
     "shallow":   {"typical": 0.0, "mild_fast": 0.40, "extreme": 0.30, "very_extreme": 0.20, "ultra_extreme": 0.10},
 }
 
-LAPLACE = 0.5                             # Laplace smoothing for the genuine baseline (adds LAPLACE to each bin,
-                                          # then renormalizes).
+PSEUDO_COUNT = 0.5                        # lambda: smoothing of the genuine column (adds PSEUDO_COUNT to
+                                          # each bin, then renormalizes).
 
-MIN_GAPS_SCORED = 5                       # minimum usable papers before an author is scorable at all.
+MIN_RECORD = 5                            # n_min: minimum usable gaps before an author is scorable at all.
 
-MIN_STRATUM = 30                          # papers needed (post-exclusion) to trust a journal stratum
+FALLBACK_MIN_N = 30                       # N_min: papers needed (post-exclusion) to use a fallback level
 
 SHORTLIST_THRESHOLD = 0.50                # P(genuine) below this -> reported shortlist + full evidence breakdown
 
@@ -103,22 +103,23 @@ Z_OUTER_PCT_DEFAULT = 15
 
 
 # ---------------------------------------------------------------------------
-# Genuine baseline with leave-one-author exclusion + back-off
+# Genuine column with leave-one-author exclusion + fallback
 # ---------------------------------------------------------------------------
 
 def smooth(counts, bins):
-    total = sum(counts.get(b, 0) for b in bins) + LAPLACE * len(bins)
-    return {b: (counts.get(b, 0) + LAPLACE) / total for b in bins}
+    """Pseudo-count smoothing of one context's bin counts."""
+    total = sum(counts.get(b, 0) for b in bins) + PSEUDO_COUNT * len(bins)
+    return {b: (counts.get(b, 0) + PSEUDO_COUNT) / total for b in bins}
 
 
 def build_pooled(journals, bins):
-    """Pooled (all-journal) type-marginal counts, for the last back-off level."""
+    """Pooled (all-journal) type-marginal counts, for the last fallback level."""
     pooled = defaultdict(lambda: defaultdict(int))
     for j in journals.values():
-        for sk, binc in j["baseline_counts"].items():
-            tbin = sk.split("|")[0]
+        for context, binc in j["baseline_counts"].items():
+            article_type = context.split("|")[0]
             for b in bins:
-                pooled[tbin][b] += binc.get(b, 0)
+                pooled[article_type][b] += binc.get(b, 0)
     return pooled
 
 
@@ -131,37 +132,39 @@ def _subtract(counts, own, match, bins):
     return out
 
 
-def genuine_dist(journals, pooled, bins, jid, tbin, pbin, own):
-    """P(bin | genuine, journal, type, pages) with author `own` papers removed.
+def genuine_column(journals, pooled, bins, jid, article_type, page_class, own):
+    """g(b | j, t, p) = P(bin | genuine, journal, article_type, page_class), with the
+    author's `own` papers removed.
 
-    Returns (smoothed_dist, level_label) via back-off; threshold checks use the
-    post-exclusion counts.
+    Returns (smoothed_column, fallback_level) via the fallback; the FALLBACK_MIN_N
+    checks use the post-exclusion counts.
     """
     jbase = journals.get(jid, {}).get("baseline_counts", {})
 
-    # level 1: journal-specific type+pages (only if pages known)
-    if pbin not in ("unknown", None):
-        c = jbase.get(f"{tbin}|{pbin}")
+    # level 1: journal-specific type+pages (only if the page class is known)
+    if page_class not in ("unknown", None):
+        c = jbase.get(f"{article_type}|{page_class}")
         if c:
             c = _subtract(c, own,
-                          lambda p: p["journal_id"] == jid and p["type_bin"] == tbin
-                          and p["pages_bin"] == pbin, bins)
-            if sum(c.values()) >= MIN_STRATUM:
+                          lambda p: p["journal_id"] == jid and p["article_type"] == article_type
+                          and p["page_class"] == page_class, bins)
+            if sum(c.values()) >= FALLBACK_MIN_N:
                 return smooth(c, bins), "journal:type+pages"
 
-    # level 2: journal type marginal (sum over pages)
+    # level 2: journal type marginal (sum over page classes)
     ctm = defaultdict(int)
-    for sk, binc in jbase.items():
-        if sk.split("|")[0] == tbin:
+    for context, binc in jbase.items():
+        if context.split("|")[0] == article_type:
             for b in bins:
                 ctm[b] += binc.get(b, 0)
     ctm = _subtract(ctm, own,
-                    lambda p: p["journal_id"] == jid and p["type_bin"] == tbin, bins)
-    if sum(ctm.values()) >= MIN_STRATUM:
+                    lambda p: p["journal_id"] == jid and p["article_type"] == article_type, bins)
+    if sum(ctm.values()) >= FALLBACK_MIN_N:
         return smooth(ctm, bins), "journal:type"
 
-    # level 3: pooled type marginal (final fallback, returned regardless of count)
-    cp = _subtract(pooled.get(tbin, {}), own, lambda p: p["type_bin"] == tbin, bins)
+    # level 3: pooled type marginal (last fallback level, returned regardless of count)
+    cp = _subtract(pooled.get(article_type, {}), own,
+                   lambda p: p["article_type"] == article_type, bins)
     return smooth(cp, bins), "pooled:type"
 
 
@@ -169,72 +172,75 @@ def genuine_dist(journals, pooled, bins, jid, tbin, pbin, own):
 # Inference  (genuine-space: LR < 1 lowers genuineness)
 # ---------------------------------------------------------------------------
 
-def gap_lr(z_bin, gdist, alpha, manip=MANIP_DIST):
-    g = gdist[z_bin]
+def gap_lr(z_bin, genuine_col, alpha, manip=MANIP_DIST):
+    """LR_i = g_i / (alpha * m_i + (1 - alpha) * g_i)."""
+    g = genuine_col[z_bin]
     not_genuine = alpha * manip[z_bin] + (1 - alpha) * g
     return g / not_genuine
 
 
-def score_author(gaps, journals, pooled, bins, alpha, prior_genuine, want_detail=False,
+def score_author(gaps, journals, pooled, bins, alpha, prior, want_detail=False,
                  manip=MANIP_DIST):
-    """gaps = the author's full list of usable papers (typical ones restore genuineness).
+    """gaps = the author's full list of usable papers (typical ones count in their favour).
 
     Accumulated in log-space (weight of evidence, Good 1985): log_odds = log prior_odds
-    + sum log LR. Returns (P(genuine), log_odds, detail). log_odds is the robust signal;
-    P can underflow to 0.0 for extreme cases while log_odds stays finite and ordered.
+    + sum log LR (natural log; woe = log_odds / ln 10). Returns
+    (P(genuine), log_odds, detail). log_odds is the robust signal; P can underflow
+    to 0.0 for extreme cases while log_odds stays finite and ordered.
     """
-    log_odds = math.log(prior_genuine / (1 - prior_genuine))
+    log_odds = math.log(prior / (1 - prior))
     detail = []
-    for g in gaps:
-        gdist, level = genuine_dist(journals, pooled, bins,
-                                    g["journal_id"], g["type_bin"], g["pages_bin"], gaps)
-        lr = gap_lr(g["z_bin"], gdist, alpha, manip)
+    for gap in gaps:
+        genuine_col, fallback_level = genuine_column(
+            journals, pooled, bins, gap["journal_id"], gap["article_type"], gap["page_class"], gaps)
+        lr = gap_lr(gap["z_bin"], genuine_col, alpha, manip)
         log_odds += math.log(lr)
         if want_detail:
             detail.append({
-                "doi": g.get("doi"), "journal_id": g["journal_id"],
-                "z": g.get("z"), "z_bin": g["z_bin"],
-                "type_bin": g["type_bin"], "pages_bin": g["pages_bin"],
-                "backoff_level": level, "genuine_p": round(gdist[g["z_bin"]], 6),
+                "doi": gap.get("doi"), "journal_id": gap["journal_id"],
+                "z": gap.get("z"), "z_bin": gap["z_bin"],
+                "article_type": gap["article_type"], "page_class": gap["page_class"],
+                "fallback_level": fallback_level,
+                "genuine": round(genuine_col[gap["z_bin"]], 6),     # g_i
                 "lr": round(lr, 6),
             })
     return log_odds_to_p(log_odds), log_odds, detail
 
 
-def iter_candidates(data, z_threshold=CANDIDATE_Z_THRESHOLD, min_gaps=MIN_GAPS_SCORED):
-    """Yield (identity, label, gaps) for every author with >=1 gap at z < z_threshold
-    and at least `min_gaps` usable papers.
+def iter_candidates(data, entry_gate_z=ENTRY_GATE_Z, min_record=MIN_RECORD):
+    """Yield (identity, label, gaps) for every candidate (>=1 gap at z < entry_gate_z)
+    whose record holds at least `min_record` usable gaps; the rest are unscorable.
     """
     papers = data["papers"]
     labels = data.get("author_labels", {})
     for ident, dois in data["author_index"].items():
         gaps = [{**papers[d], "doi": d} for d in dois if d in papers]
-        if len(gaps) < min_gaps:
+        if len(gaps) < min_record:
             continue
-        if any(g["z"] < z_threshold for g in gaps):
+        if any(gap["z"] < entry_gate_z for gap in gaps):
             yield ident, labels.get(ident, ident), gaps
 
 
-def rank_corpus(data, alpha=ALPHA, prior=PRIOR_GENUINE, manip=MANIP_DIST,
-                z_threshold=CANDIDATE_Z_THRESHOLD, min_gaps=MIN_GAPS_SCORED):
+def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
+                entry_gate_z=ENTRY_GATE_Z, min_record=MIN_RECORD):
     """Return rows sorted by P(genuine) ascending; each row carries its gaps."""
     bins = data["config"]["z_bins"]
     journals = data["journals"]
     pooled = build_pooled(journals, bins)
     rows = []
-    for ident, label, gaps in iter_candidates(data, z_threshold, min_gaps):
+    for ident, label, gaps in iter_candidates(data, entry_gate_z, min_record):
         post, log_odds, _ = score_author(gaps, journals, pooled, bins, alpha, prior, manip=manip)
-        nontyp = sum(1 for g in gaps if g["z_bin"] != "typical")
-        worst = min(gaps, key=lambda g: g["z"])
+        n_non_typical = sum(1 for gap in gaps if gap["z_bin"] != "typical")
+        worst = min(gaps, key=lambda gap: gap["z"])
         rows.append({
             "ident": ident,
             "name": label, "orcid": ident if _is_orcid(ident) else "",
-            "p_genuine": post, "log10_odds": log_odds / math.log(10),
-            "n_gaps": len(gaps), "n_nontypical": nontyp,
-            "n_journals": len({g["journal_id"] for g in gaps}),
+            "p_genuine": post, "woe": log_odds / math.log(10),     # W, base-10 log-odds
+            "n_gaps": len(gaps), "n_non_typical": n_non_typical,
+            "n_journals": len({gap["journal_id"] for gap in gaps}),
             "lowest_z": worst["z"], "lowest_bin": worst["z_bin"], "gaps": gaps,
         })
-    rows.sort(key=lambda r: r["log10_odds"])   # weight of evidence: orders even when P underflows
+    rows.sort(key=lambda r: r["woe"])   # weight of evidence: orders even when P underflows
     return rows, journals, pooled, bins
 
 
@@ -278,11 +284,11 @@ def rebin_corpus(data, outer_pct):
     for p in new_papers.values():
         if p.get("z_bin") is None:
             continue
-        counts[p["journal_id"]][f'{p["type_bin"]}|{p["pages_bin"]}'][p["z_bin"]] += 1
+        counts[p["journal_id"]][f'{p["article_type"]}|{p["page_class"]}'][p["z_bin"]] += 1
     new_journals = {
-        jid: {"baseline_counts": {sk: {b: binc.get(b, 0) for b in bins}
-                                  for sk, binc in strata.items()}}
-        for jid, strata in counts.items()
+        jid: {"baseline_counts": {context: {b: binc.get(b, 0) for b in bins}
+                                  for context, binc in contexts.items()}}
+        for jid, contexts in counts.items()
     }
     return {**data, "papers": new_papers, "journals": new_journals}
 
@@ -321,7 +327,7 @@ def print_breakdowns(rows, shortlist, min_journal=5, cap=25):
 
     jcount = defaultdict(int)
     for r in shortlist:
-        for jid in {g["journal_id"] for g in r["gaps"]}:
+        for jid in {gap["journal_id"] for gap in r["gaps"]}:
             jcount[jid] += 1
     ranked = sorted(jcount.items(), key=lambda kv: (-kv[1], str(kv[0])))
     print(f"\n=== JOURNALS BY #SHORTLISTED AUTHORS (>= {min_journal}; counted per journal) ===")
@@ -354,10 +360,10 @@ def main():
     parser.add_argument("--in", dest="in_path", default=DEFAULT_IN, help="corpus JSON from extract")
     parser.add_argument("--threshold", type=float, default=SHORTLIST_THRESHOLD,
                         help="P(genuine) below which an author is shortlisted")
-    parser.add_argument("--z-threshold", type=float, default=CANDIDATE_Z_THRESHOLD,
-                        help="candidacy cut: an author is scored if >=1 gap has z below this")
-    parser.add_argument("--min-gaps", type=int, default=MIN_GAPS_SCORED,
-                        help="minimum usable papers before an author is scored (see MIN_GAPS_SCORED)")
+    parser.add_argument("--entry-gate-z", type=float, default=ENTRY_GATE_Z,
+                        help="entry gate: an author is a candidate if >=1 gap has z below this")
+    parser.add_argument("--min-record", type=int, default=MIN_RECORD,
+                        help="minimum record n_min: usable gaps before a candidate is scored (see MIN_RECORD)")
     parser.add_argument("--selftest", action="store_true", help="run synthetic validation and exit")
     args = parser.parse_args()
 
@@ -371,22 +377,22 @@ def main():
 
     assert set(MANIP_DIST) == set(data["config"]["z_bins"]), "MANIP_DIST keys must match z_bins"
 
-    rows, journals, pooled, bins = rank_corpus(data, ALPHA, PRIOR_GENUINE,
-                                               z_threshold=args.z_threshold,
-                                               min_gaps=args.min_gaps)
+    rows, journals, pooled, bins = rank_corpus(data, ALPHA, PRIOR,
+                                               entry_gate_z=args.entry_gate_z,
+                                               min_record=args.min_record)
     shortlist = [r for r in rows if r["p_genuine"] < args.threshold]
 
-    print(f"Model: {data['model']} | z_threshold={args.z_threshold} | "
-          f"min_gaps={args.min_gaps} | alpha={ALPHA} | "
-          f"prior P(genuine)={PRIOR_GENUINE} | MANIP_DIST={MANIP_DIST}")
-    print(f"Scored {len(rows)} authors (>=1 gap with z < {args.z_threshold}); "
+    print(f"Model: {data['model']} | entry_gate_z={args.entry_gate_z} | "
+          f"min_record={args.min_record} | alpha={ALPHA} | "
+          f"prior P(genuine)={PRIOR} | MANIP_DIST={MANIP_DIST}")
+    print(f"Scored {len(rows)} authors (>=1 gap with z < {args.entry_gate_z}); "
           f"{len(shortlist)} below threshold {args.threshold}.")
 
     # --- ranking CSV (all scored authors) ---------------------------------
-    # log10_odds (weight of evidence) is the primary, non-saturating sort key;
+    # woe (weight of evidence) is the primary, non-saturating sort key;
     # p_genuine is written with full precision so tiny posteriors never read 0.
     rank_path = os.path.join(OUT_DIR, "bbn_v4_ranking.csv")
-    cols = ["name", "orcid", "p_genuine", "log10_odds", "n_gaps", "n_nontypical", "n_journals",
+    cols = ["name", "orcid", "p_genuine", "woe", "n_gaps", "n_non_typical", "n_journals",
             "lowest_z", "lowest_bin"]
     with open(rank_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -394,7 +400,7 @@ def main():
         for r in rows:
             out = dict(r)
             out["p_genuine"] = f"{r['p_genuine']:.6g}"
-            out["log10_odds"] = round(r["log10_odds"], 3)
+            out["woe"] = round(r["woe"], 3)
             w.writerow({c: out[c] for c in cols})
     print(f"Wrote {rank_path}")
 
@@ -405,19 +411,19 @@ def main():
     # recoverable.
     authors_out = []
     for r in rows:
-        _, _, detail = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, True)
+        _, _, detail = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR, True)
         detail.sort(key=lambda d: d["lr"])  # most incriminating gap first
         authors_out.append({
             "name": r["name"], "orcid": r["orcid"], "p_genuine": r["p_genuine"],
-            "log10_odds": round(r["log10_odds"], 3),
+            "woe": round(r["woe"], 3),
             "shortlisted": r["p_genuine"] < args.threshold,
-            "n_gaps": r["n_gaps"], "n_nontypical": r["n_nontypical"],
+            "n_gaps": r["n_gaps"], "n_non_typical": r["n_non_typical"],
             "n_journals": r["n_journals"],
             "gaps": detail,
         })
     json_path = os.path.join(OUT_DIR, "bbn_v4_scored.json")
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"z_threshold": args.z_threshold, "alpha": ALPHA, "prior_genuine": PRIOR_GENUINE,
+        json.dump({"entry_gate_z": args.entry_gate_z, "alpha": ALPHA, "prior": PRIOR,
                    "shortlist_threshold": args.threshold, "manip_dist": MANIP_DIST,
                    "n_scored": len(authors_out),
                    "n_shortlisted": sum(1 for a in authors_out if a["shortlisted"]),
@@ -432,8 +438,8 @@ def main():
           " -- the ranking + sensitivity are the reportable output.)")
     for r in shortlist:
         tag = f" {r['orcid']}" if r["orcid"] else ""
-        print(f"  P(genuine)={fmt_p(r['p_genuine']):>9}  WoE={r['log10_odds']:>7.2f}  {r['name']:<28} "
-              f"n_gaps={r['n_gaps']:<3} non-typ={r['n_nontypical']:<3} "
+        print(f"  P(genuine)={fmt_p(r['p_genuine']):>9}  WoE={r['woe']:>7.2f}  {r['name']:<28} "
+              f"n_gaps={r['n_gaps']:<3} non-typ={r['n_non_typical']:<3} "
               f"j={r['n_journals']:<2} worst_z={r['lowest_z']:>7} [{r['lowest_bin']}]{tag}")
 
     if shortlist:
@@ -442,7 +448,7 @@ def main():
         print("  (LR<1 lowers genuineness; a genuine author's gaps match the peer baseline)")
         for d in top["gaps"][:10]:
             print(f"     z={d['z']:>7} {d['z_bin']:<12} j={d['journal_id']:<7} "
-                  f"genuine_p={d['genuine_p']:.4f} [{d['backoff_level']:<17}] LR={d['lr']:>7.3f}")
+                  f"genuine={d['genuine']:.4f} [{d['fallback_level']:<17}] LR={d['lr']:>7.3f}")
         if len(top["gaps"]) > 10:
             print(f"     ... (+{len(top['gaps']) - 10} more gaps)")
 
@@ -453,44 +459,44 @@ def main():
     if shortlist:
         sweep = shortlist[:SWEEP_PRINT_CAP]
         labels = [r["name"].split()[-1][:11] for r in sweep]
-        print(f"\n=== ALPHA SENSITIVITY  (P(genuine), prior={PRIOR_GENUINE}; top {len(sweep)} shortlist) ===")
+        print(f"\n=== ALPHA SENSITIVITY  (P(genuine), prior={PRIOR}; top {len(sweep)} shortlist) ===")
         print("  alpha  " + "  ".join(f"{l:>11}" for l in labels))
         for a in ALPHA_SWEEP:
             line = f"  {a:<6}"
             for r in sweep:
-                p = score_author(r["gaps"], journals, pooled, bins, a, PRIOR_GENUINE)[0]
+                p = score_author(r["gaps"], journals, pooled, bins, a, PRIOR)[0]
                 line += f"  {fmt_p(p):>11}"
             print(line)
 
         print(f"\n=== PRIOR SENSITIVITY  (P(genuine), alpha={ALPHA}; top {len(sweep)} shortlist) ===")
-        print("  P(gen)0 " + "  ".join(f"{l:>11}" for l in labels))
-        for pr in PRIOR_GENUINE_SWEEP:
+        print("  prior   " + "  ".join(f"{l:>11}" for l in labels))
+        for pr in PRIOR_SWEEP:
             line = f"  {pr:<6}"
             for r in sweep:
                 p = score_author(r["gaps"], journals, pooled, bins, ALPHA, pr)[0]
                 line += f"  {fmt_p(p):>11}"
             print(line)
 
-        # --- m_b (manipulation-shape) sensitivity -------------------------
+        # --- m(b) (manipulation-shape) sensitivity -----------------------
         # Vary only the shape of the elicited manipulation distribution. First the
         # P table for the top of the shortlist, then a ranking-stability summary
         # over the WHOLE shortlist.
-        print(f"\n=== MANIP-SHAPE (m_b) SENSITIVITY  (P(genuine), alpha={ALPHA}, prior={PRIOR_GENUINE}; top {len(sweep)}) ===")
+        print(f"\n=== MANIP-SHAPE (m(b)) SENSITIVITY  (P(genuine), alpha={ALPHA}, prior={PRIOR}; top {len(sweep)}) ===")
         print("  shape       " + "  ".join(f"{l:>11}" for l in labels))
         for sname, mdist in MANIP_SWEEP.items():
             line = f"  {sname:<11}"
             for r in sweep:
-                p = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, manip=mdist)[0]
+                p = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR, manip=mdist)[0]
                 line += f"  {fmt_p(p):>11}"
             print(line)
 
         base_pos = {r["ident"]: i for i, r in enumerate(shortlist)}
         base_set = set(base_pos)
-        print(f"\n=== m_b RANKING STABILITY vs baseline (baseline shortlist n={len(shortlist)}) ===")
+        print(f"\n=== m(b) RANKING STABILITY vs baseline (baseline shortlist n={len(shortlist)}) ===")
         print("  (in-common = authors shortlisted under both; |Drank| = position shift within the shortlist order)")
         for sname, mdist in MANIP_SWEEP.items():
-            rows_s, *_ = rank_corpus(data, ALPHA, PRIOR_GENUINE, manip=mdist,
-                                     z_threshold=args.z_threshold, min_gaps=args.min_gaps)
+            rows_s, *_ = rank_corpus(data, ALPHA, PRIOR, manip=mdist,
+                                     entry_gate_z=args.entry_gate_z, min_record=args.min_record)
             sl_s = [r for r in rows_s if r["p_genuine"] < args.threshold]
             pos_s = {r["ident"]: i for i, r in enumerate(sl_s)}
             common = base_set & set(pos_s)
@@ -501,21 +507,21 @@ def main():
 
         # --- z-edge (typical boundary) sensitivity ------------------------
         # Move ONLY the outer mild_fast/typical edge (p10..p25); the fast-tail
-        # cuts p0.1/p1/p5 are held fixed. Candidacy is z<threshold on the
+        # cuts p0.1/p1/p5 are held fixed. The entry gate is z<entry_gate_z on the
         # continuous z, so the candidate set does not change.
         pcts = data.get("config", {}).get("z_percentiles", {})
         needed = [px for px in Z_OUTER_PCT_SWEEP if f"p{px}" in pcts]
         if f"p{Z_OUTER_PCT_DEFAULT}" in pcts and len(needed) >= 2:
-            reb_rows = {px: rank_corpus(rebin_corpus(data, px), ALPHA, PRIOR_GENUINE,
-                                        z_threshold=args.z_threshold,
-                                        min_gaps=args.min_gaps)[0] for px in needed}
+            reb_rows = {px: rank_corpus(rebin_corpus(data, px), ALPHA, PRIOR,
+                                        entry_gate_z=args.entry_gate_z,
+                                        min_record=args.min_record)[0] for px in needed}
             # faithfulness: rebuilt-default binning should reproduce the stored z_bin
             reb_def = rebin_corpus(data, Z_OUTER_PCT_DEFAULT)["papers"]
             drift = sum(1 for d, p in reb_def.items()
                         if p.get("z_bin") != data["papers"][d].get("z_bin"))
             print(f"\n=== Z-EDGE (typical boundary p_x) SENSITIVITY  (P(genuine), alpha={ALPHA}, "
-                  f"prior={PRIOR_GENUINE}; top {len(sweep)}) ===")
-            print(f"  (only the mild_fast/typical edge moves; candidate set fixed by z<{args.z_threshold}. "
+                  f"prior={PRIOR}; top {len(sweep)}) ===")
+            print(f"  (only the mild_fast/typical edge moves; candidate set fixed by z<{args.entry_gate_z}. "
                   f"rebuilt-p{Z_OUTER_PCT_DEFAULT} vs stored z_bin: {drift} papers differ.)")
             print("  p_x    " + "  ".join(f"{l:>11}" for l in labels))
             for px in needed:
@@ -571,16 +577,16 @@ def selftest():
     A_T = 0.10
     M_T = {"typical": 0.0, "mild_fast": 0.15, "extreme": 0.20,
            "very_extreme": 0.25, "ultra_extreme": 0.40}
-    P = lambda g, a=A_T, pr=PRIOR_GENUINE: score_author(g, journals, pooled, bins, a, pr, manip=M_T)[0]
+    P = lambda gaps, a=A_T, pr=PRIOR: score_author(gaps, journals, pooled, bins, a, pr, manip=M_T)[0]
 
     def gap(zb, z, doi, t="normal_type", p="normal"):
-        return {"journal_id": "J1", "type_bin": t, "pages_bin": p, "z_bin": zb, "z": z, "doi": doi}
+        return {"journal_id": "J1", "article_type": t, "page_class": p, "z_bin": zb, "z": z, "doi": doi}
 
     A = [gap("very_extreme", -5.0, "A1")]
     C = [gap("typical", 0.2, "C1")]
-    # z=-3.5 (not -3.0) so this gap is unambiguously past the CANDIDATE_Z_THRESHOLD
+    # z=-3.5 (not -3.0) so this gap is unambiguously past the ENTRY_GATE_Z
     # boundary and stays a V4 candidate; the label "extreme" here is just a
-    # synthetic bin tag for exercising the back-off, unrelated to the real corpus's
+    # synthetic bin tag for exercising the fallback, unrelated to the real corpus's
     # percentile-derived bin edges.
     D = [gap("extreme", -3.5, "D1", t="fast_type", p="short")]
     E = [gap("ultra_extreme", -9.0, "E1")]
@@ -600,83 +606,83 @@ def selftest():
 
     # 2. without exclusion the same author looks MORE genuine
     #    g=(3+.5)/(100+2.5)=.0341463; not_g=.025+.9*g=.0557317; LR=.612691; P=.920895
-    g0, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", [])
+    g0, _ = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", [])
     lr0 = gap_lr("very_extreme", g0, A_T, M_T)
-    odds0 = (PRIOR_GENUINE / (1 - PRIOR_GENUINE)) * lr0
+    odds0 = (PRIOR / (1 - PRIOR)) * lr0
     p_noloo = odds0 / (1 + odds0)
     check(f"no-exclusion posterior == 0.9209  (got {p_noloo:.6f})", _approx(p_noloo, 0.920895))
     check("leave-one-author LOWERS genuineness for the anomaly", pA < p_noloo)
 
     # 3. finer tail separates magnitude: an ultra_extreme gap is far more incriminating
-    #    than a very_extreme one in the SAME stratum (the whole point of the p0.1 cut).
-    g_ve, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", A)
-    g_ue, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", E)
+    #    than a very_extreme one in the SAME context (the whole point of the p0.1 cut).
+    g_ve, _ = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", A)
+    g_ue, _ = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", E)
     lr_ve = gap_lr("very_extreme", g_ve, A_T, M_T)
     lr_ue = gap_lr("ultra_extreme", g_ue, A_T, M_T)
     check(f"LR_ultra ({lr_ue:.3f}) < LR_very_extreme ({lr_ve:.3f})", lr_ue < lr_ve)
     check(f"ultra_extreme author scored more suspicious than very_extreme  "
           f"(P {P(E):.3f} < {P(A):.3f})", P(E) < P(A))
 
-    # 4. LR_typical == 1/(1-alpha) exactly, independent of counts/back-off
-    gt, _ = genuine_dist(journals, pooled, bins, "J1", "normal_type", "normal", C)
+    # 4. LR_typical == 1/(1-alpha) exactly, independent of counts/fallback
+    gt, _ = genuine_column(journals, pooled, bins, "J1", "normal_type", "normal", C)
     lrt = gap_lr("typical", gt, A_T, M_T)
     check(f"LR_typical == 1/(1-alpha)=1.11111  (got {lrt:.8f})", _approx(lrt, 1 / (1 - A_T), 1e-9))
 
     # 5. a typical-only author, and an author whose worst gap doesn't clear the
-    #    z<-3 candidacy bar, are NOT candidates; those with a gap past it are.
+    #    z<-3 entry gate, are NOT candidates; those with a gap past it are.
     data = {"papers": {"A1": A[0], "C1": C[0], "D1": D[0], "E1": E[0]},
             "author_index": {"AuthA": ["A1"], "AuthC": ["C1"], "AuthD": ["D1"], "AuthE": ["E1"]}}
-    # These synthetic authors hold one paper each, so every candidacy check below
-    # pins min_gaps=1 explicitly: it isolates the z<-3 rule from the corpus-level
-    # MIN_GAPS_SCORED default, which is exercised separately in 5c.
-    cand = {ident for ident, _, _ in iter_candidates(data, min_gaps=1)}
+    # These synthetic authors hold one paper each, so every candidate check below
+    # pins min_record=1 explicitly: it isolates the z<-3 rule from the corpus-level
+    # MIN_RECORD default, which is exercised separately in 5c.
+    cand = {ident for ident, _, _ in iter_candidates(data, min_record=1)}
     check("candidate set = {AuthA, AuthD, AuthE} (typical-only AuthC excluded)",
           cand == {"AuthA", "AuthD", "AuthE"})
 
     # 5b. an author whose single gap sits AT the boundary (z == threshold) is
     #     excluded: the cut is strictly "<", matching Westerbaan's "<-3" wording.
-    boundary_data = {"papers": {"B1": gap("very_extreme", CANDIDATE_Z_THRESHOLD, "B1")},
+    boundary_data = {"papers": {"B1": gap("very_extreme", ENTRY_GATE_Z, "B1")},
                      "author_index": {"AuthB": ["B1"]}}
-    cand_boundary = {ident for ident, _, _ in iter_candidates(boundary_data, min_gaps=1)}
+    cand_boundary = {ident for ident, _, _ in iter_candidates(boundary_data, min_record=1)}
     check("author with z exactly at the threshold is NOT a candidate (strict <)",
           cand_boundary == set())
 
-    # 5c. min_gaps gates on record length only, and is a no-op at 1.
-    #     AuthA/AuthC/AuthD/AuthE each hold a single paper, so any min_gaps > 1
-    #     empties the candidate set; a 2-paper author survives min_gaps=2.
-    check("min_gaps=1 is a no-op on the candidate set",
-          {i for i, _, _ in iter_candidates(data, min_gaps=1)} == cand)
-    check(f"MIN_GAPS_SCORED default ({MIN_GAPS_SCORED}) is applied when min_gaps is omitted",
+    # 5c. min_record gates on record length only, and is a no-op at 1.
+    #     AuthA/AuthC/AuthD/AuthE each hold a single paper, so any min_record > 1
+    #     empties the candidate set; a 2-paper author survives min_record=2.
+    check("min_record=1 is a no-op on the candidate set",
+          {i for i, _, _ in iter_candidates(data, min_record=1)} == cand)
+    check(f"MIN_RECORD default ({MIN_RECORD}) is applied when min_record is omitted",
           {i for i, _, _ in iter_candidates(data)}
-          == (cand if MIN_GAPS_SCORED <= 1 else set()))
-    check("min_gaps=2 drops every single-paper candidate",
-          {i for i, _, _ in iter_candidates(data, min_gaps=2)} == set())
+          == (cand if MIN_RECORD <= 1 else set()))
+    check("min_record=2 drops every single-paper candidate",
+          {i for i, _, _ in iter_candidates(data, min_record=2)} == set())
     two_paper = {"papers": {"A1": A[0], "T1": C[0]},
                  "author_index": {"AuthLong": ["A1", "T1"]}}
-    check("min_gaps=2 keeps a 2-paper author whose worst gap clears z<-3",
-          {i for i, _, _ in iter_candidates(two_paper, min_gaps=2)} == {"AuthLong"})
-    check("min_gaps=3 drops that same 2-paper author",
-          {i for i, _, _ in iter_candidates(two_paper, min_gaps=3)} == set())
+    check("min_record=2 keeps a 2-paper author whose worst gap clears z<-3",
+          {i for i, _, _ in iter_candidates(two_paper, min_record=2)} == {"AuthLong"})
+    check("min_record=3 drops that same 2-paper author",
+          {i for i, _, _ in iter_candidates(two_paper, min_record=3)} == set())
 
     # ORCID identity -> display label resolved, orcid column populated
     odata = {"config": {"z_bins": bins}, "journals": journals,
              "papers": {"P1": A[0]},
              "author_index": {"0000-0001-2345-6789": ["P1"]},
              "author_labels": {"0000-0001-2345-6789": "Jane Doe"}}
-    orows = rank_corpus(odata, min_gaps=1)[0]
+    orows = rank_corpus(odata, min_record=1)[0]
     check("ORCID identity -> name=label and orcid column set",
           orows[0]["name"] == "Jane Doe" and orows[0]["orcid"] == "0000-0001-2345-6789")
 
-    # 6. full back-off chain with post-exclusion threshold:
+    # 6. full fallback chain with post-exclusion FALLBACK_MIN_N:
     #    D's fast_type|short has 30; minus D's paper -> 29 < 30 -> journal:type (29) < 30
-    #    -> pooled:type (final fallback)
-    _, lvlD = genuine_dist(journals, pooled, bins, "J1", "fast_type", "short", D)
-    check(f"back-off falls through to pooled:type  (got {lvlD})", lvlD == "pooled:type")
+    #    -> pooled:type (last fallback level)
+    _, lvlD = genuine_column(journals, pooled, bins, "J1", "fast_type", "short", D)
+    check(f"fallback falls through to pooled:type  (got {lvlD})", lvlD == "pooled:type")
 
     # 7. ranking orders ascending by P(genuine) (= ascending weight of evidence)
     rows, *_ = rank_corpus({"config": {"z_bins": bins}, "journals": journals,
                             "papers": data["papers"], "author_index": data["author_index"]},
-                           min_gaps=1)
+                           min_record=1)
     ps = [r["p_genuine"] for r in rows]
     check("ranking is sorted ascending by P(genuine)", ps == sorted(ps))
 
@@ -689,9 +695,9 @@ def selftest():
                                   "p15": -0.9, "p20": -0.6, "p25": -0.4, "p50": 0.0}}
     edge_papers = {
         "Q1": {"journal_id": "J9", "z": -0.70, "z_bin": "typical",
-               "type_bin": "normal_type", "pages_bin": "normal"},
+               "article_type": "normal_type", "page_class": "normal"},
         "Q2": {"journal_id": "J9", "z": -4.00, "z_bin": "very_extreme",
-               "type_bin": "normal_type", "pages_bin": "normal"},
+               "article_type": "normal_type", "page_class": "normal"},
     }
     edge_data = {"config": edge_cfg, "papers": edge_papers,
                  "author_index": {"AuthQ": ["Q1", "Q2"]}}
@@ -709,9 +715,9 @@ def selftest():
     check("rebuilt baseline moves exactly one count typical->mild_fast at p25",
           c15["typical"] == 1 and c15["mild_fast"] == 0
           and c25["typical"] == 0 and c25["mild_fast"] == 1)
-    check("candidate set is edge-invariant (z<-3 candidacy is on continuous z)",
-          {i for i, _, _ in iter_candidates(reb15, min_gaps=1)}
-          == {i for i, _, _ in iter_candidates(reb25, min_gaps=1)})
+    check("candidate set is edge-invariant (z<-3 entry gate is on continuous z)",
+          {i for i, _, _ in iter_candidates(reb15, min_record=1)}
+          == {i for i, _, _ in iter_candidates(reb25, min_record=1)})
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     if not ok:

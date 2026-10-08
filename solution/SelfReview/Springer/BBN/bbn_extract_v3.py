@@ -4,23 +4,27 @@ BBN corpus extraction for the self-review case study (SQ1.1).
 Builds the data that bbn_infer.py needs, from the PostgreSQL `springer` schema.
 The model is a per-gap Bayesian network: one latent node G = is_genuine per
 author, and for each review-time "gap" (days from submission to acceptance) one
-observed node hanging off G with parents (article_type, pages). Gaps are the
-conditionally-independent unit of evidence.
+observed node hanging off G with covariate parents (article_type, page_class).
+Gaps are the conditionally-independent unit of evidence.
 
-Per paper: gap -> t = ln(max(gap_days, GAP_FLOOR_DAYS)), standardized within its
-own journal to z = (t - mean_j) / std_j (sample stats; gaps > HIGH_GAP_CUTOFF_DAYS
-trimmed from the reference). z is discretized with edges set to the pooled
-percentiles of z over all journals -- fast (left) tail refined, slow side coarse:
+Per paper: gap_days (d_i) -> log_gap (x_i) =
+ln(max(gap_days, GAP_FLOOR_DAYS)), standardized within its own journal to
+z = (log_gap - ref_mean_j) / ref_std_j (mu_j, sigma_j; sample stats). Papers with
+gap_days > GAP_CEILING_DAYS (tau) are dropped from the corpus altogether, so they
+are neither in the journal reference nor scored. z is discretized with edges set
+to the pooled percentiles of z over all journals -- fast (left) tail refined,
+slow side coarse:
     ultra_extreme <= p0.1 < very_extreme <= p1 < extreme <= p5
     < mild_fast <= p15 < typical
 The edges used are written to config.z_edges, so inference reads the precomputed
 z_bin and never re-bins.
 
 Output (one corpus JSON in bbn_baselines/):
-    journals      -- per-journal genuine baseline counts P(z-bin | type, pages),
+    journals      -- per-journal genuine baseline counts P(bin | article_type, page_class),
                      over every usable paper (no exclusion here; leave-one-author
                      exclusion is applied at inference time)
-    papers        -- one entry per usable DOI (journal, gap, z, z_bin, type/pages bins)
+    papers        -- one entry per usable DOI (journal, gap_days, z, z_bin,
+                     article_type, page_class)
     author_index  -- author identity -> [doi, ...] (cross-journal)
     author_labels -- identity -> representative display name
     suspects      -- the 3 case-study names, as a validation anchor
@@ -54,8 +58,8 @@ from collections import Counter, defaultdict
 
 SCHEMA = "springer"
 
-HIGH_GAP_CUTOFF_DAYS = 924
-GAP_FLOOR_DAYS = 0.5
+GAP_CEILING_DAYS = 924          # tau: papers with a longer gap are dropped from the corpus
+GAP_FLOOR_DAYS = 0.5            # delta: floor on the gap, keeps zero-day gaps finite
 MIN_JOURNAL_REF = 2             # journal needs >=2 usable gaps (and std>0) to define z
 
 # z-bin edges are the pooled percentiles of the standardized log-gap z.
@@ -68,7 +72,7 @@ Z_BINS = ["typical", "mild_fast", "extreme", "very_extreme", "ultra_extreme"]
 PCT_EDGES = [(0.1, "ultra_extreme"), (1, "very_extreme"), (5, "extreme"), (15, "mild_fast")]
 
 
-# per-gap context bins (parents of each gap node)
+# per-gap covariates (parents of each gap node): article type t_i and page class p_i
 FAST_TYPE_KEYWORDS = (
     "editorial", "erratum", "correction", "corrigendum", "comment",
     "letter", "preface", "introduction", "book review", "obituary",
@@ -76,13 +80,13 @@ FAST_TYPE_KEYWORDS = (
 )
 
 
-# Editorial-signalling TITLE patterns, used to reclassify papers whose
-# `article_type` is generic (e.g. "Article") but whose title marks them as
-# editorial / non-peer-reviewed content -- the leak the field-only classifier
+# Editorial-signalling TITLE patterns, used to relabel papers whose type metadata
+# (the DB's `article_type` field) is generic (e.g. "Article") but whose title marks
+# them as editorial / non-peer-reviewed content -- the leak the field-only classifier
 # misses (a same-day "Editorial: ..." filed as an Article looks incriminating).
 # Matched as a PREFIX (case-insensitive, leading quote/paren/space tolerated) so
 # genuine research titles ("An introduction to ...") are never caught: precision
-# matters because a false reclassification would HIDE a real fast gap.
+# matters because a false relabelling would HIDE a real fast gap.
 FAST_TITLE_PATTERNS = (
     r"(guest\s+)?editorial\b",
     r"editor['’`s]*\s+(note|introduction|message|perspective|comment)\b",
@@ -127,7 +131,7 @@ def read_config(path) -> configparser.SectionProxy:
     return config["SECTION"]
 
 
-def pages_of(first, last):
+def page_count_of(first, last):
     if first is None or last is None or last < first:
         return None
     return last - first + 1
@@ -138,13 +142,14 @@ def title_is_fast(title):
 
     Anchored at the start of the title (leading quote/paren/space tolerated), so
     "Editorial: ..." / "Correction to: ..." match while a research paper titled
-    "An introduction to ..." does not. Catches items filed under a generic
-    `article_type` that are editorial in nature."""
+    "An introduction to ..." does not. Catches items whose type metadata is
+    generic but that are editorial in nature."""
     return bool(title) and _FAST_TITLE_RE.match(title) is not None
 
 
-def type_bin(article_type, title=None):
-    t = (article_type or "").lower()
+def article_type_of(type_metadata, title=None):
+    """Article type t_i (fast_type / normal_type) from the raw type metadata."""
+    t = (type_metadata or "").lower()
     if any(k in t for k in FAST_TYPE_KEYWORDS):
         return "fast_type"
     if title_is_fast(title):
@@ -152,14 +157,16 @@ def type_bin(article_type, title=None):
     return "normal_type"
 
 
-def pages_bin(pages):
-    if pages is None:
+def page_class_of(page_count):
+    """Page class p_i (short / normal / unknown) from the page count."""
+    if page_count is None:
         return "unknown"
-    return "short" if pages <= SHORT_PAGES_MAX else "normal"
+    return "short" if page_count <= SHORT_PAGES_MAX else "normal"
 
 
-def stratum_key(tbin, pbin):
-    return f"{tbin}|{pbin}"
+def context_key(article_type, page_class):
+    """Key of one conditioning context (article type, page class) in baseline_counts."""
+    return f"{article_type}|{page_class}"
 
 
 def percentile(sorted_vals, pct):
@@ -244,42 +251,46 @@ def main():
         return row_orcid.get((doi, name)) or name_unique_orcid.get(name) or name
 
     # --- pass 1: per-paper transform + per-journal reference ----------------
+    # The DB column `review_days` is the gap d_i; `article_type` is the raw type metadata.
     papers = {}
-    journal_vals = defaultdict(list)
+    journal_log_gaps = defaultdict(list)
     missing_gaps = neg_gaps = zero_gaps = 0
-    n_title_reclassified = 0
-    title_reclass_sample = []
+    n_title_relabelled = 0
+    title_relabel_sample = []
     for a in articles:
-        gap = a["review_days"]
-        if gap is None:            # no received/accepted date -> no computable gap
+        gap_days = a["review_days"]
+        if gap_days is None:       # no received/accepted date -> no computable gap
             missing_gaps += 1
             continue
-        if gap < 0:                # acceptance before submission (verified: ~none in corpus)
+        if gap_days < 0:           # acceptance before submission (verified: ~none in corpus)
             neg_gaps += 1
             continue
-        if gap == 0:
+        if gap_days == 0:
             zero_gaps += 1
-        if gap > HIGH_GAP_CUTOFF_DAYS:
+        if gap_days > GAP_CEILING_DAYS:     # above the ceiling: dropped from the corpus
             continue
-        t = math.log(max(gap, GAP_FLOOR_DAYS))
+        log_gap = math.log(max(gap_days, GAP_FLOOR_DAYS))
         title = a["title"]
-        tbin_field = type_bin(a["article_type"])        # article_type field only
-        tbin = "fast_type" if (tbin_field == "fast_type" or title_is_fast(title)) else "normal_type"
-        via_title = tbin_field == "normal_type" and tbin == "fast_type"
+        type_from_field = article_type_of(a["article_type"])  # type metadata only
+        article_type = ("fast_type" if (type_from_field == "fast_type" or title_is_fast(title))
+                        else "normal_type")
+        via_title = type_from_field == "normal_type" and article_type == "fast_type"
         if via_title:
-            n_title_reclassified += 1
-            if len(title_reclass_sample) < 20:
-                title_reclass_sample.append((a["doi"], a["article_type"], title))
+            n_title_relabelled += 1
+            if len(title_relabel_sample) < 20:
+                title_relabel_sample.append((a["doi"], a["article_type"], title))
         papers[a["doi"]] = {
-            "doi": a["doi"], "journal_id": a["journal_id"], "gap": gap, "t": t,
-            "article_type": a["article_type"], "title": title,
-            "type_bin": tbin, "type_from_title": via_title,
-            "pages": pages_of(a["first_page"], a["last_page"]),
+            "doi": a["doi"], "journal_id": a["journal_id"], "gap_days": gap_days,
+            "log_gap": log_gap,
+            "type_metadata": a["article_type"], "title": title,
+            "article_type": article_type, "relabelled_by_title": via_title,
+            "page_count": page_count_of(a["first_page"], a["last_page"]),
         }
-        journal_vals[a["journal_id"]].append(t)
+        journal_log_gaps[a["journal_id"]].append(log_gap)
 
+    # journal reference (mu_j, sigma_j) of the log gap
     journal_ref = {}
-    for jid, vals in journal_vals.items():
+    for jid, vals in journal_log_gaps.items():
         if len(vals) < MIN_JOURNAL_REF:
             continue
         sd = statistics.stdev(vals)
@@ -288,8 +299,8 @@ def main():
 
     for p in papers.values():
         ref = journal_ref.get(p["journal_id"])
-        p["z"] = (p["t"] - ref[0]) / ref[1] if ref else None
-        p["pages_bin"] = pages_bin(p["pages"])
+        p["z"] = (p["log_gap"] - ref[0]) / ref[1] if ref else None
+        p["page_class"] = page_class_of(p["page_count"])
 
     # --- derive z-edges from pooled standardized z ----------------
     sorted_z = sorted(p["z"] for p in papers.values() if p["z"] is not None)
@@ -320,30 +331,30 @@ def main():
     # Editorial-title leak: papers rescued from a wrong "normal_type" baseline.
     # rescued_fast are the actual false positives this fix removes -- editorial
     # content that would otherwise have contributed an incriminating fast-bin LR.
-    rescued = [p for p in usable if p["type_from_title"]]
+    rescued = [p for p in usable if p["relabelled_by_title"]]
     fast_bins = ("extreme", "very_extreme", "ultra_extreme")
     rescued_fast = [p for p in rescued if p["z_bin"] in fast_bins]
-    print(f"Editorial-title reclassification: {n_title_reclassified} papers filed under a "
-          f"non-fast article_type but flagged editorial by title;")
+    print(f"Editorial-title relabelling: {n_title_relabelled} papers filed under a "
+          f"non-fast type metadata but flagged editorial by title;")
     print(f"   {len(rescued)} are usable gaps, of which {len(rescued_fast)} fall in a fast "
-          f"z-bin (the false positives this fix removes).")
-    for doi, at, tt in title_reclass_sample[:15]:
+          f"bin (the false positives this fix removes).")
+    for doi, at, tt in title_relabel_sample[:15]:
         shown = (tt[:70] + "...") if tt and len(tt) > 70 else (tt or "")
         print(f"     [{at or '?'}] {shown}  ({doi})")
 
-    # --- JOURNAL-SPECIFIC genuine baseline counts P(z-bin | type, pages) -----
+    # --- JOURNAL-SPECIFIC genuine baseline counts P(bin | article_type, page_class) --
     # No exclusion here: every usable paper counts. Leave-one-author exclusion is
-    # applied at inference time. counts[journal_id][stratum_key][z_bin].
+    # applied at inference time. counts[journal_id][context_key][z_bin].
     counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for p in usable:
-        counts[p["journal_id"]][stratum_key(p["type_bin"], p["pages_bin"])][p["z_bin"]] += 1
+        counts[p["journal_id"]][context_key(p["article_type"], p["page_class"])][p["z_bin"]] += 1
 
     journals_out = {}
     for jid, ref in journal_ref.items():
-        baseline = {sk: {b: bins.get(b, 0) for b in Z_BINS}
-                    for sk, bins in counts.get(jid, {}).items()}
+        baseline = {context: {b: bins.get(b, 0) for b in Z_BINS}
+                    for context, bins in counts.get(jid, {}).items()}
         journals_out[jid] = {
-            "ref_mean": ref[0], "ref_std": ref[1],
+            "ref_mean": ref[0], "ref_std": ref[1],            # mu_j, sigma_j of the log gap
             "n_papers": sum(sum(b.values()) for b in baseline.values()),
             "baseline_counts": baseline,
         }
@@ -358,11 +369,11 @@ def main():
     for d in keep_dois:
         p = papers[d]
         papers_out[d] = {
-            "journal_id": p["journal_id"], "gap_days": p["gap"],
+            "journal_id": p["journal_id"], "gap_days": p["gap_days"],
             "z": round(p["z"], 3), "z_bin": p["z_bin"],
-            "type_bin": p["type_bin"], "pages_bin": p["pages_bin"],
-            "article_type": p["article_type"], "title": p["title"],
-            "type_from_title": p["type_from_title"],
+            "article_type": p["article_type"], "page_class": p["page_class"],
+            "type_metadata": p["type_metadata"], "title": p["title"],
+            "relabelled_by_title": p["relabelled_by_title"],
         }
 
     # group authorships into identities (ORCID-or-name); label = most common name
@@ -396,14 +407,14 @@ def main():
         "model": "v3_per_gap_corpus",
         "journal_filter": args.journal,
         "config": {
-            "high_gap_cutoff_days": HIGH_GAP_CUTOFF_DAYS, "gap_floor_days": GAP_FLOOR_DAYS,
+            "gap_ceiling_days": GAP_CEILING_DAYS, "gap_floor_days": GAP_FLOOR_DAYS,
             "min_journal_ref": MIN_JOURNAL_REF,
             "z_edges": [[e if e != float("inf") else "inf", lbl] for e, lbl in z_edges],
             "z_bins": Z_BINS,
             "z_percentiles": percentiles,
             "short_pages_max": SHORT_PAGES_MAX,
             "fast_title_patterns": list(FAST_TITLE_PATTERNS),
-            "n_title_reclassified": n_title_reclassified,
+            "n_title_relabelled": n_title_relabelled,
         },
         "journals": journals_out,
         "papers": papers_out,
