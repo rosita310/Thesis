@@ -38,6 +38,54 @@ BLOCKLIST_KEYWORDS = {
     "cf.", "silicon device", "technology", "editorial:"
 }
 
+# Words that never occur in a person's name (matched per word, case-insensitive).
+# Catches affiliation fragments that end up on their own line.
+NON_NAME_WORDS = {
+    "university", "univ", "univ.", "universidad", "universidade", "università", "universität",
+    "université", "universiteit", "institute", "inst", "inst.", "institut", "instituto",
+    "istituto", "politecnico", "polytechnic", "polytechnique", "department", "dept", "dept.",
+    "inc", "inc.", "corp", "corp.", "ltd", "ltd.", "llc", "gmbh", "laboratory", "laboratories",
+    "lab", "lab.", "labs", "center", "centre", "college", "school", "academy", "hospital",
+    "research", "ieee", "society", "soc.", "page", "break", "for", "and", "of", "the",
+    "tech", "polytechnical", "scuola", "suny", "uc", "eth", "national", "eng.", "comput.",
+    "electr.", "office", "officio", "staff", "administration", "administrator",
+    "association", "activities", "editor", "editors", "editor-in-chief",
+    "editors-in-chief", "theory", "coding", "processing", "networks", "network",
+    "techniques", "communication", "communications", "wireless", "information",
+    "technology", "science", "sciences", "physics", "learning", "electronics",
+    "manufacturing", "optic", "optics", "sensor", "sensors", "systems", "integration",
+    "interface", "data", "semiconductor", "council", "committee", "board", "lecturers",
+}
+
+# A lone country is the tail of an affiliation that was split over two lines.
+COUNTRIES = {
+    "usa", "u.s.a.", "us", "u.s.", "united states", "canada", "mexico", "brazil", "chile",
+    "argentina", "uk", "u.k.", "united kingdom", "england", "scotland", "ireland", "france",
+    "germany", "spain", "portugal", "italy", "switzerland", "austria", "belgium",
+    "the netherlands", "netherlands", "luxembourg", "denmark", "sweden", "norway", "finland",
+    "poland", "czech republic", "hungary", "greece", "turkey", "russia", "israel", "iran",
+    "egypt", "saudi arabia", "qatar", "uae", "united arab emirates", "india", "pakistan",
+    "china", "p.r. china", "pr china", "hong kong", "macau", "macao", "taiwan", "japan",
+    "korea", "south korea", "singapore", "malaysia", "thailand", "vietnam", "indonesia",
+    "australia", "new zealand", "south africa",
+}
+
+# Lower-case words allowed inside a name ("Jan van der Berg", "Ana de la Cruz").
+NAME_PARTICLES = {
+    "van", "von", "der", "den", "de", "del", "della", "di", "da", "dos", "das", "du", "la",
+    "le", "bin", "ibn", "al", "el", "ter", "ten",
+}
+
+# A name that appears in this many journals is IEEE corporate staff or an officer,
+# not an editor. Checked on the 2026-09 corpus: from 12 journals up it is all
+# officers and staff; at 10-11 the first real editors appear.
+MAX_JOURNALS_PER_NAME = 12
+
+# A board without any role caption is still accepted (role "Unknown") when this
+# many 'name / affiliation' entries follow within HEADERLESS_WINDOW lines.
+HEADERLESS_MIN_ENTRIES = 5
+HEADERLESS_WINDOW = 30
+
 # ==========================================
 # PARSER CONFIGURATION
 # ==========================================
@@ -533,11 +581,41 @@ def is_valid_inline_role(role_str: str) -> bool:
     return any(re.search(rf"\b{kw}\b", role_str) for kw in ROLE_KEYWORDS)
 
 def is_valid_name(name_str: str) -> bool:
-    """Returns False if the string contains any numeric digits. Can be expanded with more heuristics."""
-    return not any(char.isdigit() for char in name_str)
+    """Shape check: 2-5 words, starts with a capital, no digits, no affiliation
+    words, not a lone country, not the page-break marker."""
+    name = name_str.strip().rstrip(",")
+    if any(char.isdigit() for char in name):
+        return False
+    if any(char in name for char in "@/:;[]&"):
+        return False
+    if name.lower() in COUNTRIES or name.lower().split(",")[-1].strip() in COUNTRIES:
+        return False
+    words = name.split()
+    if not 2 <= len(words) <= 5:
+        return False
+    if not words[0][0].isupper():
+        return False
+    for word in words:
+        lower = word.lower().strip(",")
+        if lower in NON_NAME_WORDS:
+            return False
+        word = word.lstrip("(")  # a nickname: 'JOHN (JJ) DOE'
+        if not word or not word[0].isupper() and lower not in NAME_PARTICLES:
+            return False
+    return True
+
+def is_ignored_role(role_str: str) -> bool:
+    """Exact match on IGNORED_ROLES, also for the head of a header such as
+    'Vice President, Publication Services' or 'Director: Editorial Services'."""
+    role_str = role_str.lower().strip()
+    if role_str in IGNORED_ROLES:
+        return True
+    head = re.split(r"\s*[,:;—–]\s*", role_str, maxsplit=1)[0]
+    return head in IGNORED_ROLES
 
 def parse_inline_entry(line: str) -> tuple[str, str] | None:
-    """Checks if a line contains 'Name, Role' or 'Role: Name' inline format."""
+    """Checks if a line contains 'Name, Role' or 'Role: Name' inline format.
+    The role is None when it is one of the IGNORED_ROLES (e.g. 'John Smith, President')."""
     # Length limit for inline entries to avoid capturing heavily punctuated prose
     if len(line) > 100:
         return None
@@ -550,6 +628,8 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
         if is_valid_inline_role(potential_role):
             if not is_valid_name(potential_name):
                 return None
+            if is_ignored_role(potential_role):
+                return potential_name, None
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
@@ -562,6 +642,8 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
             if not is_valid_name(potential_name):
                 return None
             
+            if is_ignored_role(potential_role):
+                return potential_name, None
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
@@ -573,16 +655,59 @@ def parse_inline_entry(line: str) -> tuple[str, str] | None:
         if is_valid_inline_role(potential_role):
             if not is_valid_name(potential_name):
                 return None
+            if is_ignored_role(potential_role):
+                return potential_name, None
             mapped_role = ROLE_MAPPING.get(potential_role, f"Unmapped: {potential_role}")
             return potential_name, mapped_role
 
     return None
+
+# Two initial-style names on one line: 'J. DOE A. B. SMITH'
+DOUBLE_NAME = re.compile(r"((?:[A-Z]\.\s*)+[A-Z][\w'-]+)\s+((?:[A-Z]\.\s*)+[A-Z][\w'-]+)")
+
+def split_double_names(editors: list[dict]) -> list[dict]:
+    """Splits rows that hold two people (two masthead columns read as one line)."""
+    result = []
+    for editor in editors:
+        match = DOUBLE_NAME.fullmatch(editor["name"])
+        if match:
+            result.extend({**editor, "name": name} for name in match.groups())
+        else:
+            result.append(editor)
+    return result
+
+def looks_like_affiliation(line: str) -> bool:
+    clean_line = line.lower()
+    return "@" in line or any(inst in clean_line for inst in INSTITUTION_KEYWORDS)
+
+def starts_headerless_board(lines: list[str], i: int) -> bool:
+    """True if lines[i] opens a board that has no role caption: a name followed by
+    an affiliation, and at least HEADERLESS_MIN_ENTRIES such pairs close together.
+    A single 'name / affiliation' (an editorial's byline) does not qualify."""
+    def is_entry(j: int) -> bool:
+        return (j + 1 < len(lines) and is_valid_name(lines[j])
+                and looks_like_affiliation(lines[j + 1]))
+
+    if not is_entry(i):
+        return False
+    window = range(i, min(i + HEADERLESS_WINDOW, len(lines)))
+    return sum(is_entry(j) for j in window) >= HEADERLESS_MIN_ENTRIES
 
 def parse_markdown_file(md_path: Path) -> dict:
     with open(md_path, "r", encoding="utf-8") as file:
         text = file.read()
 
     text = unicodedata.normalize("NFKC", text)
+
+    # Drop boilerplate blocks (copyright, non-discrimination notice) as a whole.
+    # This must skip, not terminate: parse_pdf_to_md.py sorts blocks into coarse
+    # 100pt column bins, so the page-wide copyright block often lands *before*
+    # the narrow board columns, and stopping there loses most of the masthead.
+    blocks = re.split(r"\n\s*\n", text)
+    text = "\n\n".join(
+        block for block in blocks
+        if not any(t in re.sub(r"\s+", " ", block.lower()) for t in TERMINATING_TEXTS)
+    )
 
     # Clean raw lines: remove blank lines, trim spaces, and collapse multiple spaces into one
     raw_lines = [
@@ -626,27 +751,20 @@ def parse_markdown_file(md_path: Path) -> dict:
     current_name = None
     affiliation_lines = []
 
-    for line in merged_lines:
+    for i, line in enumerate(merged_lines):
         clean_line = line.lower()
-
-        # Termination Check
-        if clean_line in TERMINATING_ROLES or any(
-            t in clean_line for t in TERMINATING_TEXTS
-        ):
-            if current_name and current_role:
-                extracted_editors.append({
-                    "name": current_name,
-                    "role": current_role,
-                    "association": " ".join(affiliation_lines).strip(),
-                })
-            break
 
         # Skip subject area sub-headers
         if clean_line in SUBJECT_AREAS:
             continue
 
-        # Check and Ignore Corporate Officers & Staff (BEFORE inline & header checks)
-        if any(role in clean_line for role in IGNORED_ROLES):
+        # Check and Ignore Corporate Officers & Staff (BEFORE inline & fuzzy header checks).
+        # Exact match: a substring match on "board" would also swallow "editorial board".
+        # A staff header (TERMINATING_ROLES) closes the current section the same way;
+        # it no longer stops the file, since the board may still follow it.
+        if clean_line not in ROLE_MAPPING and (
+            is_ignored_role(clean_line) or clean_line in TERMINATING_ROLES
+        ):
             if current_name and current_role:
                 extracted_editors.append({
                     "name": current_name,
@@ -670,6 +788,11 @@ def parse_markdown_file(md_path: Path) -> dict:
                 affiliation_lines = []
 
             name, role = inline_match
+            if role is None:  # an ignored role, e.g. 'John Smith, President'
+                current_name = None
+                current_role = None
+                affiliation_lines = []
+                continue
             if role.startswith("Unmapped:"):
                 log_unmapped_role(role, journal_name)
             extracted_editors.append(
@@ -702,7 +825,9 @@ def parse_markdown_file(md_path: Path) -> dict:
             continue
 
         if not current_role:
-            continue
+            if not starts_headerless_board(merged_lines, i):
+                continue
+            current_role = "Unknown"
 
         # Parse Name and Affiliations under active roles
         if not current_name:
@@ -748,8 +873,36 @@ def parse_markdown_file(md_path: Path) -> dict:
 
     return {
         "journal_file": journal_name,
-        "editors": extracted_editors,
+        "editors": split_double_names(extracted_editors),
     }
+
+def journal_of(file_name: str) -> str:
+    """'IEEE Trans. X_2016_Issue_5.md' -> 'IEEE Trans. X'"""
+    return re.sub(r"_\d{4}_Issue_.*$", "", file_name)
+
+def name_key(name: str) -> str:
+    """'JANE A. DOE, Secretary' and 'Jane Doe' -> 'jane doe'.
+    Drops middle initials only; a first initial stays, so 'J. Doe' != 'A. Doe'."""
+    words = [w.strip(".") for w in name.split(",")[0].lower().replace(".", ". ").split()
+             if w not in ("dr.", "prof.")]
+    if len(words) < 3:
+        return " ".join(words)
+    return " ".join([words[0]] + [w for w in words[1:-1] if len(w) > 1] + [words[-1]])
+
+def drop_corpus_wide_names(parsed: dict[str, dict]):
+    """Removes names that appear in MAX_JOURNALS_PER_NAME or more journals (IEEE
+    officers and publishing staff). Works across files, so it runs after parsing:
+    the reading order is too scrambled to recognise their sections reliably."""
+    journals_per_name = {}
+    for file_name, data in parsed.items():
+        for editor in data["editors"]:
+            journals_per_name.setdefault(name_key(editor["name"]), set()).add(journal_of(file_name))
+
+    corporate = {key for key, journals in journals_per_name.items()
+                 if len(journals) >= MAX_JOURNALS_PER_NAME}
+    logging.info(f"Dropping {len(corporate)} names found in {MAX_JOURNALS_PER_NAME}+ journals.")
+    for data in parsed.values():
+        data["editors"] = [e for e in data["editors"] if name_key(e["name"]) not in corporate]
 
 # ==========================================
 # MAIN EXECUTION
@@ -761,12 +914,15 @@ def main():
         return
 
     logging.info("--- Starting new parsing run ---")
-    
-    processed_count = 0
-    
+
+    # Parse everything first, write afterwards: drop_corpus_wide_names needs all
+    # files at once. Its counts only cover the files parsed in this run, so a
+    # small MAX_FILES or OVERWRITE_EXISTING = False weakens it.
+    parsed = {}
+
     for md_path in DATA_DIR.glob("*.md"):
         
-        if MAX_FILES is not None and processed_count >= MAX_FILES:
+        if MAX_FILES is not None and len(parsed) >= MAX_FILES:
             logging.info(f"Reached maximum file limit ({MAX_FILES}). Stopping.")
             break
 
@@ -785,18 +941,19 @@ def main():
 
         logging.info(f"Parsing: {md_path.name}")
         try:
-            extracted_data = parse_markdown_file(md_path)
-            
-            with open(json_path, "w", encoding="utf-8") as json_file:
-                json.dump(extracted_data, json_file, indent=4, ensure_ascii=False)
-                
-            logging.info(f"Successfully created: {json_path.name}")
-            processed_count += 1
-            
+            parsed[md_path.name] = parse_markdown_file(md_path)
         except Exception as e:
             logging.error(f"Failed to parse {md_path.name}. Error: {e}", exc_info=True)
 
-    logging.info(f"Run complete. Successfully processed {processed_count} files.\n")
+    drop_corpus_wide_names(parsed)
+
+    for file_name, extracted_data in parsed.items():
+        json_path = (DATA_DIR / file_name).with_suffix(".json")
+        with open(json_path, "w", encoding="utf-8") as json_file:
+            json.dump(extracted_data, json_file, indent=4, ensure_ascii=False)
+        logging.info(f"Successfully created: {json_path.name}")
+
+    logging.info(f"Run complete. Successfully processed {len(parsed)} files.\n")
 
 if __name__ == "__main__":
     main()

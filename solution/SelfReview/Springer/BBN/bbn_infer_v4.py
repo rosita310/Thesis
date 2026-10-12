@@ -4,19 +4,11 @@ BBN inference for the self-review case study (SQ1.1).
 Reads the corpus JSON from bbn_extract_v3.py and scores every author who has at
 least one paper with z < CANDIDATE_Z_THRESHOLD (default -3.0). This threshold
 matches Westerbaan's original outlier definition for this attack (an author is
-flagged as soon as one of their papers has a z-score below -3). V3 flagged an
-author on ANY non-typical gap (i.e. beyond the corpus's p15 percentile edge,
-~-0.91); V4 narrows candidacy to Westerbaan's fixed z<-3 cut so the author pool
-we score lines up with the outlier list his method would produce. Once an
-author is flagged, nothing else changes: ALL of their gaps (not just the one
-that crossed -3) are still scored as evidence, so we can tell whether the fast
-gap is an isolated event or part of a structural, recurring pattern, and
-whether it is explained away by a benign covariate (page count, article type)
-via the journal/type/page-conditioned CPT.
+flagged as soon as one of their papers has a z-score below -3).
 
 The latent node is G = is_genuine in {genuine, not_genuine} (presumption of
 innocence): we report P(genuine | evidence) and escalate the LOWEST values for
-manual review -- a ranking to support investigation, never an accusation.
+manual review.
 
 Each gap contributes a likelihood ratio:
 
@@ -25,31 +17,20 @@ Each gap contributes a likelihood ratio:
 
 where b is the gap's z-bin and genuine_b is the journal-specific empirical
 baseline. The not_genuine branch is an alpha-mixture: a fraction `alpha` of a
-non-genuine author's papers are manipulated (near-instant review, distribution
-MANIP_DIST), the rest behave genuinely. A fast gap gives LR < 1 and lowers
-genuineness; MANIP_DIST[typical] = 0 makes LR_typical = 1/(1-alpha), so a typical
-gap is mild positive evidence.
-
-Combined in log space (weight of evidence, additive over gaps):
-    log odds(genuine|E) = log odds(genuine) + SUM log LR_i
-A very small posterior is reported as log10-odds (never a misleading 0.000), and
-the ranking is by weight of evidence. Absolute posteriors are overconfident at
-large n (gaps are not perfectly independent), so lean on the ranking and the
-sensitivity sweeps: alpha, prior, the manipulation shape m_b, and the outer
-z-bin edge (the mild_fast/typical boundary, swept over p10..p25 -- the "why p15
-and not p25" question -- by re-binning the corpus and re-ranking).
+non-genuine author's papers are manipulated, the rest behave genuinely. A fast
+gap gives LR < 1 and lowers genuineness; MANIP_DIST[typical] = 0 makes
+LR_typical = 1/(1-alpha), so a typical gap is mild positive evidence.
 
 Leave-one-author: when scoring author A, A's own papers are subtracted from the
-baseline A is compared against -- judged against peers, not itself. Genuine
-baseline uses a Laplace-smoothed back-off (threshold checked on post-exclusion
-counts); pages=unknown is treated as missing:
+baseline A is compared against. Genuine baseline uses a Laplace-smoothed
+back-off (threshold checked on post-exclusion counts); pages=unknown is treated
+as missing:
     journal type+pages  ->  journal type (pages marginal)  ->  pooled type
 
 Outputs (bbn_baselines/): bbn_v4_ranking.csv (all scored authors, summary rows)
 and bbn_v4_scored.json (ALL scored authors with the full per-gap evidence
-breakdown, most-suspicious first; each carries a `shortlisted` flag for the
-P(genuine) < threshold subset). The threshold governs only the terminal output,
-never what is written to disk.
+breakdown, least genuine first; each carries a `shortlisted` flag for the
+P(genuine) < threshold subset).
 
 Run from this directory (BBN/), any venv (stdlib only):
     python bbn_infer_v4.py                  # score the corpus
@@ -86,28 +67,16 @@ CANDIDATE_Z_THRESHOLD = -3.0             # Westerbaan's outlier cut: >=1 paper w
 PRIOR_GENUINE = 0.95
 PRIOR_GENUINE_SWEEP = [0.99, 0.98, 0.95, 0.90, 0.80]
 
-ALPHA = 0.20                             # fraction of a non-genuine author's papers that are manipulated.
-                                         # Chronic-gamer target: ~1 in 5 papers gamed. A higher alpha both
-                                         # matches "consistent gaming" and makes clean papers exonerate
-                                         # harder (LR_typical = 1/(1-alpha)), so an occasional-fast author
-                                         # with a long clean record drops off while a chronic one stays.
-ALPHA_SWEEP = [0.10, 0.15, 0.20, 0.25, 0.30]
+ALPHA = 0.50                             # fraction of a non-genuine author's papers that are manipulated.
+                                         # MUST be paired with MIN_GAPS_SCORED (because it sweeps in single-
+                                         # paper authors)
+ALPHA_SWEEP = [0.10, 0.20, 0.30, 0.40, 0.50]
 
-# What a manipulated paper's gap looks like (the not_genuine component) -- the one
-# elicited piece. Keys must match z_bins; sums to 1. Tuned for the CHRONIC-gamer
-# target: the peak sits on very_extreme (a consistently very-fast review), with
-# ultra reduced so a single catastrophic gap cannot outrank a sustained pattern,
-# and mild_fast kept ~neutral (near its ~0.10 genuine rate) so benign efficient
-# authors are not swept in. typical=0 makes LR_typical = 1/(1-alpha). Sensitivity
-# to this shape is reported via the m_b sweep.
+# What a manipulated paper's gap looks like (the not_genuine component). 
+# Sensitivity to this shape is reported via the m_b sweep.
 MANIP_DIST = {"typical": 0.0, "mild_fast": 0.10, "extreme": 0.25,
               "very_extreme": 0.40, "ultra_extreme": 0.25}
-
-# Alternative manipulation shapes for the m_b sensitivity sweep. Every shape puts
-# zero mass on `typical` (manipulation never slows a review) and differs only in
-# how the remaining mass is spread over the fast bins: `deep-tail` emphasizes a
-# single catastrophic gap (one-off severe), `shallow` emphasizes a chronic run of
-# mildly-fast gaps, `uniform` is agnostic. `baseline` is the chronic-tuned MANIP_DIST.
+# Alternative manipulation shapes for the m_b sensitivity sweep.
 MANIP_SWEEP = {
     "baseline":  {"typical": 0.0, "mild_fast": 0.10, "extreme": 0.25, "very_extreme": 0.40, "ultra_extreme": 0.25},
     "deep-tail": {"typical": 0.0, "mild_fast": 0.05, "extreme": 0.15, "very_extreme": 0.30, "ultra_extreme": 0.50},
@@ -115,34 +84,22 @@ MANIP_SWEEP = {
     "shallow":   {"typical": 0.0, "mild_fast": 0.40, "extreme": 0.30, "very_extreme": 0.20, "ultra_extreme": 0.10},
 }
 
-LAPLACE = 0.5
+LAPLACE = 0.5                             # Laplace smoothing for the genuine baseline (adds LAPLACE to each bin,
+                                          # then renormalizes).
+
+MIN_GAPS_SCORED = 5                       # minimum usable papers before an author is scorable at all.
+
 MIN_STRATUM = 30                          # papers needed (post-exclusion) to trust a journal stratum
+
 SHORTLIST_THRESHOLD = 0.50                # P(genuine) below this -> reported shortlist + full evidence breakdown
+
 SWEEP_PRINT_CAP = 12                      # cap printed sensitivity rows
 
 # Percentiles to try for the OUTER z-bin edge (the mild_fast/typical boundary) in
 # the discretization sensitivity sweep. 15 is the model's default (matches the
-# extract's p15 cut); 10 and 25 are the neighbouring choices the thesis calls
-# "similarly defensible". Only the outer edge moves -- the fast-tail cuts
-# p0.1/p1/p5 stay fixed -- and candidacy (z < CANDIDATE_Z_THRESHOLD) is on the
-# continuous z, so the candidate SET is identical across the sweep; only the
-# genuine baseline and the exoneration weight of near-typical gaps change.
+# extract's p15 cut).
 Z_OUTER_PCT_SWEEP = [10, 15, 20, 25]
 Z_OUTER_PCT_DEFAULT = 15
-
-
-def log_odds_to_p(log_odds):
-    """P(genuine) from log-odds, overflow-safe. Underflows to 0.0 only when the true
-    posterior is below ~1e-308 -- report weight-of-evidence (log_odds) in that regime."""
-    if log_odds >= 0:
-        return 1.0 / (1.0 + math.exp(-log_odds))
-    e = math.exp(log_odds)
-    return e / (1.0 + e)
-
-
-def fmt_p(p):
-    """Never render a non-zero posterior as a misleading 0.000."""
-    return f"{p:.4f}" if p >= 1e-4 else f"{p:.2e}"
 
 
 # ---------------------------------------------------------------------------
@@ -244,30 +201,28 @@ def score_author(gaps, journals, pooled, bins, alpha, prior_genuine, want_detail
     return log_odds_to_p(log_odds), log_odds, detail
 
 
-def iter_candidates(data, z_threshold=CANDIDATE_Z_THRESHOLD):
-    """Yield (identity, label, gaps) for every author with >=1 gap at z < z_threshold.
-
-    Matches Westerbaan's outlier definition (a single paper with z < -3 flags the
-    author). Once flagged, ALL of the author's usable papers are yielded as
-    `gaps` -- the candidacy check only decides WHO gets scored, not what evidence
-    is used to score them.
+def iter_candidates(data, z_threshold=CANDIDATE_Z_THRESHOLD, min_gaps=MIN_GAPS_SCORED):
+    """Yield (identity, label, gaps) for every author with >=1 gap at z < z_threshold
+    and at least `min_gaps` usable papers.
     """
     papers = data["papers"]
     labels = data.get("author_labels", {})
     for ident, dois in data["author_index"].items():
         gaps = [{**papers[d], "doi": d} for d in dois if d in papers]
+        if len(gaps) < min_gaps:
+            continue
         if any(g["z"] < z_threshold for g in gaps):
             yield ident, labels.get(ident, ident), gaps
 
 
 def rank_corpus(data, alpha=ALPHA, prior=PRIOR_GENUINE, manip=MANIP_DIST,
-                z_threshold=CANDIDATE_Z_THRESHOLD):
+                z_threshold=CANDIDATE_Z_THRESHOLD, min_gaps=MIN_GAPS_SCORED):
     """Return rows sorted by P(genuine) ascending; each row carries its gaps."""
     bins = data["config"]["z_bins"]
     journals = data["journals"]
     pooled = build_pooled(journals, bins)
     rows = []
-    for ident, label, gaps in iter_candidates(data, z_threshold):
+    for ident, label, gaps in iter_candidates(data, z_threshold, min_gaps):
         post, log_odds, _ = score_author(gaps, journals, pooled, bins, alpha, prior, manip=manip)
         nontyp = sum(1 for g in gaps if g["z_bin"] != "typical")
         worst = min(gaps, key=lambda g: g["z"])
@@ -310,12 +265,6 @@ def _bin_of(z, edges):
 def rebin_corpus(data, outer_pct):
     """A shallow copy of `data` with every paper re-binned under a different outer
     edge and the per-journal genuine baseline counts rebuilt to match.
-
-    Everything is re-derived from each paper's continuous `z`, so the returned
-    corpus is internally consistent (papers and baselines share one binning). The
-    baseline is rebuilt from the `papers` dict, which the extract fills with every
-    usable paper -- so this is faithful for a whole-corpus extract; a --journal
-    restricted corpus would rebuild the baseline on the restricted set only.
     """
     edges = _edges_for_outer(data["config"], outer_pct)
     bins = data["config"]["z_bins"]
@@ -339,7 +288,7 @@ def rebin_corpus(data, outer_pct):
 
 
 # ---------------------------------------------------------------------------
-# Result breakdowns (thesis Tables: confidence tier + journals)
+# Result functions for console output
 # ---------------------------------------------------------------------------
 
 def tier_of(n_gaps):
@@ -382,6 +331,19 @@ def print_breakdowns(rows, shortlist, min_journal=5, cap=25):
             break
         print(f"  {str(jid):<12}{c:>12}")
 
+def log_odds_to_p(log_odds):
+    """P(genuine) from log-odds, overflow-safe. Underflows to 0.0 only when the true
+    posterior is below ~1e-308 -- report weight-of-evidence (log_odds) in that regime."""
+    if log_odds >= 0:
+        return 1.0 / (1.0 + math.exp(-log_odds))
+    e = math.exp(log_odds)
+    return e / (1.0 + e)
+
+
+def fmt_p(p):
+    """Never render a non-zero posterior as a misleading 0.000."""
+    return f"{p:.4f}" if p >= 1e-4 else f"{p:.2e}"
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -394,6 +356,8 @@ def main():
                         help="P(genuine) below which an author is shortlisted")
     parser.add_argument("--z-threshold", type=float, default=CANDIDATE_Z_THRESHOLD,
                         help="candidacy cut: an author is scored if >=1 gap has z below this")
+    parser.add_argument("--min-gaps", type=int, default=MIN_GAPS_SCORED,
+                        help="minimum usable papers before an author is scored (see MIN_GAPS_SCORED)")
     parser.add_argument("--selftest", action="store_true", help="run synthetic validation and exit")
     args = parser.parse_args()
 
@@ -407,10 +371,13 @@ def main():
 
     assert set(MANIP_DIST) == set(data["config"]["z_bins"]), "MANIP_DIST keys must match z_bins"
 
-    rows, journals, pooled, bins = rank_corpus(data, ALPHA, PRIOR_GENUINE, z_threshold=args.z_threshold)
+    rows, journals, pooled, bins = rank_corpus(data, ALPHA, PRIOR_GENUINE,
+                                               z_threshold=args.z_threshold,
+                                               min_gaps=args.min_gaps)
     shortlist = [r for r in rows if r["p_genuine"] < args.threshold]
 
-    print(f"Model: {data['model']} | z_threshold={args.z_threshold} | alpha={ALPHA} | "
+    print(f"Model: {data['model']} | z_threshold={args.z_threshold} | "
+          f"min_gaps={args.min_gaps} | alpha={ALPHA} | "
           f"prior P(genuine)={PRIOR_GENUINE} | MANIP_DIST={MANIP_DIST}")
     print(f"Scored {len(rows)} authors (>=1 gap with z < {args.z_threshold}); "
           f"{len(shortlist)} below threshold {args.threshold}.")
@@ -435,7 +402,7 @@ def main():
     # Everything scored is persisted here, ordered most-suspicious first; the
     # P(genuine) < threshold cut only governs the terminal output below, not what
     # is written. Each author carries a `shortlisted` flag so the P<0.5 subset is
-    # trivially recoverable, but nothing is dropped from the file.
+    # recoverable.
     authors_out = []
     for r in rows:
         _, _, detail = score_author(r["gaps"], journals, pooled, bins, ALPHA, PRIOR_GENUINE, True)
@@ -507,7 +474,7 @@ def main():
         # --- m_b (manipulation-shape) sensitivity -------------------------
         # Vary only the shape of the elicited manipulation distribution. First the
         # P table for the top of the shortlist, then a ranking-stability summary
-        # over the WHOLE shortlist (re-ranks the corpus per shape -- takes a bit).
+        # over the WHOLE shortlist.
         print(f"\n=== MANIP-SHAPE (m_b) SENSITIVITY  (P(genuine), alpha={ALPHA}, prior={PRIOR_GENUINE}; top {len(sweep)}) ===")
         print("  shape       " + "  ".join(f"{l:>11}" for l in labels))
         for sname, mdist in MANIP_SWEEP.items():
@@ -522,7 +489,8 @@ def main():
         print(f"\n=== m_b RANKING STABILITY vs baseline (baseline shortlist n={len(shortlist)}) ===")
         print("  (in-common = authors shortlisted under both; |Drank| = position shift within the shortlist order)")
         for sname, mdist in MANIP_SWEEP.items():
-            rows_s, *_ = rank_corpus(data, ALPHA, PRIOR_GENUINE, manip=mdist, z_threshold=args.z_threshold)
+            rows_s, *_ = rank_corpus(data, ALPHA, PRIOR_GENUINE, manip=mdist,
+                                     z_threshold=args.z_threshold, min_gaps=args.min_gaps)
             sl_s = [r for r in rows_s if r["p_genuine"] < args.threshold]
             pos_s = {r["ident"]: i for i, r in enumerate(sl_s)}
             common = base_set & set(pos_s)
@@ -534,15 +502,13 @@ def main():
         # --- z-edge (typical boundary) sensitivity ------------------------
         # Move ONLY the outer mild_fast/typical edge (p10..p25); the fast-tail
         # cuts p0.1/p1/p5 are held fixed. Candidacy is z<threshold on the
-        # continuous z, so the candidate set does not change -- this isolates how
-        # the exoneration boundary alone reshapes the ranking. Each point re-bins
-        # every paper and rebuilds the genuine baseline (rebin_corpus), then
-        # re-ranks. Requires the corpus to carry config.z_percentiles.
+        # continuous z, so the candidate set does not change.
         pcts = data.get("config", {}).get("z_percentiles", {})
         needed = [px for px in Z_OUTER_PCT_SWEEP if f"p{px}" in pcts]
         if f"p{Z_OUTER_PCT_DEFAULT}" in pcts and len(needed) >= 2:
             reb_rows = {px: rank_corpus(rebin_corpus(data, px), ALPHA, PRIOR_GENUINE,
-                                        z_threshold=args.z_threshold)[0] for px in needed}
+                                        z_threshold=args.z_threshold,
+                                        min_gaps=args.min_gaps)[0] for px in needed}
             # faithfulness: rebuilt-default binning should reproduce the stored z_bin
             reb_def = rebin_corpus(data, Z_OUTER_PCT_DEFAULT)["papers"]
             drift = sum(1 for d, p in reb_def.items()
@@ -660,7 +626,10 @@ def selftest():
     #    z<-3 candidacy bar, are NOT candidates; those with a gap past it are.
     data = {"papers": {"A1": A[0], "C1": C[0], "D1": D[0], "E1": E[0]},
             "author_index": {"AuthA": ["A1"], "AuthC": ["C1"], "AuthD": ["D1"], "AuthE": ["E1"]}}
-    cand = {ident for ident, _, _ in iter_candidates(data)}
+    # These synthetic authors hold one paper each, so every candidacy check below
+    # pins min_gaps=1 explicitly: it isolates the z<-3 rule from the corpus-level
+    # MIN_GAPS_SCORED default, which is exercised separately in 5c.
+    cand = {ident for ident, _, _ in iter_candidates(data, min_gaps=1)}
     check("candidate set = {AuthA, AuthD, AuthE} (typical-only AuthC excluded)",
           cand == {"AuthA", "AuthD", "AuthE"})
 
@@ -668,16 +637,33 @@ def selftest():
     #     excluded: the cut is strictly "<", matching Westerbaan's "<-3" wording.
     boundary_data = {"papers": {"B1": gap("very_extreme", CANDIDATE_Z_THRESHOLD, "B1")},
                      "author_index": {"AuthB": ["B1"]}}
-    cand_boundary = {ident for ident, _, _ in iter_candidates(boundary_data)}
+    cand_boundary = {ident for ident, _, _ in iter_candidates(boundary_data, min_gaps=1)}
     check("author with z exactly at the threshold is NOT a candidate (strict <)",
           cand_boundary == set())
+
+    # 5c. min_gaps gates on record length only, and is a no-op at 1.
+    #     AuthA/AuthC/AuthD/AuthE each hold a single paper, so any min_gaps > 1
+    #     empties the candidate set; a 2-paper author survives min_gaps=2.
+    check("min_gaps=1 is a no-op on the candidate set",
+          {i for i, _, _ in iter_candidates(data, min_gaps=1)} == cand)
+    check(f"MIN_GAPS_SCORED default ({MIN_GAPS_SCORED}) is applied when min_gaps is omitted",
+          {i for i, _, _ in iter_candidates(data)}
+          == (cand if MIN_GAPS_SCORED <= 1 else set()))
+    check("min_gaps=2 drops every single-paper candidate",
+          {i for i, _, _ in iter_candidates(data, min_gaps=2)} == set())
+    two_paper = {"papers": {"A1": A[0], "T1": C[0]},
+                 "author_index": {"AuthLong": ["A1", "T1"]}}
+    check("min_gaps=2 keeps a 2-paper author whose worst gap clears z<-3",
+          {i for i, _, _ in iter_candidates(two_paper, min_gaps=2)} == {"AuthLong"})
+    check("min_gaps=3 drops that same 2-paper author",
+          {i for i, _, _ in iter_candidates(two_paper, min_gaps=3)} == set())
 
     # ORCID identity -> display label resolved, orcid column populated
     odata = {"config": {"z_bins": bins}, "journals": journals,
              "papers": {"P1": A[0]},
              "author_index": {"0000-0001-2345-6789": ["P1"]},
              "author_labels": {"0000-0001-2345-6789": "Jane Doe"}}
-    orows = rank_corpus(odata)[0]
+    orows = rank_corpus(odata, min_gaps=1)[0]
     check("ORCID identity -> name=label and orcid column set",
           orows[0]["name"] == "Jane Doe" and orows[0]["orcid"] == "0000-0001-2345-6789")
 
@@ -689,7 +675,8 @@ def selftest():
 
     # 7. ranking orders ascending by P(genuine) (= ascending weight of evidence)
     rows, *_ = rank_corpus({"config": {"z_bins": bins}, "journals": journals,
-                            "papers": data["papers"], "author_index": data["author_index"]})
+                            "papers": data["papers"], "author_index": data["author_index"]},
+                           min_gaps=1)
     ps = [r["p_genuine"] for r in rows]
     check("ranking is sorted ascending by P(genuine)", ps == sorted(ps))
 
@@ -723,7 +710,8 @@ def selftest():
           c15["typical"] == 1 and c15["mild_fast"] == 0
           and c25["typical"] == 0 and c25["mild_fast"] == 1)
     check("candidate set is edge-invariant (z<-3 candidacy is on continuous z)",
-          {i for i, _, _ in iter_candidates(reb15)} == {i for i, _, _ in iter_candidates(reb25)})
+          {i for i, _, _ in iter_candidates(reb15, min_gaps=1)}
+          == {i for i, _, _ in iter_candidates(reb25, min_gaps=1)})
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     if not ok:

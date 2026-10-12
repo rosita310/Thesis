@@ -1,34 +1,20 @@
 """
-Matching authors based on ORCIDs instead of names -- step 1 of 2: project (doi, name, ordinal, orcid)
-out of the local DBLP RDF store for the Springer DOIs we care about.
+ORCID-based author matching, step 1 of 2: project (doi, name, ordinal, orcid) out
+of the local DBLP store for our Springer DOIs.
 
-DBLP RDF model (verified against https://dblp.org/rdf/docu/):
-  ?pub dblp:doi ?doi ; dblp:hasSignature ?sig .
-  ?sig dblp:signatureDblpName ?name ;          # name as printed on this paper
-       dblp:signatureOrdinal  ?ordinal ;       # author position (1-based)
-       dblp:signatureOrcid    ?orcid ;         # ORCID for this authorship (optional)
-       dblp:signatureCreator  ?person .        # the dblp Person (?person dblp:orcid ...)
-We take ORCID from the signature, falling back to the Person's ORCID.
+A DBLP ORCID sits on the signature, or failing that on the Person it creates.
+Reaching both needs a nested OPTIONAL, which fans out where a Person carries
+several dblp:orcid values: the same authorship returns once per candidate.
+resolve_signatures() collapses that client-side and assigns an ORCID only when it
+is unambiguous -- the ORCID is the BBN's identity key, so a wrong one merges or
+splits an author and shifts n_gaps.
 
-This script does not touch PostgreSQL. It reads the Springer DOIs from a plain
-text file (one DOI per line) that you export once:
-
-    \\copy (SELECT DISTINCT doi FROM springer.articles) TO 'springer_dois.txt'
-
-Local store: pyoxigraph (embedded, pip install pyoxigraph) by default; or point
---endpoint at any SPARQL HTTP endpoint (Fuseki/Virtuoso/live dblp). The SPARQL is
-identical either way.
-
-Typical use:
-    # one-time: bulk-load the DBLP N-Triples dump into an on-disk oxigraph store
-    # (dblp.nt.gz from dblp.org/rdf; loaded directly, no need to gunzip)
-    python dblp_orcid_extract.py --store ./dblp_store --load dblp.nt.gz
-    # then project for our DOIs
+    python dblp_orcid_extract.py --store ./dblp_store --load
     python dblp_orcid_extract.py --store ./dblp_store --dois springer_dois.txt --out dblp_orcid_raw.tsv
-    # or against an HTTP endpoint instead of a local store:
-    python dblp_orcid_extract.py --endpoint http://localhost:3030/dblp/sparql --dois springer_dois.txt
+    python dblp_orcid_extract.py --selftest
 
-    python dblp_orcid_extract.py --selftest    # validates query/term construction, no store
+springer_dois.txt is one DOI per line, exported once:
+    \\copy (SELECT DISTINCT doi FROM springer.articles) TO 'springer_dois.txt'
 """
 
 from __future__ import annotations
@@ -37,36 +23,49 @@ import argparse
 import csv
 import os
 import re
+import time
+from collections import defaultdict
+from pathlib import Path
 
 DBLP_PREFIX = "PREFIX dblp: <https://dblp.org/rdf/schema#>"
 
 _ORCID_RE = re.compile(r"(\d{4}-\d{4}-\d{4}-\d{3}[\dxX])")
 
+SOLUTION_DIR = Path(__file__).resolve().parents[3]
+DUMP_NAME = "dblp.nt"
 
-# ---------------------------------------------------------------------------
-# Pure helpers (unit-tested via --selftest)
-# ---------------------------------------------------------------------------
+
+def dblp_dump():
+    """Unpacking dblp.nt.gz leaves the file either in solution/ or in a folder of
+    the same name, so accept both."""
+    p = SOLUTION_DIR / DUMP_NAME
+    if p.is_dir():
+        p = p / DUMP_NAME
+    if not p.is_file():
+        raise SystemExit(f"{p} not found -- unpack dblp.nt.gz (gunzip / 7z x) into "
+                         f"{SOLUTION_DIR}.")
+    return str(p)
+
+
+# --- Pure helpers (unit-tested via --selftest) ------------------------------
 
 def _esc_literal(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def doi_term(doi):
-    """SPARQL term to match against dblp:doi. DBLP stores the DOI as an IRI
-    https://doi.org/<DOI> with the suffix uppercased (confirmed via --debug; the
-    bare/literal/lowercase variants returned 0 matches)."""
+    """DBLP stores the DOI as an uppercased doi.org IRI; other forms match nothing."""
     return f"<https://doi.org/{doi.upper()}>"
 
 
 def build_query(dois):
-    """SELECT projecting (sdoi, name, ordinal, orcid) for a batch of DOIs.
-
-    ?sdoi is the original Springer DOI (kept so results map back); ?doi is the
-    uppercased doi.org IRI actually matched against dblp:doi.
-    """
+    """?sdoi carries the original Springer DOI so results map back. The two ORCID
+    sources stay separate instead of being COALESCEd, so resolve_signatures() can
+    see them disagree. One query, not two: a second pass for the Person fallback
+    measured slower, as it re-walks the same publication->signature join."""
     pairs = "\n    ".join(f'("{_esc_literal(d)}" {doi_term(d)})' for d in dois)
     return f"""{DBLP_PREFIX}
-SELECT ?sdoi ?name ?ordinal ?orcid WHERE {{
+SELECT ?sdoi ?name ?ordinal ?sorcid ?corcid WHERE {{
   VALUES (?sdoi ?doi) {{
     {pairs}
   }}
@@ -76,7 +75,6 @@ SELECT ?sdoi ?name ?ordinal ?orcid WHERE {{
   OPTIONAL {{ ?sig dblp:signatureOrdinal ?ordinal }}
   OPTIONAL {{ ?sig dblp:signatureOrcid ?sorcid }}
   OPTIONAL {{ ?sig dblp:signatureCreator ?person . OPTIONAL {{ ?person dblp:orcid ?corcid }} }}
-  BIND(COALESCE(?sorcid, ?corcid) AS ?orcid)
 }}"""
 
 
@@ -93,96 +91,103 @@ def batched(seq, n):
         yield seq[i:i + n]
 
 
-# ---------------------------------------------------------------------------
-# Store backends -- both expose run_query(sparql) -> list[dict[str, str|None]]
-# ---------------------------------------------------------------------------
+# --- Store ------------------------------------------------------------------
 
 class OxigraphStore:
-    def __init__(self, path):
+    def __init__(self, path, read_only=False):
         from pyoxigraph import Store
-        self.store = Store(path)
+        if read_only:
+            if not hasattr(Store, "read_only"):
+                raise SystemExit("--read-only needs pyoxigraph >= 0.4.")
+            self.store = Store.read_only(path)
+        else:
+            self.store = Store(path)
 
-    def load(self, dump_path):
-        import gzip
+    def load(self):
         from pyoxigraph import RdfFormat
-        base = dump_path[:-3] if dump_path.endswith(".gz") else dump_path
-        if base.endswith(".nt"):
-            fmt = RdfFormat.N_TRIPLES
-        elif base.endswith(".ttl"):
-            fmt = RdfFormat.TURTLE
-        else:
-            fmt = RdfFormat.RDF_XML
-        print(f"Bulk-loading {dump_path} ({fmt}) into the store -- can take 10-30+ min "
-              f"and tens of GB of disk ...")
-        # pyoxigraph does not auto-decompress .gz, so stream-decompress it here and
-        # feed the decompressed bytes to bulk_load (no giant uncompressed file on disk).
-        if dump_path.endswith(".gz"):
-            with gzip.open(dump_path, "rb") as f:
-                self.store.bulk_load(f, format=fmt)
-        else:
-            self.store.bulk_load(path=dump_path, format=fmt)
-        print("Load complete.")
-
-    def run_query(self, sparql):
-        out = []
-        for sol in self.store.query(sparql):
-            out.append({v: (sol[v].value if sol[v] is not None else None)
-                        for v in ("sdoi", "name", "ordinal", "orcid")})
-        return out
+        path = dblp_dump()
+        print(f"Bulk-loading {path} -- can take 10-30+ min and tens of GB of disk.")
+        t0 = time.perf_counter()
+        self.store.bulk_load(path=path, format=RdfFormat.N_TRIPLES)
+        print(f"Load complete in {time.perf_counter() - t0:.0f} s.")
 
     def run_raw(self, sparql):
         res = self.store.query(sparql)
         names = [str(v).lstrip("?") for v in res.variables]
-        out = []
-        for sol in res:
-            out.append({n: (sol[i].value if sol[i] is not None else None)
-                        for i, n in enumerate(names)})
-        return out
+        return [{n: (sol[i].value if sol[i] is not None else None)
+                 for i, n in enumerate(names)} for sol in res]
 
 
-class HttpStore:
-    def __init__(self, endpoint):
-        self.endpoint = endpoint
+# --- Projection -------------------------------------------------------------
 
-    def load(self, dump_path):
-        raise SystemExit("--load is only for --store (oxigraph); load the dump into your endpoint separately.")
-
-    def run_query(self, sparql):
-        import json
-        import urllib.parse
-        import urllib.request
-        data = urllib.parse.urlencode({"query": sparql}).encode()
-        req = urllib.request.Request(
-            self.endpoint, data=data,
-            headers={"Accept": "application/sparql-results+json"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            res = json.load(resp)
-        out = []
-        for b in res.get("results", {}).get("bindings", []):
-            out.append({v: (b[v]["value"] if v in b else None)
-                        for v in ("sdoi", "name", "ordinal", "orcid")})
-        return out
-
-    def run_raw(self, sparql):
-        import json
-        import urllib.parse
-        import urllib.request
-        data = urllib.parse.urlencode({"query": sparql}).encode()
-        req = urllib.request.Request(self.endpoint, data=data,
-                                     headers={"Accept": "application/sparql-results+json"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            res = json.load(resp)
-        vars_ = res.get("head", {}).get("vars", [])
-        return [{v: (b[v]["value"] if v in b else None) for v in vars_}
-                for b in res.get("results", {}).get("bindings", [])]
+def _sig_key(row):
+    """Not the signature node itself: DBLP models signatures as blank nodes,
+    whose labels are not stable references."""
+    return (row.get("sdoi"), row.get("name"), row.get("ordinal"))
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def resolve_signatures(rows, stats=None):
+    """One row per signature, keeping an ORCID only where the candidates agree.
+    Order is preserved; pass a dict as `stats` for the per-source counts."""
+    own, person, order = defaultdict(set), defaultdict(set), []
+    for r in rows:
+        k = _sig_key(r)
+        if k not in own:
+            order.append(k)
+            own[k]                      # touch, so a no-ORCID signature still exists
+        o = norm_orcid(r.get("sorcid"))
+        if o:
+            own[k].add(o)
+        c = norm_orcid(r.get("corcid"))
+        if c:
+            person[k].add(c)
 
-def debug(store, sample_doi="10.1007/s00799-023-00361-6"):
-    """Inspect the store: is it loaded, what namespace, how is dblp:doi serialized?"""
+    st = stats if stats is not None else {}
+    out = []
+    for k in order:
+        sdoi, name, ordinal = k
+        o_own, o_per = own[k], person[k]
+        if len(o_own) == 1:
+            orcid, src = next(iter(o_own)), "own"
+        elif len(o_own) > 1:
+            orcid, src = None, "own_ambiguous"
+        elif len(o_per) == 1:
+            orcid, src = next(iter(o_per)), "person"
+        elif len(o_per) > 1:
+            orcid, src = None, "person_ambiguous"
+        else:
+            orcid, src = None, "none"
+        st[src] = st.get(src, 0) + 1
+        out.append({"sdoi": sdoi, "name": name, "ordinal": ordinal, "orcid": orcid})
+    return out
+
+
+def raw_rows(rows):
+    """The historical projection, fan-out kept. Only for --no-dedupe."""
+    return [{"sdoi": r.get("sdoi"), "name": r.get("name"),
+             "ordinal": r.get("ordinal"),
+             "orcid": norm_orcid(r.get("sorcid")) or norm_orcid(r.get("corcid"))}
+            for r in rows]
+
+
+def read_dois(path):
+    """One DOI per line; tolerates a BOM, quotes, blank lines and a header row."""
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} not found. Export it from DBeaver (SELECT DISTINCT "
+                         f"doi FROM springer.articles -> Export resultset -> CSV, no header).")
+    dois = []
+    with open(path, encoding="utf-8-sig") as f:
+        for ln in f:
+            d = ln.strip().strip('"').strip("'").strip()
+            if d and d.lower() != "doi":
+                dois.append(d)
+    return dois
+
+
+# --- Commands ---------------------------------------------------------------
+
+def debug(store):
+    """Is the store loaded, what namespace, how is dblp:doi serialized?"""
     def show(label, q):
         print(f"\n--- {label} ---")
         try:
@@ -195,33 +200,121 @@ def debug(store, sample_doi="10.1007/s00799-023-00361-6"):
         for r in rows[:15]:
             print("  " + " | ".join(f"{k}={v}" for k, v in r.items()))
 
-    show("A. store non-empty? (any 3 triples)",
-         "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 3")
-    show("B. dblp:doi sample values (is the predicate/namespace right + value format)",
+    show("A. store non-empty?", "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 3")
+    show("B. dblp:doi sample values",
          "PREFIX dblp: <https://dblp.org/rdf/schema#> "
          "SELECT ?o WHERE { ?s dblp:doi ?o } LIMIT 10")
-    show("C. distinct predicates (what namespace is actually used)",
+    show("C. distinct predicates",
          "SELECT DISTINCT ?p WHERE { ?s ?p ?o } LIMIT 50")
 
 
+def audit_orcids(store, args):
+    """Report the ORCID fan-out over the first N DOIs. Writes nothing."""
+    dois = read_dois(args.dois)[:args.audit]
+    print(f"Auditing {len(dois)} DOIs (batch={args.batch}) ...")
+
+    t0 = time.perf_counter()
+    n_raw = n_sig = 0
+    stats = {}
+    worst = []
+    for batch in batched(dois, args.batch):
+        rows = store.run_raw(build_query(batch))
+        n_raw += len(rows)
+        n_sig += len(resolve_signatures(rows, stats))
+        cand = defaultdict(set)
+        for r in rows:
+            for key in ("sorcid", "corcid"):
+                o = norm_orcid(r.get(key))
+                if o:
+                    cand[_sig_key(r)].add(o)
+        worst.extend((len(v), k) for k, v in cand.items() if len(v) > 1)
+    elapsed = time.perf_counter() - t0
+
+    amb = stats.get("own_ambiguous", 0) + stats.get("person_ambiguous", 0)
+    print(f"\n  elapsed             : {elapsed:.2f} s")
+    print(f"  raw rows            : {n_raw}")
+    print(f"  distinct signatures : {n_sig}")
+    print(f"  duplicate rows      : {n_raw - n_sig} "
+          f"({100 * (n_raw - n_sig) / max(n_raw, 1):.2f}% of raw rows)")
+    print("\n  ORCID source breakdown (per signature):")
+    print(f"    from the signature  : {stats.get('own', 0)}")
+    print(f"    from creator Person : {stats.get('person', 0)}")
+    print(f"    none available      : {stats.get('none', 0)}")
+    print(f"    SUPPRESSED ambiguous: {amb} "
+          f"({100 * amb / max(n_sig, 1):.2f}% of signatures)")
+    if worst:
+        worst.sort(key=lambda t: t[0], reverse=True)   # keys may hold None; sort on the count only
+        print("\n  worst offenders (candidate ORCIDs for one authorship):")
+        for n, (doi, name, ordinal) in worst[:10]:
+            print(f"    {n} ORCIDs  {doi} | {name} | ord {ordinal}")
+
+
 def verify_doi_matches(store, sample):
-    """Fail fast if the DOI serialization doesn't match (empty store / format drift)."""
-    n = len(store.run_query(build_query(sample)))
+    """Fail fast on an empty store or a changed DOI serialization."""
+    n = len(store.run_raw(build_query(sample)))
     if n == 0:
-        raise SystemExit(
-            "No DBLP matches on the sample -- is the store loaded and do these DOIs "
-            "exist in DBLP? Inspect with:  --store <path> --debug")
+        raise SystemExit("No DBLP matches on the sample -- is the store loaded? "
+                         "Inspect with:  --store <path> --debug")
     print(f"DOI match confirmed on sample: {n} signature rows from {len(sample)} DOIs.")
+
+
+def extract(store, args):
+    dois = read_dois(args.dois)
+    print(f"{len(dois)} Springer DOIs to look up.")
+    verify_doi_matches(store, dois[:args.batch])
+
+    t0 = time.perf_counter()
+    n_rows = n_orcid = 0
+    stats = {}
+    seen_doi = set()
+    n_batches = (len(dois) + args.batch - 1) // args.batch
+    mode = "raw fan-out (historical)" if args.no_dedupe else "one row per signature"
+    print(f"Extraction, {n_batches} batches of {args.batch} DOIs -- {mode}.")
+    with open(args.out, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["doi", "dblp_name", "ordinal", "orcid"])
+        for bi, batch in enumerate(batched(dois, args.batch), 1):
+            rows = store.run_raw(build_query(batch))
+            for r in (raw_rows(rows) if args.no_dedupe else resolve_signatures(rows, stats)):
+                seen_doi.add(r["sdoi"])
+                orcid = r["orcid"] or ""
+                w.writerow([r["sdoi"], r["name"] or "", r["ordinal"] or "", orcid])
+                n_rows += 1
+                n_orcid += bool(orcid)
+            if bi % 20 == 0:
+                print(f"  ...{bi}/{n_batches} batches, {n_rows} signature rows, "
+                      f"{n_orcid} with an ORCID")
+
+    matched = len(seen_doi)
+    print(f"\nElapsed: {time.perf_counter() - t0:.1f} s "
+          f"({len(dois)} DOIs, batch={args.batch}, {mode}).")
+    print(f"Wrote {args.out}: {n_rows} signature rows for "
+          f"{matched}/{len(dois)} DOIs ({matched / max(len(dois), 1):.1%} found in DBLP); "
+          f"{n_orcid} rows carry an ORCID ({n_orcid / max(n_rows, 1):.1%}).")
+    if stats:
+        amb = stats.get("own_ambiguous", 0) + stats.get("person_ambiguous", 0)
+        print(f"  ORCID source: {stats.get('own', 0)} from the signature, "
+              f"{stats.get('person', 0)} from the creator Person, "
+              f"{stats.get('none', 0)} none available, "
+              f"{amb} SUPPRESSED as ambiguous "
+              f"({stats.get('own_ambiguous', 0)} signature / "
+              f"{stats.get('person_ambiguous', 0)} Person carried >1 ORCID).")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Project DBLP ORCIDs for Springer DOIs.")
     ap.add_argument("--store", help="path to an on-disk pyoxigraph store")
-    ap.add_argument("--endpoint", help="SPARQL HTTP endpoint URL (instead of --store)")
-    ap.add_argument("--load", help="bulk-load this RDF dump into --store, then exit")
+    ap.add_argument("--load", action="store_true",
+                    help=f"bulk-load {DUMP_NAME} from {SOLUTION_DIR} into --store, then exit")
     ap.add_argument("--dois", default="springer_dois.txt", help="one DOI per line")
     ap.add_argument("--out", default="dblp_orcid_raw.tsv")
     ap.add_argument("--batch", type=int, default=200, help="DOIs per SPARQL VALUES block")
+    ap.add_argument("--read-only", action="store_true",
+                    help="open --store without the write lock (pyoxigraph >= 0.4)")
+    ap.add_argument("--audit", type=int, metavar="N",
+                    help="report the ORCID fan-out over the first N DOIs; writes nothing")
+    ap.add_argument("--no-dedupe", action="store_true",
+                    help="reproduce the historical raw output, fan-out and all")
     ap.add_argument("--debug", action="store_true", help="inspect the store (diagnose 0-match)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -229,50 +322,20 @@ def main():
     if args.selftest:
         return selftest()
 
-    if not args.store and not args.endpoint:
-        raise SystemExit("Provide --store <path> (pyoxigraph) or --endpoint <url>.")
-    store = OxigraphStore(args.store) if args.store else HttpStore(args.endpoint)
+    if not args.store:
+        raise SystemExit("Provide --store <path>.")
+    store = OxigraphStore(args.store, read_only=args.read_only)
 
     if args.load:
-        return store.load(args.load)
-
+        return store.load()
     if args.debug:
         return debug(store)
-
-    if not os.path.exists(args.dois):
-        raise SystemExit(f"{args.dois} not found. Export it from DBeaver (SELECT DISTINCT "
-                         f"doi FROM springer.articles -> Export resultset -> CSV, no header).")
-    with open(args.dois, encoding="utf-8-sig") as f:        # -sig strips a BOM if present
-        dois = []
-        for ln in f:
-            d = ln.strip().strip('"').strip("'").strip()    # tolerate quotes/whitespace
-            if d and d.lower() != "doi":                    # skip a stray header row
-                dois.append(d)
-    print(f"{len(dois)} Springer DOIs to look up.")
-
-    verify_doi_matches(store, dois[:200])
-
-    n_rows = 0
-    seen_doi = set()
-    with open(args.out, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(["doi", "dblp_name", "ordinal", "orcid"])
-        for bi, batch in enumerate(batched(dois, args.batch), 1):
-            for r in store.run_query(build_query(batch)):
-                seen_doi.add(r["sdoi"])
-                w.writerow([r["sdoi"], r["name"] or "", r["ordinal"] or "",
-                            norm_orcid(r["orcid"]) or ""])
-                n_rows += 1
-            if bi % 20 == 0:
-                print(f"  ...{bi} batches, {n_rows} signature rows so far")
-    matched_dois = len(seen_doi)
-    print(f"\nWrote {args.out}: {n_rows} signature rows for "
-          f"{matched_dois}/{len(dois)} DOIs ({matched_dois/max(len(dois),1):.1%} found in DBLP).")
+    if args.audit is not None:
+        return audit_orcids(store, args)
+    return extract(store, args)
 
 
-# ---------------------------------------------------------------------------
-# Self-test (pure string/format logic; no store)
-# ---------------------------------------------------------------------------
+# --- Self-test (pure logic; no store) ---------------------------------------
 
 def selftest():
     ok = True
@@ -281,27 +344,68 @@ def selftest():
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
         ok = ok and cond
 
-    check("doi_term is an uppercased doi.org IRI",
+    def row(doi, name, ordinal, sorcid=None, corcid=None):
+        return {"sdoi": doi, "name": name, "ordinal": ordinal,
+                "sorcid": sorcid, "corcid": corcid}
+
+    def orcids(rows, stats=None):
+        return [r["orcid"] for r in resolve_signatures(rows, stats)]
+
+    check("doi_term uppercases into a doi.org IRI",
           doi_term("10.1007/s00799-abc") == "<https://doi.org/10.1007/S00799-ABC>")
-    check("literal escaping helper", _esc_literal('a"b') == 'a\\"b')
-
-    check("orcid from bare", norm_orcid("0000-0002-1825-0097") == "0000-0002-1825-0097")
-    check("orcid from IRI",
-          norm_orcid("https://orcid.org/0000-0002-1825-0097") == "0000-0002-1825-0097")
-    check("orcid X checksum kept", norm_orcid("0000-0002-1694-233X") == "0000-0002-1694-233X")
-    check("no orcid -> None", norm_orcid("") is None and norm_orcid(None) is None)
-
-    q = build_query(["10.1007/a", "10.1007/b"])
-    check("query has VALUES pairs mapping sdoi -> uppercased IRI",
-          '("10.1007/a" <https://doi.org/10.1007/A>)' in q
-          and '("10.1007/b" <https://doi.org/10.1007/B>)' in q)
-    check("query selects the 4 projection vars",
-          "SELECT ?sdoi ?name ?ordinal ?orcid" in q)
-    check("query uses signature + COALESCE for orcid",
-          "dblp:hasSignature" in q and "COALESCE(?sorcid, ?corcid)" in q)
-
+    check("quotes in a DOI stay escaped", _esc_literal('a"b') == 'a\\"b')
+    check("norm_orcid strips the IRI, keeps the X checksum, else None",
+          norm_orcid("https://orcid.org/0000-0002-1825-0097") == "0000-0002-1825-0097"
+          and norm_orcid("0000-0002-1694-233x") == "0000-0002-1694-233X"
+          and norm_orcid("") is None and norm_orcid(None) is None)
     check("batched splits correctly",
           list(batched([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]])
+
+    q = build_query(["10.1007/a", "10.1007/b"])
+    check("VALUES maps each raw DOI to its uppercased IRI",
+          '("10.1007/a" <https://doi.org/10.1007/A>)' in q
+          and '("10.1007/b" <https://doi.org/10.1007/B>)' in q)
+    check("both ORCID sources projected separately, no COALESCE",
+          "SELECT ?sdoi ?name ?ordinal ?sorcid ?corcid" in q and "COALESCE" not in q)
+
+    check("SOLUTION_DIR points at solution/", SOLUTION_DIR.name == "solution")
+    try:
+        print(f"  [ -- ] dump: {dblp_dump()}")
+    except SystemExit as e:
+        print(f"  [WARN] {e}")
+
+    st = {}
+    check("signature ORCID, else Person ORCID, else none -- one row each, in order",
+          orcids([row("10.1/a", "A One", "1", sorcid="0000-0001-2345-6789"),
+                  row("10.1/a", "B Two", "2", corcid="https://orcid.org/0000-0002-1825-0097"),
+                  row("10.1/a", "C Three", "3")], st)
+          == ["0000-0001-2345-6789", "0000-0002-1825-0097", None]
+          and (st.get("own"), st.get("person"), st.get("none")) == (1, 1, 1))
+
+    st = {}
+    check("a Person carrying several ORCIDs -> one row, ORCID suppressed",
+          orcids([row("10.1/c", "E Five", "5", corcid=f"0000-0002-0000-000{i}")
+                  for i in (1, 2, 3)], st) == [None]
+          and st.get("person_ambiguous") == 1)
+
+    st = {}
+    check("a signature carrying several ORCIDs -> one row, ORCID suppressed",
+          orcids([row("10.1/d", "F Six", "1", sorcid=f"0000-0002-1111-000{i}")
+                  for i in (1, 2)], st) == [None]
+          and st.get("own_ambiguous") == 1)
+
+    check("repeated rows agreeing on one ORCID collapse and keep it",
+          orcids([row("10.1/e", "G Seven", "1", sorcid="0000-0002-2222-3333")] * 2)
+          == ["0000-0002-2222-3333"])
+
+    check("the signature's own ORCID wins over an ambiguous Person",
+          orcids([row("10.1/f", "H", "1", "0000-0003-4444-5555", "0000-0003-9999-0001"),
+                  row("10.1/f", "H", "1", "0000-0003-4444-5555", "0000-0003-9999-0002")])
+          == ["0000-0003-4444-5555"])
+
+    check("--no-dedupe keeps one row per candidate ORCID",
+          len(raw_rows([row("10.1/c", "E Five", "5", corcid=f"0000-0002-0000-000{i}")
+                        for i in (1, 2, 3)])) == 3)
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     if not ok:
