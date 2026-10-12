@@ -48,10 +48,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import os
 import re
+import sys
 from collections import defaultdict
 
 _ORCID_RE = re.compile(r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$")
@@ -788,4 +790,6 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")    # author names do not fit the Windows console codepage
     main()

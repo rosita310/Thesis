@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import io
 import json
 import math
 import os
@@ -568,4 +569,6 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")    # titles do not fit the Windows console codepage
     main()
