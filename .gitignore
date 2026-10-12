@@ -10,24 +10,24 @@ geckodriver.log
 .fake
 solution/.env
 venv
-/solution/SelfReview/ACM/data
-/solution/SelfReview/ACM/progress.json
+/solution/SelfReviewAttack/ACM/data
+/solution/SelfReviewAttack/ACM/progress.json
 logs
 dblp.nt.gz
 dblp.nt
-/solution/SelfReview/Springer/scraper/data
-/solution/SelfReview/Springer/scraper/progress.json
-/solution/SelfReview/Springer/scraper/.chrome_profile
+/solution/SelfReviewAttack/Springer/scraper/data
+/solution/SelfReviewAttack/Springer/scraper/progress.json
+/solution/SelfReviewAttack/Springer/scraper/.chrome_profile
 /solution/CoauthorAttack/ACM/data
 /solution/CoauthorAttack/ACM/parsing.log
 /solution/CoauthorAttack/IEEE/data
 /solution/CoauthorAttack/IEEE/parsing.log
 /solution/CoauthorAttack/IEEE/unmapped_roles.txt
 
-/solution/SelfReview/Springer/BBN/bbn_baselines
-/solution/SelfReview/Springer/BBN/dblp_store
-/solution/SelfReview/Springer/BBN/dblp_orcid_raw.tsv
-/solution/SelfReview/Springer/BBN/springer_dois.txt
+/solution/SelfReviewAttack/Springer/BBN/bbn_baselines
+/solution/SelfReviewAttack/Springer/BBN/dblp_store
+/solution/SelfReviewAttack/Springer/BBN/dblp_orcid_raw.tsv
+/solution/SelfReviewAttack/Springer/BBN/springer_dois.txt
 
 /solution/PCMemberAttack/ACM/data
 /solution/PCMemberAttack/ACM/parsing.log
