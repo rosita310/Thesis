@@ -98,3 +98,17 @@ MIN_CONTROL_NODES = 3        # pre-tenure co-authorships needed for a per-editor
 PLACEBO_SAMPLES = 50_000     # Monte-Carlo draws per editor
 PLACEBO_SEED = 3             # each editor's draws are seeded from this and their id
 PLACEBO_RECORD_BANDS = [2, 10, 50, 200]   # publication-count bands for matched stand-ins
+
+# ---------------------------------------------------------------------------
+# The injection test (bbn_inject.py)
+# ---------------------------------------------------------------------------
+
+# Coerced papers planted in every scored editor's record, one run per count.
+INJECT_PAPERS = [0, 1, 2, 3, 5, 8, 12, 20]
+INJECT_COAUTHORS = 3         # co-authors per coerced paper: the median of the suspect papers
+# one-off:  every coerced paper has new co-authors, so each co-authorship is `single`
+# standing: the same co-authors on every coerced paper, so `repeated` from R_min papers on
+# model:    the state of each co-authorship drawn from MANIP_DIST, the model's own m(s)
+INJECT_PROFILES = ["one-off", "standing", "model"]
+INJECT_HOST_BANDS = [2, 10]  # bands of the editor's own suspect papers: <=2 | 3-10 | >10
+INJECT_SEED = 7

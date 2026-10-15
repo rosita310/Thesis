@@ -206,19 +206,22 @@ def node_lr(state, gdist, alpha, manip=MANIP_DIST, fit="", fdist=None,
 
 def score_editor(nodes, ref: Reference, alpha=ALPHA, prior=PRIOR,
                  manip=MANIP_DIST, condition_on_career_stage=CONDITION_ON_CAREER_STAGE,
-                 manip_fit=MANIP_FIT):
+                 manip_fit=MANIP_FIT, own=None):
     """log_odds = log prior_odds + SUM load * log LR over one editor's nodes.
 
-    Returns (P(genuine), log_odds, detail), with one detail record per node.
+    `own` are the editor's nodes that the reference counts, and so the ones the
+    baseline leaves out; by default all of `nodes`. Returns (P(genuine),
+    log_odds, detail), with one detail record per node.
     """
+    own = nodes if own is None else own
     log_odds = math.log(prior / (1 - prior))
     detail = []
     for node in nodes:
-        gdist, level = genuine_dist(ref, node["journal"], node["career_stage"], nodes,
+        gdist, level = genuine_dist(ref, node["journal"], node["career_stage"], own,
                                     condition_on_career_stage=condition_on_career_stage)
         fit = node.get("fit", "") if ref.fit_base else ""
         fdist, flevel = (fit_dist(ref, node["journal"], node["state"],
-                                  node.get("network_band"), nodes)
+                                  node.get("network_band"), own)
                          if fit else (None, ""))
         lr = node_lr(node["state"], gdist, alpha, manip, fit, fdist, manip_fit)
         contribution = node["load"] * math.log(lr)

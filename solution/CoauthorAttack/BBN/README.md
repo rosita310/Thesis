@@ -51,7 +51,8 @@ The dump stages are cached; `--force` redoes them.
 `bbn_infer.py` scores the corpus and writes `bbn/bbn_cs2_ranking.csv` and
 `bbn/bbn_cs2_scored.json`, with the publishers of each editor. `bbn_report.py` prints the
 diagnostics and sensitivity sweeps, and `bbn_placebo.py` runs the within-paper placebo tests and
-writes `bbn/bbn_cs2_placebo.csv`.
+writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` plants coerced papers in every editor's record
+and writes how often the model then shortlists them to `bbn/bbn_cs2_injection.csv`.
 
 ```
 python ../IEEE/parse_json_to_DB.py         # once, and after new IEEE front matter
@@ -61,6 +62,7 @@ python bbn_extract.py --stage all
 python bbn_infer.py
 python bbn_report.py
 python bbn_placebo.py
+python bbn_inject.py
 ```
 
 Only the two loaders, `dblp_extract.py` and `bbn_extract.py --stage pairs` need the database; the
