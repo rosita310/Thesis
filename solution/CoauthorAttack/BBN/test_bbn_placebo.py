@@ -102,6 +102,14 @@ def test_permutation_null():
           and results[0]["n_papers"] == 4)
     check("observed and expected are summed over the editor's papers",
           approx(results[0]["observed"], 4.0) and approx(results[0]["expected"], 4 * 2 / 3))
+    one = placebo.exact_test([{"editor": "S", "observed": 1.0, "alternatives": [0.0]}],
+                             samples=2000)[0]
+    check("one paper with one stand-in cannot reach p <= 0.05, so its null never does",
+          one["min_p"] > 0.05 and one["null_share"][0.05] == 0.0)
+    check("the null share stays at or below the nominal level, up to Monte-Carlo noise",
+          all(r["null_share"][q] <= q + 0.02
+              for r in placebo.exact_test(extreme + flat, samples=4000)
+              for q in placebo.P_LEVELS))
 
 
 def test_partner_patterns():

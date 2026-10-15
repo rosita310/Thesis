@@ -20,7 +20,7 @@ import json
 import math
 import random
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
@@ -29,6 +29,8 @@ from bbn_extract import (BoardIndex, PeopleIndex, band_of, collaboration_network
 from cs2_config import (BBN_DIR, FIT_MIN_COLLABS, NETWORK_BANDS, PLACEBO_RECORD_BANDS,
                         PLACEBO_SAMPLES, PLACEBO_SEED, REPORTS_DIR)
 from dblp_extract import as_bool, load_mapping, pct, read_csv
+
+P_LEVELS = (0.01, 0.05, 0.10, 0.25)   # p-value levels of the per-editor test report
 
 class Pool(NamedTuple):
     """One suspect paper x editor. `signers[0]` is the editor, the rest are non-board signers."""
@@ -214,8 +216,20 @@ def cluster_by_editor(editors, observed, comparator):
     return kept, [statistics.fmean(d) for d in per_editor.values()]
 
 
+def null_p_values(draws: Counter, samples) -> list[tuple]:
+    """(p, number of draws) for every value the null statistic took: the p-value a
+    draw of that value would get. With few papers only a few values are possible,
+    so a small p may be out of reach."""
+    out, at_least = [], 0
+    for value in sorted(draws, reverse=True):
+        at_least += draws[value]
+        out.append(((at_least + 1) / (samples + 1), draws[value]))
+    return out
+
+
 def exact_test(units, samples=PLACEBO_SAMPLES) -> list[dict]:
-    """Per editor: a Monte-Carlo permutation p-value over their own papers' stand-ins.
+    """Per editor: a Monte-Carlo permutation p-value over their own papers' stand-ins,
+    and how often the null itself reaches each level of P_LEVELS.
 
     Each editor has their own generator, seeded from PLACEBO_SEED and their id.
     """
@@ -225,13 +239,18 @@ def exact_test(units, samples=PLACEBO_SAMPLES) -> list[dict]:
     results = []
     for editor, choices in by_editor.items():
         rng = random.Random(f"{PLACEBO_SEED}:{editor}")
-        observed = sum(c[0] for c in choices)
+        observed = round(sum(c[0] for c in choices), 9)
         expected = sum(statistics.fmean(c) for c in choices)
-        at_least = sum(1 for _ in range(samples)
-                       if sum(rng.choice(c) for c in choices) >= observed - 1e-9)
+        draws = Counter(round(sum(rng.choice(c) for c in choices), 9)
+                        for _ in range(samples))
+        at_least = sum(k for v, k in draws.items() if v >= observed)
+        null = null_p_values(draws, samples)
         results.append({"editor": editor, "n_papers": len(choices),
                         "observed": observed, "expected": expected,
-                        "p": (at_least + 1) / (samples + 1)})
+                        "p": (at_least + 1) / (samples + 1),
+                        "min_p": min(p for p, _ in null),
+                        "null_share": {q: sum(k for p, k in null if p <= q) / samples
+                                       for q in P_LEVELS}})
     results.sort(key=lambda r: (r["p"], -(r["observed"] - r["expected"])))
     return results
 
@@ -296,14 +315,20 @@ def report_pattern_fit(pools, net_path) -> None:
 
 
 def report_exact_test(results, samples) -> None:
-    """The share of editors at or below each p, against the share chance gives."""
+    """The share of editors at or below each p, against the share the null gives.
+
+    The null share is averaged over the editors' own null distributions: an editor
+    with one or two papers often cannot reach a small p at all.
+    """
     n = len(results)
     print(f"\n  exact permutation null over {n} editors "
           f"({samples} draws each), on the venue-locked statistic:")
-    ps = [r["p"] for r in results]
-    for q in (0.01, 0.05, 0.10, 0.25):
-        print(f"    P(p <= {q:<5}) = {sum(1 for x in ps if x <= q) / n:>7.4f}"
-              f"   (expected {q})")
+    for q in P_LEVELS:
+        observed = sum(1 for r in results if r["p"] <= q) / n
+        null = statistics.fmean(r["null_share"][q] for r in results)
+        reachable = sum(1 for r in results if r["min_p"] <= q)
+        print(f"    P(p <= {q:<5}) = {observed:>7.4f}   (null {null:.4f}, nominal {q}; "
+              f"reachable for {reachable} editors)")
 
 
 def write_results_csv(path, results, labels) -> None:

@@ -91,6 +91,9 @@ OUTSIDE_READINGS = ["any", "strict"]   # strict: a venue the editor also edits i
 
 MIN_CONTROL_NODES = 3        # pre-tenure co-authorships needed for a per-editor comparison
 
+# Entry conditions: rank only editors with at least this many suspect papers (n_min).
+MIN_RECORD_SWEEP = [1, 2, 3, 5]
+
 # ---------------------------------------------------------------------------
 # The placebo (bbn_placebo.py)
 # ---------------------------------------------------------------------------
@@ -106,9 +109,12 @@ PLACEBO_RECORD_BANDS = [2, 10, 50, 200]   # publication-count bands for matched 
 # Coerced papers planted in every scored editor's record, one run per count.
 INJECT_PAPERS = [0, 1, 2, 3, 5, 8, 12, 20]
 INJECT_COAUTHORS = 3         # co-authors per coerced paper: the median of the suspect papers
-# one-off:  every coerced paper has new co-authors, so each co-authorship is `single`
-# standing: the same co-authors on every coerced paper, so `repeated` from R_min papers on
-# model:    the state of each co-authorship drawn from MANIP_DIST, the model's own m(s)
-INJECT_PROFILES = ["one-off", "standing", "model"]
+INJECT_COAUTHOR_SWEEP = [1, 5]   # the one-off profile again with these numbers of co-authors
+# one-off:   every coerced paper has new co-authors, so each co-authorship is `single`
+# standing:  the same co-authors on every coerced paper, so `repeated` from R_min papers on
+# model:     the state of each co-authorship drawn from MANIP_DIST, the model's own m(s)
+# follow-up: every coerced co-author later publishes once with the editor elsewhere, so
+#            `outside_1`: a coercion the tie cannot see
+INJECT_PROFILES = ["one-off", "standing", "model", "follow-up"]
 INJECT_HOST_BANDS = [2, 10]  # bands of the editor's own suspect papers: <=2 | 3-10 | >10
 INJECT_SEED = 7

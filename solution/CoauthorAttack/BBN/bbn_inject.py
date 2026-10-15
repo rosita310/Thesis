@@ -22,8 +22,8 @@ from collections import defaultdict
 
 from bbn_infer import (corpus_path_argument, load_corpus, log_odds_to_p,
                        passes_inout_gate, rank_corpus, reference, score_editor)
-from cs2_config import (INJECT_COAUTHORS, INJECT_HOST_BANDS, INJECT_PAPERS,
-                        INJECT_PROFILES, INJECT_SEED, MANIP_DIST, PRIOR,
+from cs2_config import (INJECT_COAUTHOR_SWEEP, INJECT_COAUTHORS, INJECT_HOST_BANDS,
+                        INJECT_PAPERS, INJECT_PROFILES, INJECT_SEED, MANIP_DIST, PRIOR,
                         SHORTLIST_THRESHOLD)
 
 # The node fields a score depends on; planted nodes that agree on all of them merge.
@@ -47,6 +47,8 @@ def planted_states(profile, papers, rng, repeated_min, coauthors=INJECT_COAUTHOR
         states, weights = zip(*MANIP_DIST.items())
         return [(rng.choices(states, weights)[0], 1 / coauthors)
                 for _ in range(papers * coauthors)]
+    if profile == "follow-up":
+        return [("outside_1", 1 / coauthors)] * (papers * coauthors)
     raise ValueError(f"unknown injection profile {profile!r}")
 
 
@@ -68,10 +70,11 @@ class Donors:
         return rng.choice(pool) if pool else {}
 
 
-def planted_nodes(journal, profile, papers, rng, donors, repeated_min):
+def planted_nodes(journal, profile, papers, rng, donors, repeated_min,
+                  coauthors=INJECT_COAUTHORS):
     """The co-authorships of `papers` coerced papers in `journal`."""
     nodes = []
-    for state, load in planted_states(profile, papers, rng, repeated_min):
+    for state, load in planted_states(profile, papers, rng, repeated_min, coauthors):
         donor = donors.draw(journal, state, rng)
         nodes.append({"journal": journal, "state": state, "load": load,
                       "career_stage": donor.get("career_stage", "established"),
@@ -123,8 +126,15 @@ def host_band(n_papers, edges=INJECT_HOST_BANDS):
     return f">{edges[-1]}"
 
 
+def runs():
+    """(profile, co-authors per paper): every profile at INJECT_COAUTHORS, and the
+    one-off profile again at each count of INJECT_COAUTHOR_SWEEP."""
+    return ([(p, INJECT_COAUTHORS) for p in INJECT_PROFILES]
+            + [("one-off", c) for c in INJECT_COAUTHOR_SWEEP])
+
+
 def run(data):
-    """One trial per scored editor, profile and number of planted papers."""
+    """One trial per scored editor, run and number of planted papers."""
     ref = reference(data)
     donors = Donors(data["coauthorships"], ref.publisher_of)
     repeated_min = data["config"]["repeated_min"]
@@ -136,35 +146,38 @@ def run(data):
             continue
         real = row["woe"] * math.log(10)
         band = host_band(row["n_suspect_papers"])
-        for profile in INJECT_PROFILES:
+        for profile, coauthors in runs():
             for papers in INJECT_PAPERS:
-                rng = random.Random(f"{INJECT_SEED}|{row['ident']}|{profile}|{papers}")
+                rng = random.Random(f"{INJECT_SEED}|{row['ident']}|{profile}|"
+                                    f"{coauthors}|{papers}")
                 journal = rng.choice(seats)["journal"]
-                planted = planted_nodes(journal, profile, papers, rng, donors, repeated_min)
+                planted = planted_nodes(journal, profile, papers, rng, donors,
+                                        repeated_min, coauthors)
                 p = log_odds_to_p(real + planted_log_odds(planted, row["nodes"], ref))
                 gate = passes_inout_gate(with_planted_seat(points, journal, len(planted)))
-                trials.append({"profile": profile, "papers": papers, "band": band,
-                               "p": p, "gate": gate})
+                trials.append({"profile": profile, "coauthors": coauthors,
+                               "papers": papers, "band": band, "p": p, "gate": gate})
     return trials
 
 
 def summarise(trials):
-    """Per profile, number of papers and host band (and over all bands): the share
+    """Per run, number of papers and host band (and over all bands): the share
     shortlisted without and with the gate, and the median P(genuine)."""
     groups = defaultdict(list)
     for t in trials:
-        groups[(t["profile"], t["papers"], t["band"])].append(t)
-        groups[(t["profile"], t["papers"], "all")].append(t)
+        key = (t["profile"], t["coauthors"], t["papers"])
+        groups[key + (t["band"],)].append(t)
+        groups[key + ("all",)].append(t)
     rows = []
-    for (profile, papers, band), ts in groups.items():
+    for (profile, coauthors, papers, band), ts in groups.items():
         short = [t for t in ts if t["p"] < SHORTLIST_THRESHOLD]
-        rows.append({"profile": profile, "papers": papers, "host_band": band,
-                     "hosts": len(ts),
+        rows.append({"profile": profile, "coauthors": coauthors, "papers": papers,
+                     "host_band": band, "hosts": len(ts),
                      "shortlisted": len(short) / len(ts),
                      "shortlisted_gated": sum(t["gate"] for t in short) / len(ts),
                      "median_p": statistics.median(t["p"] for t in ts)})
-    order = {p: i for i, p in enumerate(INJECT_PROFILES)}
-    rows.sort(key=lambda r: (order[r["profile"]], r["papers"],
+    order = {r: i for i, r in enumerate(runs())}
+    rows.sort(key=lambda r: (order[(r["profile"], r["coauthors"])], r["papers"],
                              r["host_band"] != "all", r["host_band"]))
     return rows
 
@@ -182,21 +195,21 @@ def write_csv(path, rows):
 def print_table(rows):
     bands = sorted({r["host_band"] for r in rows} - {"all"},
                    key=lambda b: int(b.lstrip("<=>").split("-")[0]))
-    at = {(r["profile"], r["papers"], r["host_band"]): r for r in rows}
-    hosts = {b: at[(INJECT_PROFILES[0], 0, b)]["hosts"] for b in ["all"] + bands}
+    at = {(r["profile"], r["coauthors"], r["papers"], r["host_band"]): r for r in rows}
+    first = runs()[0]
+    hosts = {b: at[first + (0, b)]["hosts"] for b in ["all"] + bands}
     print(f"\n=== INJECTION TEST: share shortlisted (P < {SHORTLIST_THRESHOLD}) ===")
-    print(f"  {INJECT_COAUTHORS} co-authors per coerced paper; hosts: "
-          + ", ".join(f"{b} own papers {hosts[b]}" for b in bands)
+    print("  hosts: " + ", ".join(f"{b} own papers {hosts[b]}" for b in bands)
           + f", all {hosts['all']}")
-    for profile in INJECT_PROFILES:
-        print(f"\n  {profile}")
+    for profile, coauthors in runs():
+        print(f"\n  {profile}, {coauthors} co-authors per coerced paper")
         print(f"  {'papers':>6} {'no gate':>8} {'gate':>8} {'median P':>9}  "
               + "".join(f"{'own ' + b:>11}" for b in bands))
         for papers in INJECT_PAPERS:
-            a = at[(profile, papers, "all")]
+            a = at[(profile, coauthors, papers, "all")]
             print(f"  {papers:>6} {a['shortlisted']:>8.1%} {a['shortlisted_gated']:>8.1%} "
                   f"{a['median_p']:>9.3f}  "
-                  + "".join(f"{at[(profile, papers, b)]['shortlisted']:>11.1%}"
+                  + "".join(f"{at[(profile, coauthors, papers, b)]['shortlisted']:>11.1%}"
                             for b in bands))
 
 

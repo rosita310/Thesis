@@ -93,6 +93,8 @@ def test_planted_states():
              for s, _ in inject.planted_states("model", 1, rng, 2, coauthors=3)]
     check("model: states drawn from m(s), never one it gives no mass",
           "outside_5plus" not in drawn and {"single", "repeated"} <= set(drawn))
+    check("follow-up: every co-authorship has one tie outside the journal",
+          {s for s, _ in inject.planted_states("follow-up", 3, rng, 2)} == {"outside_1"})
     check("no papers, nothing planted",
           inject.planted_states("one-off", 0, rng, 2) == [])
 
@@ -149,8 +151,11 @@ def test_leave_out_is_exact():
 def test_run():
     print("\n-- the run over every editor --")
     trials = inject.run(corpus())
-    host = [t for t in trials if t["profile"] == "one-off" and t["band"] == "<=2"]
-    by_papers = {t["papers"]: t for t in host}
+    def host(profile, coauthors=inject.INJECT_COAUTHORS):
+        return {t["papers"]: t for t in trials if t["profile"] == profile
+                and t["coauthors"] == coauthors and t["band"] == "<=2"}
+
+    by_papers = host("one-off")
     real = {r["ident"]: r for r in infer.rank_corpus(corpus(), inout_gate=False)}
     check("no planted papers reproduces the real score",
           approx(by_papers[0]["p"], real["E"]["p_genuine"]))
@@ -159,10 +164,19 @@ def test_run():
           all(a > b for a, b in zip(ps, ps[1:])))
     check("one coerced paper does not clear the gate, twenty do",
           not by_papers[1]["gate"] and by_papers[20]["gate"])
+    follow_up = host("follow-up")
+    check("follow-up co-authorships (one tie outside) never lower P(genuine)",
+          all(follow_up[k]["p"] >= follow_up[0]["p"] for k in follow_up))
+    one, five = host("one-off", 1), host("one-off", 5)
+    check("the same papers weigh the same with 1 or 5 co-authors, without a fit",
+          all(approx(one[k]["p"], five[k]["p"]) for k in one))
+    check("but 5 co-authors a paper reach the gate sooner than 1",
+          sum(t["gate"] for t in five.values()) > sum(t["gate"] for t in one.values()))
     rows = inject.summarise(trials)
-    check("the summary has a row over all hosts for every profile and count",
-          {(r["profile"], r["papers"]) for r in rows if r["host_band"] == "all"}
-          == {(p, k) for p in inject.INJECT_PROFILES for k in inject.INJECT_PAPERS})
+    check("the summary has a row over all hosts for every run and count",
+          {(r["profile"], r["coauthors"], r["papers"]) for r in rows
+           if r["host_band"] == "all"}
+          == {run + (k,) for run in inject.runs() for k in inject.INJECT_PAPERS})
     check("a gated share never exceeds the ungated one",
           all(r["shortlisted_gated"] <= r["shortlisted"] for r in rows))
 

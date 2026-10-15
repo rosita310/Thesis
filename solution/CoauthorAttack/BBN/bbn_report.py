@@ -4,25 +4,29 @@ Diagnostics and sensitivity sweeps over the scored corpus, printed to the consol
 Reports: the shortlist per publisher, benign exclusions, the in/out gate, the
 journals of the shortlist,
 co-author career stage and the within-editor tenure control.
-Sweeps: alpha, the prior, m(s), the fit factor, R_min and the `outside` reading.
+Sweeps: alpha, the prior, m(s), the fit factor, R_min and the `outside` reading,
+the entry conditions (gate and minimum record), and the network against a count.
 
     python bbn_report.py [--in bbn/bbn_cs2_corpus.json]
 """
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections import Counter, defaultdict
 
 from bbn_extract import baseline_counts, classify, relabel_fit_per_publisher
-from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, rank_corpus,
-                       reference, score_editor, state_shares)
+from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
+                       rank_corpus, reference, score_editor, smooth, state_shares)
 from cs2_config import (ALPHA, ALPHA_SWEEP, INOUT_GATE, MANIP_DIST, MANIP_SWEEP,
-                        MIN_CONTROL_NODES, OUTSIDE_READINGS, PRIOR,
+                        MIN_CONTROL_NODES, MIN_RECORD_SWEEP, OUTSIDE_READINGS, PRIOR,
                         PRIOR_SWEEP, REPEATED_SWEEP, SHORTLIST_THRESHOLD)
 from dblp_extract import pct
 
 # Console layout only.
 SWEEP_PRINT_CAP = 12
+LOWEST_PRINT_CAP = 3        # ungated editors described without names
 JOURNAL_PRINT_CAP = 25
 MIN_SHORTLISTED_PER_JOURNAL = 5
 
@@ -73,6 +77,12 @@ def print_gate(rows):
           f"  ({pct(len(red), len(points))})")
     print(f"  editors with >= 1 red point      {len(passing):>6}"
           f"  ({pct(len(passing), len(plotted))})")
+    strict = [r for r in plotted if any(p["x"] > p["y"] for p in r["inout_points"])]
+    print(f"  ...with Westerbaan's strict x > y: {sum(p['x'] > p['y'] for p in points)} "
+          f"points, {len(strict)} editors")
+    print(f"  passing editors: median "
+          f"{statistics.median(r['n_suspect_papers'] for r in passing)} suspect papers, "
+          f"{sum(r['n_suspect_papers'] >= 5 for r in passing)} with >= 5")
     margins = sorted((p["x"] - p["y"] for p in points), reverse=True)
     n = len(margins)
     print("  x - y at the top of the distribution: "
@@ -240,6 +250,90 @@ def print_sweeps(data, rows, shortlist, base_pos):
                                    f"out1={shares.get('outside_1', 0):.1%}")
 
 
+def shortlisted(rows):
+    return [r for r in rows if r["p_genuine"] < SHORTLIST_THRESHOLD]
+
+
+def print_entry_conditions(ungated, base_pos):
+    """Who is ranked, not how they are scored: the gate and a minimum record.
+    `ungated` is the ranking of every scored editor."""
+    gated = [r for r in ungated if r["passes_inout_gate"]]
+    strict = [r for r in ungated if any(p["x"] > p["y"] for p in r["inout_points"] or [])]
+    print("\n=== ENTRY CONDITIONS: who is ranked, not how they are scored ===")
+    report_stability("gate x >= y (the run)", gated, base_pos)
+    report_stability("gate x > y (Westerbaan)", strict, base_pos)
+    report_stability("no gate", ungated, base_pos)
+    for n_min in MIN_RECORD_SWEEP:
+        report_stability(f"gate, >= {n_min} suspect papers",
+                         [r for r in gated if r["n_suspect_papers"] >= n_min], base_pos)
+        report_stability(f"no gate, >= {n_min} suspect papers",
+                         [r for r in ungated if r["n_suspect_papers"] >= n_min], base_pos)
+
+    short = shortlisted(ungated)
+    if not short:
+        return
+    papers = [r["n_suspect_papers"] for r in short]
+    publishers = Counter(p for r in short for p in r["publishers"].split("|") if p)
+    print(f"\n  without the gate: {len(short)} below {SHORTLIST_THRESHOLD}, "
+          f"{dict(publishers)}; median {statistics.median(papers)} suspect papers, "
+          f"{sum(p >= 5 for p in papers)} with >= 5; "
+          f"{sum(r['passes_inout_gate'] for r in short)} pass the gate; "
+          f"the gated shortlist sits at "
+          f"{[i + 1 for i, r in enumerate(short) if r['passes_inout_gate']]}")
+    print("  the lowest, without names:")
+    for i, r in enumerate(short[:LOWEST_PRINT_CAP], 1):
+        repeated = sum(n["load"] for n in r["nodes"] if n["state"] == "repeated") / r["load"]
+        print(f"    {i}. P={fmt_p(r['p_genuine'])} papers={r['n_suspect_papers']} "
+              f"co-authorships={r['n_nodes']} single={r['share_single']:.0%} "
+              f"repeated={repeated:.0%} outside={r['share_outside']:.0%} "
+              f"journals={len(r['journals'].split('|'))} "
+              f"x={r['inout_x']} y={r['inout_y']}")
+
+
+def print_count_ablation(data, ungated):
+    """The network against a count: one fixed log LR per tie class and publisher,
+    from the pooled baseline, with no per-journal baseline and no fit."""
+    ref = reference(data)
+    states = ref.states
+    log_lr = {(publisher, s): math.log(node_lr(s, smooth(merge(stages.values(), states),
+                                                         states), ALPHA))
+              for publisher, stages in ref.pooled.items() for s in states}
+    prior = math.log(PRIOR / (1 - PRIOR))
+
+    def counted(r):
+        return prior + sum(n["load"] * log_lr[(ref.publisher_of.get(n["journal"], ""),
+                                               n["state"])] for n in r["nodes"])
+
+    def locked_share(journal):
+        counts = merge(ref.journals[journal]["baseline_counts"].values(), states)
+        total = sum(counts.values())
+        return (counts["single"] + counts["repeated"]) / total if total else None
+
+    def editor_locked(r):
+        shares = [s for s in (locked_share(n["journal"]) for n in r["nodes"]) if s is not None]
+        return statistics.fmean(shares) if shares else None
+
+    def median_locked(rows):
+        values = [v for v in map(editor_locked, rows) if v is not None]
+        return f"{statistics.median(values):.1%}" if values else "-"
+
+    no_fit = {r["ident"]: r for r in rank_corpus({**data, "fit_baseline": None},
+                                                  inout_gate=False)}
+    print("\n=== THE NETWORK AGAINST A COUNT (fixed log LR per tie class and publisher) ===")
+    for label, rows in (("gate", [r for r in ungated if r["passes_inout_gate"]]),
+                        ("no gate", ungated)):
+        net = {r["ident"] for r in shortlisted(rows)}
+        count = {r["ident"] for r in rows if counted(r) < 0}
+        nofit = {r["ident"] for r in rows if no_fit[r["ident"]]["p_genuine"] < SHORTLIST_THRESHOLD}
+        print(f"  {label:<8} network {len(net)} | count {len(count)}, {len(net & count)} in common"
+              f" | network without the fit {len(nofit)}, {len(net & nofit)} in common")
+        if label == "no gate":
+            print(f"  share of venue-locked load in the editors' journals (median): "
+                  f"all {median_locked(rows)}, count only "
+                  f"{median_locked([r for r in rows if r['ident'] in count - net])}, "
+                  f"network only {median_locked([r for r in rows if r['ident'] in net - count])}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -253,13 +347,16 @@ def main():
     print(f"Ranked {len(rows)} editors; {len(shortlist)} below threshold "
           f"{SHORTLIST_THRESHOLD}.")
 
+    ungated = rank_corpus(data, inout_gate=False)
     print_publishers(rows, shortlist)
     print_benign(data)
-    print_gate(rank_corpus(data, inout_gate=False))
+    print_gate(ungated)
     print_journals(shortlist)
     print_record_diagnostic(rows, data, base_pos)
     print_tenure(rows, data)
     print_sweeps(data, rows, shortlist, base_pos)
+    print_entry_conditions(ungated, base_pos)
+    print_count_ablation(data, ungated)
 
 
 if __name__ == "__main__":
