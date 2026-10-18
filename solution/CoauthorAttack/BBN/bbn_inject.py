@@ -2,14 +2,19 @@
 Injection test: how many coerced papers does an editor need before the model
 shortlists them?
 
-Plants coerced papers in the record of every scored editor, in a journal on
-whose board they sit, scores the editor again and counts how often they fall
-below SHORTLIST_THRESHOLD, with and without the in/out gate. A planted
-co-authorship copies the career stage and the pool stats (the co-author's own
-collaborators and one-off collaborators) of a real co-authorship of the same
-state in that journal, so it gets the personal adjustment a real co-author of
-that tie gets, and differs from a genuine one only in its state. Writes
-bbn_cs2_injection.csv beside the corpus.
+Plants coerced papers in the record of one scored editor at a time, in a journal on
+whose board they sit, scores that editor again and counts how often they fall
+below SHORTLIST_THRESHOLD, with and without the in/out gate. The other editors and
+the baselines stay as they are. A planted co-authorship copies the career stage and
+the pool stats (the co-author's own collaborators and one-off collaborators) of a
+real co-authorship of the same state in that journal, so it gets the personal
+adjustment a real co-author of that tie gets, and differs from a genuine one only in
+its state.
+
+Every profile is planted in one seat. An editor on two or more boards also gets the
+one-off profile spread over two of their seats. The results are split by the
+editor's own record (INJECT_HOST_BANDS) and for the editors on two or more boards.
+Writes bbn_cs2_injection.csv beside the corpus.
 
     python bbn_inject.py [--in bbn/bbn_cs2_corpus.json]
 """
@@ -24,12 +29,14 @@ from collections import defaultdict
 
 from bbn_infer import (corpus_path_argument, load_corpus, log_odds_to_p,
                        passes_inout_gate, rank_corpus, reference, score_editor)
-from cs2_config import (INJECT_COAUTHOR_SWEEP, INJECT_COAUTHORS, INJECT_HOST_BANDS,
-                        INJECT_PAPERS, INJECT_PROFILES, INJECT_SEED, MANIP_DIST, PRIOR,
+from cs2_config import (INJECT_COAUTHORS, INJECT_HOST_BANDS, INJECT_PAPERS,
+                        INJECT_PROFILES, INJECT_SEED, MANIP_DIST, PRIOR,
                         SHORTLIST_THRESHOLD)
 
 # The node fields a score depends on; planted nodes that agree on all of them merge.
 SCORING_KEYS = ("journal", "state", "career_stage", "pool_n", "pool_oneoffs")
+
+MULTI_BOARD = "multi-board"   # the host group of editors with two or more seats
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +52,7 @@ def planted_states(profile, papers, rng, repeated_min, coauthors=INJECT_COAUTHOR
     if profile == "standing":
         state = "repeated" if papers >= repeated_min else "single"
         return [(state, papers / coauthors)] * coauthors
-    if profile == "model":
+    if profile == "mix":
         states, weights = zip(*MANIP_DIST.items())
         return [(rng.choices(states, weights)[0], 1 / coauthors)
                 for _ in range(papers * coauthors)]
@@ -73,11 +80,10 @@ class Donors:
         return rng.choice(pool) if pool else {}
 
 
-def planted_nodes(journal, profile, papers, rng, donors, repeated_min,
-                  coauthors=INJECT_COAUTHORS):
+def planted_nodes(journal, profile, papers, rng, donors, repeated_min):
     """The co-authorships of `papers` coerced papers in `journal`."""
     nodes = []
-    for state, load in planted_states(profile, papers, rng, repeated_min, coauthors):
+    for state, load in planted_states(profile, papers, rng, repeated_min):
         donor = donors.draw(journal, state, rng)
         nodes.append({"journal": journal, "state": state, "load": load,
                       "career_stage": donor.get("career_stage", "established"),
@@ -103,6 +109,11 @@ def with_planted_seat(points, journal, added):
     """The editor's in/out points after `added` new co-authors in `journal`."""
     return [{**p, "x": p["x"] + added} if p["journal"] == journal else p
             for p in points]
+
+
+def split(papers, n_seats):
+    """`papers` divided over `n_seats` seats as evenly as possible, the larger part first."""
+    return [papers // n_seats + (i < papers % n_seats) for i in range(n_seats)]
 
 
 def planted_log_odds(planted, own, ref):
@@ -131,10 +142,24 @@ def host_band(n_papers, edges=INJECT_HOST_BANDS):
 
 
 def runs():
-    """(profile, co-authors per paper): every profile at INJECT_COAUTHORS, and the
-    one-off profile again at each count of INJECT_COAUTHOR_SWEEP."""
-    return ([(p, INJECT_COAUTHORS) for p in INJECT_PROFILES]
-            + [("one-off", c) for c in INJECT_COAUTHOR_SWEEP])
+    """(profile, seats the coerced papers are spread over): every profile in one
+    seat, and the one-off profile over two seats of an editor on two or more boards."""
+    return [(p, 1) for p in INJECT_PROFILES] + [("one-off", 2)]
+
+
+def plant(row, profile, n_seats, papers, seats, ref, donors, repeated_min):
+    """P(genuine) and the gate of one editor after planting `papers` coerced papers
+    spread over `n_seats` of their `seats`."""
+    rng = random.Random(f"{INJECT_SEED}|{row['ident']}|{profile}|{n_seats}|{papers}")
+    points = row["inout_points"]
+    planted = []
+    for journal, k in zip(rng.sample(seats, n_seats), split(papers, n_seats)):
+        nodes = planted_nodes(journal, profile, k, rng, donors, repeated_min)
+        planted += nodes
+        points = with_planted_seat(points, journal, len(nodes))
+    real = row["woe"] * math.log(10)
+    p = log_odds_to_p(real + planted_log_odds(planted, row["nodes"], ref))
+    return p, passes_inout_gate(points)
 
 
 def run(data):
@@ -144,46 +169,52 @@ def run(data):
     repeated_min = data["config"]["repeated_min"]
     trials = []
     for row in rank_corpus(data, inout_gate=False):
-        points = row["inout_points"] or []
-        seats = [p for p in points if p["journal"] in ref.journals]
+        seats = [p["journal"] for p in row["inout_points"] or []
+                 if p["journal"] in ref.journals]
         if not seats:
             continue
-        real = row["woe"] * math.log(10)
-        band = host_band(row["n_suspect_papers"])
-        for profile, coauthors in runs():
+        host = {"band": host_band(row["n_suspect_papers"]), "multi_board": len(seats) >= 2}
+        for profile, n_seats in runs():
+            if n_seats > len(seats):
+                continue
             for papers in INJECT_PAPERS:
-                rng = random.Random(f"{INJECT_SEED}|{row['ident']}|{profile}|"
-                                    f"{coauthors}|{papers}")
-                journal = rng.choice(seats)["journal"]
-                planted = planted_nodes(journal, profile, papers, rng, donors,
-                                        repeated_min, coauthors)
-                p = log_odds_to_p(real + planted_log_odds(planted, row["nodes"], ref))
-                gate = passes_inout_gate(with_planted_seat(points, journal, len(planted)))
-                trials.append({"profile": profile, "coauthors": coauthors,
-                               "papers": papers, "band": band, "p": p, "gate": gate})
+                p, gate = plant(row, profile, n_seats, papers, seats, ref, donors,
+                                repeated_min)
+                trials.append({"profile": profile, "seats": n_seats, "papers": papers,
+                               **host, "p": p, "gate": gate})
     return trials
 
 
+def host_groups(trial):
+    """The host groups a trial counts in: all, its record band, and multi-board."""
+    return ["all", trial["band"]] + ([MULTI_BOARD] if trial["multi_board"] else [])
+
+
 def summarise(trials):
-    """Per run, number of papers and host band (and over all bands): the share
-    shortlisted without and with the gate, and the median P(genuine)."""
+    """Per run, number of papers and host group: the share shortlisted without and
+    with the gate, and the median P(genuine)."""
     groups = defaultdict(list)
     for t in trials:
-        key = (t["profile"], t["coauthors"], t["papers"])
-        groups[key + (t["band"],)].append(t)
-        groups[key + ("all",)].append(t)
+        for group in host_groups(t):
+            groups[(t["profile"], t["seats"], t["papers"], group)].append(t)
     rows = []
-    for (profile, coauthors, papers, band), ts in groups.items():
+    for (profile, seats, papers, group), ts in groups.items():
         short = [t for t in ts if t["p"] < SHORTLIST_THRESHOLD]
-        rows.append({"profile": profile, "coauthors": coauthors, "papers": papers,
-                     "host_band": band, "hosts": len(ts),
+        rows.append({"profile": profile, "seats": seats, "papers": papers,
+                     "hosts": group, "n_hosts": len(ts),
                      "shortlisted": len(short) / len(ts),
                      "shortlisted_gated": sum(t["gate"] for t in short) / len(ts),
                      "median_p": statistics.median(t["p"] for t in ts)})
     order = {r: i for i, r in enumerate(runs())}
-    rows.sort(key=lambda r: (order[(r["profile"], r["coauthors"])], r["papers"],
-                             r["host_band"] != "all", r["host_band"]))
+    group_order = ["all"] + host_band_names() + [MULTI_BOARD]
+    rows.sort(key=lambda r: (order[(r["profile"], r["seats"])], r["papers"],
+                             group_order.index(r["hosts"])))
     return rows
+
+
+def host_band_names(edges=INJECT_HOST_BANDS):
+    """The record bands in order: <=2, 3-10, >10."""
+    return [host_band(edge) for edge in edges] + [host_band(edges[-1] + 1)]
 
 
 def write_csv(path, rows):
@@ -197,24 +228,23 @@ def write_csv(path, rows):
 
 
 def print_table(rows):
-    bands = sorted({r["host_band"] for r in rows} - {"all"},
-                   key=lambda b: int(b.lstrip("<=>").split("-")[0]))
-    at = {(r["profile"], r["coauthors"], r["papers"], r["host_band"]): r for r in rows}
-    first = runs()[0]
-    hosts = {b: at[first + (0, b)]["hosts"] for b in ["all"] + bands}
-    print(f"\n=== INJECTION TEST: share shortlisted (P < {SHORTLIST_THRESHOLD}) ===")
-    print("  hosts: " + ", ".join(f"{b} own papers {hosts[b]}" for b in bands)
-          + f", all {hosts['all']}")
-    for profile, coauthors in runs():
-        print(f"\n  {profile}, {coauthors} co-authors per coerced paper")
-        print(f"  {'papers':>6} {'no gate':>8} {'gate':>8} {'median P':>9}  "
-              + "".join(f"{'own ' + b:>11}" for b in bands))
+    at = {(r["profile"], r["seats"], r["papers"], r["hosts"]): r for r in rows}
+    groups = ["all"] + host_band_names() + [MULTI_BOARD]
+    print(f"\n=== INJECTION TEST: share shortlisted (P < {SHORTLIST_THRESHOLD}), "
+          f"with the gate / without ===")
+    print("  hosts: " + ", ".join(f"{g} {at[('one-off', 1, 0, g)]['n_hosts']}"
+                                  for g in groups))
+    for profile, seats in runs():
+        where = "in one seat" if seats == 1 else f"spread over {seats} seats"
+        print(f"\n  {profile}, {INJECT_COAUTHORS} co-authors per coerced paper, {where}")
+        print(f"  {'papers':>6}" + "".join(f"{g:>16}" for g in groups))
         for papers in INJECT_PAPERS:
-            a = at[(profile, coauthors, papers, "all")]
-            print(f"  {papers:>6} {a['shortlisted']:>8.1%} {a['shortlisted_gated']:>8.1%} "
-                  f"{a['median_p']:>9.3f}  "
-                  + "".join(f"{at[(profile, coauthors, papers, b)]['shortlisted']:>11.1%}"
-                            for b in bands))
+            cells = []
+            for g in groups:
+                r = at.get((profile, seats, papers, g))
+                cells.append(f"{r['shortlisted_gated']:>7.1%} /{r['shortlisted']:>6.1%}"
+                             if r else f"{'-':>16}")
+            print(f"  {papers:>6}" + "".join(f"{c:>16}" for c in cells))
 
 
 def main():

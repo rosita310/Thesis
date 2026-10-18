@@ -94,8 +94,8 @@ def test_planted_states():
           len(standing) == 3 and {s for s, _ in standing} == {"repeated"}
           and approx(sum(load for _, load in standing), 5.0))
     drawn = [s for _ in range(300)
-             for s, _ in inject.planted_states("model", 1, rng, 2, coauthors=3)]
-    check("model: states drawn from m(s), never one it gives no mass",
+             for s, _ in inject.planted_states("mix", 1, rng, 2, coauthors=3)]
+    check("mix: states drawn from m(s), never one it gives no mass",
           "outside_5plus" not in drawn and {"single", "repeated"} <= set(drawn))
     check("follow-up: every co-authorship has one tie outside the journal",
           {s for s, _ in inject.planted_states("follow-up", 3, rng, 2)} == {"outside_1"})
@@ -132,6 +132,9 @@ def test_seat():
           after[0]["x"] == 8 and after[1]["x"] == 0)
     check("enough new co-authors push a failing editor through the gate",
           not infer.passes_inout_gate(points) and infer.passes_inout_gate(after))
+    check("papers are split over seats as evenly as possible, the larger part first",
+          inject.split(5, 2) == [3, 2] and inject.split(4, 2) == [2, 2]
+          and inject.split(0, 2) == [0, 0] and inject.split(3, 1) == [3])
 
 
 # --- scoring ------------------------------------------------------------------
@@ -142,7 +145,7 @@ def test_leave_out_is_exact():
     ref = infer.reference(data)
     rng = random.Random(3)
     donors = inject.Donors(data["coauthorships"], ref.publisher_of)
-    planted = inject.planted_nodes("J1", "model", 4, rng, donors, 2)
+    planted = inject.planted_nodes("J1", "mix", 4, rng, donors, 2)
     check("the planted co-authorships get the personal adjustment of their donors",
           all(d["adjusted"] for d in infer.score_editor(planted, ref, own=REAL)[2]))
     _, real, _ = infer.score_editor(REAL, ref)
@@ -157,12 +160,21 @@ def test_leave_out_is_exact():
     check("merging sums the load", approx(sum(n["load"] for n in inject.merged(planted)), 4.0))
 
 
+def two_board_corpus():
+    """The synthetic corpus with E also on the board of J2, a copy of J1 with the same
+    seat below the diagonal."""
+    data = corpus(points=[{"journal": "J1", "x": 2, "y": 20},
+                          {"journal": "J2", "x": 2, "y": 20}])
+    data["journals"]["J2"] = copy.deepcopy(data["journals"]["J1"])
+    return data
+
+
 def test_run():
     print("\n-- the run over every editor --")
     trials = inject.run(corpus())
-    def host(profile, coauthors=inject.INJECT_COAUTHORS):
-        return {t["papers"]: t for t in trials if t["profile"] == profile
-                and t["coauthors"] == coauthors and t["band"] == "<=2"}
+    def host(profile, seats=1, ts=trials):
+        return {t["papers"]: t for t in ts if t["profile"] == profile
+                and t["seats"] == seats and t["band"] == "<=2"}
 
     by_papers = host("one-off")
     real = {r["ident"]: r for r in infer.rank_corpus(corpus(), inout_gate=False)}
@@ -176,18 +188,27 @@ def test_run():
     follow_up = host("follow-up")
     check("follow-up co-authorships (one tie outside) never lower P(genuine)",
           all(follow_up[k]["p"] >= follow_up[0]["p"] for k in follow_up))
-    one, five = host("one-off", 1), host("one-off", 5)
-    check("the same papers weigh the same with 1 or 5 co-authors of the same habit",
-          all(approx(one[k]["p"], five[k]["p"]) for k in one))
-    check("but 5 co-authors a paper reach the gate sooner than 1",
-          sum(t["gate"] for t in five.values()) > sum(t["gate"] for t in one.values()))
+    check("an editor on one board gets no run spread over two seats",
+          not any(t["seats"] == 2 for t in trials))
     rows = inject.summarise(trials)
-    check("the summary has a row over all hosts for every run and count",
-          {(r["profile"], r["coauthors"], r["papers"]) for r in rows
-           if r["host_band"] == "all"}
-          == {run + (k,) for run in inject.runs() for k in inject.INJECT_PAPERS})
+    check("the summary has a row over all hosts for every one-seat run and count",
+          {(r["profile"], r["seats"], r["papers"]) for r in rows if r["hosts"] == "all"}
+          == {run + (k,) for run in inject.runs() if run[1] == 1
+              for k in inject.INJECT_PAPERS})
     check("a gated share never exceeds the ungated one",
           all(r["shortlisted_gated"] <= r["shortlisted"] for r in rows))
+
+    two = inject.run(two_board_corpus())
+    one_seat, spread = host("one-off", 1, two), host("one-off", 2, two)
+    check("an editor on two boards gets the one-off run spread over two seats",
+          set(spread) == set(inject.INJECT_PAPERS))
+    check("spread over two seats, no planted papers still reproduces the real score",
+          approx(spread[0]["p"], one_seat[0]["p"]))
+    check("ten papers in one seat clear the gate, five in each of two seats do not",
+          one_seat[10]["gate"] and not spread[10]["gate"])
+    check("the editor on two boards is counted in the multi-board host group",
+          any(r["hosts"] == inject.MULTI_BOARD and r["seats"] == 2
+              for r in inject.summarise(two)))
 
 
 def test_host_band():
@@ -195,6 +216,7 @@ def test_host_band():
     check("1, 2 | 3, 10 | 11 papers fall in <=2 | 3-10 | >10",
           [inject.host_band(n) for n in (1, 2, 3, 10, 11)]
           == ["<=2", "<=2", "3-10", "3-10", ">10"])
+    check("the band names come in order", inject.host_band_names() == ["<=2", "3-10", ">10"])
 
 
 def main():

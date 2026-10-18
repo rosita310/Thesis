@@ -59,6 +59,7 @@ existing `reports/journal_mapping.csv` are carried over as `verified`. Check eve
 |------------------|--------------------|------------------------------------------------------------------|
 | `pairs`          | database, extract  | suspect papers, co-authorships, board tenure, pre-tenure control |
 | `coauthors`      | dump               | every publication of the editors and co-authors                  |
+| `years`          | dump               | the year of each of those publications (co-author's career stage) |
 | `editor_authors` | dump               | authors and year of the editors' publications (in/out gate)      |
 | `signer_authors` | dump               | authors of the signers' publications (co-authors' own networks)  |
 | `corpus`         | the files above    | `bbn_cs2_corpus.json`                                            |
@@ -68,10 +69,12 @@ The dump stages are cached; `--force` redoes them.
 `bbn_infer.py` scores the corpus and writes `bbn/bbn_cs2_ranking.csv` and
 `bbn/bbn_cs2_scored.json`, with the publishers of each editor. `bbn_report.py` prints the
 diagnostics and sensitivity sweeps, and `bbn_placebo.py` runs the within-paper placebo tests and
-writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` plants coerced papers in every editor's record
-and writes how often the model then shortlists them to `bbn/bbn_cs2_injection.csv`; a planted
-co-authorship copies the career stage and pool stats of a real co-authorship of the same tie in
-that journal, so it gets the personal adjustment a real co-author of that tie gets.
+writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` plants coerced papers in one editor's record at
+a time, with the other editors and the baselines unchanged, and writes how often the model then
+shortlists them to `bbn/bbn_cs2_injection.csv`, per record band and for editors on two or more
+boards (who also get the coerced papers spread over two seats); a planted co-authorship copies
+the career stage and pool stats of a real co-authorship of the same tie in that journal, so it
+gets the personal adjustment a real co-author of that tie gets.
 
 ```
 python ../IEEE/parse_json_to_DB.py         # once, and after new IEEE front matter
