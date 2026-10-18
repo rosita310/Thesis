@@ -9,6 +9,9 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
         reads the database.
     python bbn_extract.py --stage coauthors
         Dump pass: every publication of those people.
+    python bbn_extract.py --stage years
+        Dump pass: the year of each of those publications, for the co-author's
+        career stage at the first paper with the editor.
     python bbn_extract.py --stage editor_authors
         Dump pass: authors and year of every publication of the editors.
     python bbn_extract.py --stage signer_authors
@@ -584,7 +587,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Stages: coauthors, editor_authors, signer_authors  (one dump pass each)
+# Stages: coauthors, years, editor_authors, signer_authors  (one dump pass each)
 # ---------------------------------------------------------------------------
 
 KEEP_PREDS = (SIG_PREDS - {P_SIG_ORDINAL}) | {P_SIG_PUBLICATION, P_YEAR}
@@ -653,6 +656,40 @@ def stage_coauthors(out_dir: Path, dump: Path, force: bool) -> None:
         dump, f"the signatures of {len(wanted)} people",
         lambda person, rec: {"person_id": person, "rec_key": rec}
         if person in wanted else None))
+    print("\nNext: --stage years")
+
+
+def scan_years(dump: Path, recs: set) -> list[dict]:
+    """The year of every publication in `recs` that the dump gives one."""
+    years: dict[str, str] = {}
+    start = time.time()
+    print(f"  scanning {dump} for the years of {len(recs)} publications ...")
+    with open_dump(dump) as f:
+        for i, line in enumerate(f, 1):
+            if i % PROGRESS_EVERY == 0:
+                print(f"    {i / 1e6:.0f}M lines, {len(years)} years found, "
+                      f"{time.time() - start:.0f}s")
+            if predicate_of(line) != P_YEAR:
+                continue
+            triple = parse_triple(line)
+            if triple is not None and triple[0] in recs:
+                years[triple[0]] = triple[2]
+    print(f"  done in {time.time() - start:.0f}s: {len(years)} of {len(recs)} "
+          f"publications have a year")
+    return [{"rec_key": rec, "year": year} for rec, year in sorted(years.items())]
+
+
+def stage_years(out_dir: Path, dump: Path, force: bool) -> None:
+    """The year of every publication the coauthors pass found, for the co-author's
+    career stage at the first paper with the editor."""
+    out_path = out_dir / "publication_years.csv"
+    if is_cached(out_path, force):
+        return
+    recs = {r["rec_key"] for r in read_csv(out_dir / "pid_publications.csv")}
+    if not recs:
+        sys.exit("\nERROR: pid_publications.csv is empty. Run --stage coauthors first.\n")
+    print(f"\n=== YEARS: one pass over the dump for {len(recs)} publications ===")
+    write_csv(out_path, scan_years(dump, recs))
     print("\nNext: --stage editor_authors")
 
 
@@ -743,10 +780,22 @@ def benign_reason(entry, coauthor_pubs=None) -> str:
     return ""
 
 
+def pubs_before(pubs, shared, year_of) -> int:
+    """The co-author's publications from years before their first publication with
+    the editor. Without a dated shared publication, the whole record counts."""
+    first = min((int(year_of[r]) for r in shared if year_of.get(r)), default=None)
+    if first is None:
+        return len(pubs)
+    return sum(1 for r in pubs if year_of.get(r) and int(year_of[r]) < first)
+
+
 def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN,
-                publisher_of=None):
-    """One node per (editor, journal, co-author), with its summed load, state and career stage."""
+                publisher_of=None, year_of=None):
+    """One node per (editor, journal, co-author), with its summed load, state and career
+    stage. The career stage counts the co-author's publications before the first one
+    with the editor (`year_of`: publication -> year)."""
     publisher_of = publisher_of or {}
+    year_of = year_of or {}
     grouped = defaultdict(lambda: {"load": 0.0, "n_papers": 0, "rec_keys": [],
                                    "n_front_matter": 0, "on_board": False})
     labels: dict[str, str] = {}
@@ -772,6 +821,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         outside_strict = {r for r in outside if not is_inside(r, controlled)}
         node_id = node_key(ed_id, journal, co_id)
         n_pubs = len(pubs_of.get(co_id, set()))
+        n_before = pubs_before(pubs_of.get(co_id, set()), shared, year_of)
         nodes[node_id] = {
             "editor_id": ed_id, "journal": journal,
             "publisher": publisher_of.get(journal, ""), "coauthor_id": co_id,
@@ -779,7 +829,8 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
             "load": round(entry["load"], 6), "n_shared_suspect": entry["n_papers"],
             "n_shared_inside": len(inside), "n_shared_outside": len(outside),
             "n_shared_outside_strict": len(outside_strict),
-            "coauthor_pubs": n_pubs, "career_stage": career_stage(n_pubs),
+            "coauthor_pubs": n_pubs, "coauthor_pubs_before": n_before,
+            "career_stage": career_stage(n_before),
             "state": classify(len(outside), len(inside), repeated_min),
             "n_front_matter": entry["n_front_matter"],
             "coauthor_on_board": entry["on_board"],
@@ -866,6 +917,12 @@ def print_corpus_summary(nodes, control_nodes, benign, papers,
     for state in STATES:
         print(f"  {state:<12}{by_state[state]:>8}{pct(by_state[state], len(nodes)):>9}"
               f"{load_by_state[state]:>10.1f}{pct(load_by_state[state], total_load):>12}")
+    junior = sum(n["load"] for n in nodes.values() if n["career_stage"] == "junior")
+    junior_today = sum(n["load"] for n in nodes.values()
+                       if career_stage(n["coauthor_pubs"]) == "junior")
+    print(f"  junior co-authors (at most {JUNIOR_MAX_PUBS} publications before the first "
+          f"with the editor) {pct(junior, total_load)} of the load, on their record "
+          f"today {pct(junior_today, total_load)}")
     print(f"  control nodes (pre-tenure)  {len(control_nodes)} over "
           f"{n_control_editors} editors")
     print(f"  excluded before scoring     {len(benign)} nodes, load {benign_load:.1f} "
@@ -885,6 +942,10 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     papers = read_csv(out_dir / "suspect_papers.csv")
     tenure = read_csv(out_dir / "editor_tenure.csv")
     pubs_of = publications_of(out_dir / "pid_publications.csv")
+    years_path = out_dir / "publication_years.csv"
+    if not years_path.exists():
+        sys.exit(f"\nERROR: {years_path.name} not found. Run --stage years first.\n")
+    pub_year = {row["rec_key"]: row["year"] for row in read_csv(years_path)}
 
     authors_path = out_dir / "editor_pub_authors.csv"
     authors_of_pub, year_of = defaultdict(set), {}
@@ -910,9 +971,10 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     suspect_rows = [r for r in rows if r["group"] == "suspect"]
     control_rows = [r for r in rows if r["group"] == "control"]
     nodes = build_nodes(suspect_rows, pubs_of, mapping, controlled_of,
-                        publisher_of=publisher_of)
+                        publisher_of=publisher_of, year_of=pub_year)
     control_nodes = build_nodes(control_rows, pubs_of, mapping, controlled_of,
-                                publisher_of=publisher_of)
+                                publisher_of=publisher_of, year_of=pub_year)
+    del pub_year
 
     signer_path = out_dir / "signer_pub_authors.csv"
     if signer_path.exists():
@@ -982,7 +1044,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the CS2 co-authorship BBN corpus (read-only).")
     parser.add_argument("--stage", required=True,
-                        choices=["pairs", "coauthors", "editor_authors",
+                        choices=["pairs", "coauthors", "years", "editor_authors",
                                  "signer_authors", "corpus", "all"])
     parser.add_argument("--reports-dir", default=str(REPORTS_DIR),
                         help="dblp_extract.py's --out-dir (holds extract/ and the mapping)")
@@ -995,7 +1057,7 @@ def main() -> None:
                         help="verified journal mapping CSV "
                              "(default: <reports-dir>/journal_mapping.csv)")
     parser.add_argument("--force", action="store_true",
-                        help="redo a cached dump pass (coauthors, editor_authors, "
+                        help="redo a cached dump pass (coauthors, years, editor_authors, "
                              "signer_authors)")
     args = parser.parse_args()
 
@@ -1012,6 +1074,8 @@ def main() -> None:
         stage_pairs(db, reports_dir, out_dir, mapping_path)
     if args.stage in ("coauthors", "all"):
         stage_coauthors(out_dir, dump, args.force)
+    if args.stage in ("years", "all"):
+        stage_years(out_dir, dump, args.force)
     if args.stage in ("editor_authors", "all"):
         stage_editor_authors(out_dir, dump, args.force)
     if args.stage in ("signer_authors", "all"):

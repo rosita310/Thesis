@@ -127,7 +127,7 @@ def print_record_diagnostic(rows, data, base_pos):
     nodes = [n for r in rows for n in r["nodes"]]
     stages = sorted({n["career_stage"] for n in nodes})
     print("\n=== CO-AUTHOR CAREER STAGE (diagnostic; NOT a parent of the state node) ===")
-    print("  (the co-author's record as of the dump, not as of the paper)")
+    print("  (the co-author's publications before their first one with the editor)")
     print(f"  {'career stage':<14}{'nodes':>8}{'load':>10}"
           + "".join(f"{s:>11}" for s in data["config"]["states"]))
     for stage in stages:

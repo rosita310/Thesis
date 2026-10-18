@@ -354,6 +354,12 @@ def test_scan_signatures():
     check("without years_for the rows carry no year at all",
           all("year" not in r for r in rows))
 
+    years = extract.scan_years(dump, {JKEY + "A1", CONF + "B1"})
+    check("scan_years finds the year of a wanted publication, and skips one without",
+          years == [{"rec_key": JKEY + "A1", "year": "2019"}])
+    check("scan_years ignores publications it was not asked for",
+          extract.scan_years(dump, {CONF + "B1"}) == [])
+
 
 # --- stage corpus -----------------------------------------------------------------
 
@@ -398,6 +404,21 @@ def test_build_nodes():
           a_node["career_stage"] == "established")
     check("B, whose whole record is the shared paper, is state-determined",
           b_node["benign_reason"] == "state_determined" and a_node["benign_reason"] == "")
+
+    # With years: A's first paper with E is X (2014), and A's other papers come later.
+    year_of = {JKEY + "P1": "2015", JKEY + "P2": "2016", CONF + "X": "2014"}
+    year_of.update({f"https://dblp.org/rec/conf/other/A{i}": "2020"
+                    for i in range(extract.JUNIOR_MAX_PUBS)})
+    dated = extract.build_nodes(rows, pubs, mapping, controlled_of={}, year_of=year_of)
+    check("A, established today, was junior at the first paper with E",
+          dated["E||J||A"]["career_stage"] == "junior"
+          and dated["E||J||A"]["coauthor_pubs_before"] == 0
+          and dated["E||J||A"]["coauthor_pubs"] == len(pubs["A"]))
+    check("pubs_before counts only earlier years, not the same year",
+          extract.pubs_before({"a", "b", "c", "d"}, {"c"},
+                              {"a": "2010", "b": "2014", "c": "2014"}) == 1)
+    check("pubs_before counts the whole record when no shared paper has a year",
+          extract.pubs_before({"a", "b"}, {"b"}, {"a": "2010"}) == 2)
 
     # A pair whose only outside tie is in ANOTHER journal E edits.
     strict_pubs = dict(pubs)
