@@ -5,9 +5,11 @@ shortlists them?
 Plants coerced papers in the record of every scored editor, in a journal on
 whose board they sit, scores the editor again and counts how often they fall
 below SHORTLIST_THRESHOLD, with and without the in/out gate. A planted
-co-authorship copies the fit, network band and career stage of a real
-co-authorship of the same state in that journal, so it differs from a genuine
-one only in its state. Writes bbn_cs2_injection.csv beside the corpus.
+co-authorship copies the career stage and the pool stats (the co-author's own
+collaborators and one-off collaborators) of a real co-authorship of the same
+state in that journal, so it gets the personal adjustment a real co-author of
+that tie gets, and differs from a genuine one only in its state. Writes
+bbn_cs2_injection.csv beside the corpus.
 
     python bbn_inject.py [--in bbn/bbn_cs2_corpus.json]
 """
@@ -27,7 +29,7 @@ from cs2_config import (INJECT_COAUTHOR_SWEEP, INJECT_COAUTHORS, INJECT_HOST_BAN
                         SHORTLIST_THRESHOLD)
 
 # The node fields a score depends on; planted nodes that agree on all of them merge.
-SCORING_KEYS = ("journal", "state", "career_stage", "fit", "network_band")
+SCORING_KEYS = ("journal", "state", "career_stage", "pool_n", "pool_oneoffs")
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +55,8 @@ def planted_states(profile, papers, rng, repeated_min, coauthors=INJECT_COAUTHOR
 
 
 class Donors:
-    """The real scored co-authorships a planted one copies its fit and career stage from."""
+    """The real scored co-authorships a planted one copies its career stage and pool
+    stats from."""
 
     def __init__(self, coauthorships, publisher_of):
         self.publisher_of = publisher_of
@@ -78,8 +81,8 @@ def planted_nodes(journal, profile, papers, rng, donors, repeated_min,
         donor = donors.draw(journal, state, rng)
         nodes.append({"journal": journal, "state": state, "load": load,
                       "career_stage": donor.get("career_stage", "established"),
-                      "fit": donor.get("fit", ""),
-                      "network_band": donor.get("network_band")})
+                      "pool_n": donor.get("pool_n"),
+                      "pool_oneoffs": donor.get("pool_oneoffs")})
     return nodes
 
 
@@ -105,8 +108,9 @@ def with_planted_seat(points, journal, added):
 def planted_log_odds(planted, own, ref):
     """What the planted nodes add to the editor's log-odds.
 
-    The baseline leaves out only the editor's real nodes: the planted ones were
-    never counted in it, so there is nothing of theirs to take out.
+    The baselines (the journal column and r_bar) leave out only the editor's real
+    nodes: the planted ones were never counted in them, so there is nothing of
+    theirs to take out.
     """
     _, log_odds, _ = score_editor(merged(planted), ref, own=own)
     return log_odds - math.log(PRIOR / (1 - PRIOR))

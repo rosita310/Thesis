@@ -29,14 +29,17 @@ def approx(a, b, tol=1e-9):
 # --- the synthetic corpus --------------------------------------------------
 # One ACM journal J1 whose baseline includes the host's real nodes, as the extract
 # emits it. The host E has one outside co-authorship and a seat below the diagonal.
+# Every co-author has 40 collaborators; those of the `single` co-authorships have
+# more one-offs than the rest, so a planted `single` gets a personal adjustment.
 
 STATES = ["outside_5plus", "outside_2_4", "outside_1", "repeated", "single"]
 
 
-def node(state, load, coauthor, fit="", band=None, stage="established"):
+def node(state, load, coauthor, stage="established", pool_n=40, pool_oneoffs=None):
+    oneoffs = (30 if state == "single" else 15) if pool_oneoffs is None else pool_oneoffs
     return {"editor_id": "E", "journal": "J1", "publisher": "acm", "coauthor_id": coauthor,
             "coauthor_name": coauthor, "state": state, "load": load, "career_stage": stage,
-            "fit": fit, "network_band": band}
+            "pool_n": pool_n, "pool_oneoffs": oneoffs}
 
 
 REAL = [node("outside_5plus", 2.0, "a")]
@@ -53,7 +56,6 @@ def corpus(real=REAL, points=None):
     return {"config": {"states": STATES, "repeated_min": 2, "junior_max_pubs": 10},
             "journals": {"J1": {"publisher": "acm",
                                 "baseline_counts": {"established": counts}}},
-            "fit_baseline": None,
             "coauthorships": nodes,
             "editor_index": {"E": [f"E||J1||{n['coauthor_id']}" for n in real],
                              "O": list(OTHERS)},
@@ -64,11 +66,13 @@ def corpus(real=REAL, points=None):
 
 
 def with_in_baseline(data, planted):
-    """The corpus as it would be had the planted nodes been extracted with it."""
+    """The corpus as it would be had the planted nodes been extracted with it: in
+    the journal's baseline and among the co-authorships r_bar is taken over."""
     data = copy.deepcopy(data)
     counts = data["journals"]["J1"]["baseline_counts"]["established"]
-    for n in planted:
+    for i, n in enumerate(planted):
         counts[n["state"]] = counts.get(n["state"], 0.0) + n["load"]
+        data["coauthorships"][f"E||J1||planted{i}"] = {**n, "editor_id": "E"}
     return data
 
 
@@ -100,21 +104,24 @@ def test_planted_states():
 
 
 def test_donors():
-    print("\n-- the donor of fit and career stage --")
-    real = {"x": {**node("single", 1.0, "x", fit="core", band=2, stage="junior")},
-            "y": {**node("single", 1.0, "y", fit="typical", band=1), "journal": "J2"}}
+    print("\n-- the donor of career stage and pool stats --")
+    real = {"x": node("single", 1.0, "x", stage="junior", pool_n=77, pool_oneoffs=11),
+            "y": {**node("single", 1.0, "y", pool_n=50, pool_oneoffs=5), "journal": "J2"}}
     donors = inject.Donors(real, {"J1": "acm", "J2": "acm", "J3": "acm", "K1": "ieee"})
     rng = random.Random(1)
     check("a planted node copies a real one of its state in the same journal",
-          donors.draw("J1", "single", rng)["fit"] == "core")
+          donors.draw("J1", "single", rng)["pool_n"] == 77)
     check("a journal without one falls back to the publisher",
-          donors.draw("J3", "single", rng)["fit"] in {"core", "typical"})
-    check("no real node of that state in the publisher: no donor, so no fit",
+          donors.draw("J3", "single", rng)["pool_n"] in {77, 50})
+    check("no real node of that state in the publisher: no donor",
           donors.draw("K1", "single", rng) == {})
     planted = inject.planted_nodes("J1", "one-off", 1, rng, donors, 2)
-    check("planted nodes take the donor's fit, band and career stage",
-          all(n["fit"] == "core" and n["network_band"] == 2 and n["career_stage"] == "junior"
+    check("planted nodes take the donor's pool stats and career stage",
+          all(n["pool_n"] == 77 and n["pool_oneoffs"] == 11 and n["career_stage"] == "junior"
               for n in planted))
+    bare = inject.planted_nodes("K1", "one-off", 1, rng, donors, 2)
+    check("without a donor a planted node has no pool stats, so no adjustment",
+          all(n["pool_n"] is None and n["career_stage"] == "established" for n in bare))
 
 
 def test_seat():
@@ -136,6 +143,8 @@ def test_leave_out_is_exact():
     rng = random.Random(3)
     donors = inject.Donors(data["coauthorships"], ref.publisher_of)
     planted = inject.planted_nodes("J1", "model", 4, rng, donors, 2)
+    check("the planted co-authorships get the personal adjustment of their donors",
+          all(d["adjusted"] for d in infer.score_editor(planted, ref, own=REAL)[2]))
     _, real, _ = infer.score_editor(REAL, ref)
     quick = real + inject.planted_log_odds(planted, REAL, ref)
     full_ref = infer.reference(with_in_baseline(data, planted))
@@ -160,7 +169,7 @@ def test_run():
     check("no planted papers reproduces the real score",
           approx(by_papers[0]["p"], real["E"]["p_genuine"]))
     ps = [by_papers[k]["p"] for k in sorted(by_papers)]
-    check("without a fit, every extra one-off paper lowers P(genuine)",
+    check("every extra one-off paper lowers P(genuine)",
           all(a > b for a, b in zip(ps, ps[1:])))
     check("one coerced paper does not clear the gate, twenty do",
           not by_papers[1]["gate"] and by_papers[20]["gate"])
@@ -168,7 +177,7 @@ def test_run():
     check("follow-up co-authorships (one tie outside) never lower P(genuine)",
           all(follow_up[k]["p"] >= follow_up[0]["p"] for k in follow_up))
     one, five = host("one-off", 1), host("one-off", 5)
-    check("the same papers weigh the same with 1 or 5 co-authors, without a fit",
+    check("the same papers weigh the same with 1 or 5 co-authors of the same habit",
           all(approx(one[k]["p"], five[k]["p"]) for k in one))
     check("but 5 co-authors a paper reach the gate sooner than 1",
           sum(t["gate"] for t in five.values()) > sum(t["gate"] for t in one.values()))

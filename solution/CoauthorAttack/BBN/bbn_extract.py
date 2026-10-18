@@ -12,7 +12,8 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
     python bbn_extract.py --stage editor_authors
         Dump pass: authors and year of every publication of the editors.
     python bbn_extract.py --stage signer_authors
-        Dump pass: authors of every publication of the suspect papers' signers.
+        Dump pass: authors of every publication of the suspect papers' signers:
+        the co-authors' own networks, for the personal one-off baseline.
     python bbn_extract.py --stage corpus
         Writes bbn/bbn_cs2_corpus.json.
     python bbn_extract.py --stage all
@@ -33,9 +34,9 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from cs2_config import (BBN_DIR, DUMP_PATH, ENV_PATH, FIT_MIN_COLLABS, FIT_STATES,
-                        JUNIOR_MAX_PUBS, MAX_AUTHORS, NETWORK_BANDS, OUTSIDE_BANDS,
-                        OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR, STATES)
+from cs2_config import (BBN_DIR, DUMP_PATH, ENV_PATH, JUNIOR_MAX_PUBS, MAX_AUTHORS,
+                        OUTSIDE_BANDS, OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR,
+                        STATES)
 from dblp_extract import (
     PROGRESS_EVERY, P_SIG_CREATOR, P_SIG_NAME, P_SIG_ORDINAL,
     P_SIG_PUBLICATION, P_YEAR, SIG_PREDS, TABLE_BOARD, TABLE_ISSUES, as_bool, connect,
@@ -167,16 +168,6 @@ def classify(n_outside: int, n_inside: int, repeated_min: int = REPEATED_MIN) ->
     return "repeated" if n_inside >= repeated_min else "single"
 
 
-def midrank_pct(values, x) -> float:
-    """Midrank percentile of x within values, ties averaged. 0 = lowest."""
-    n = len(values)
-    if n < 2:
-        return 0.5
-    below = sum(1 for v in values if v < x)
-    equal = sum(1 for v in values if v == x)
-    return (below + (equal - 1) / 2) / (n - 1)
-
-
 def issue_year(articles: list[dict]) -> str:
     """The year of a matched DBLP issue: the earliest year its articles carry."""
     years = sorted(a["year"] for a in articles if a.get("year"))
@@ -201,26 +192,35 @@ def publications_of(path) -> dict[str, set[str]]:
 
 
 # ---------------------------------------------------------------------------
-# The fit: where the editor sits in the co-author's own network
+# The co-author's one-off habit, from their own collaboration network
 # ---------------------------------------------------------------------------
 
-def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, dict]:
+def read_authors(path) -> dict[str, list[str]]:
+    """publication -> its author ids, from an author-list CSV (rec_key, person_id)."""
+    authors_of = defaultdict(list)
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            authors_of[row["rec_key"]].append(row["person_id"])
+    return authors_of
+
+
+def counted_authors(ids) -> set:
+    """The distinct authors of a publication the networks count: empty when it has
+    fewer than two, or more than MAX_AUTHORS."""
+    ids = set(ids)
+    return ids if 2 <= len(ids) <= MAX_AUTHORS else set()
+
+
+def networks_from(authors_of: dict, wanted: set, with_venues=False) -> tuple[dict, dict]:
     """person -> collaborator -> publications shared, and -> the venues they were in.
 
     Only the `wanted` people get a network. Without `with_venues` the second dict
     is empty.
     """
-    authors_of = defaultdict(list)
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
-            authors_of[row["rec_key"]].append(row["person_id"])
-
     depth = defaultdict(lambda: defaultdict(int))
     spread = defaultdict(lambda: defaultdict(set))
     for rec_key, ids in authors_of.items():
-        ids = set(ids)
-        if len(ids) < 2 or len(ids) > MAX_AUTHORS:
-            continue
+        ids = counted_authors(ids)
         focal = ids & wanted
         if not focal:
             continue
@@ -238,100 +238,56 @@ def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, 
     return depth, spread
 
 
-def annotate_fit(nodes: dict, depth: dict) -> None:
-    """Add `fit_pct` and `network_band` to every node, None without enough collaborators."""
-    for node in nodes.values():
-        cols = depth.get(node["coauthor_id"])
-        if not cols or len(cols) < FIT_MIN_COLLABS:
-            node["fit_pct"] = None
-            node["network_band"] = None
-            continue
-        values = list(cols.values())
-        if node["editor_id"] in cols:
-            x = cols[node["editor_id"]]
-        else:
-            # The dump pass missed the signature; the pair shares at least one paper.
-            x = 1
-            values = values + [1]
-        node["fit_pct"] = round(midrank_pct(values, x), 6)
-        node["network_band"] = band_of(len(cols), NETWORK_BANDS)
+def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, dict]:
+    """networks_from over the author lists in `path`."""
+    return networks_from(read_authors(path), wanted, with_venues)
 
 
-def fit_cuts(nodes: dict) -> dict:
-    """Load-weighted terciles of `fit_pct` within each state: {state: [lo, hi] or None}."""
-    by_state = defaultdict(list)
-    for node in nodes.values():
-        if node.get("fit_pct") is not None:
-            by_state[node["state"]].append((node["fit_pct"], node["load"]))
-    cuts = {}
-    for state, pairs in by_state.items():
-        pairs.sort()
-        total = sum(w for _, w in pairs)
-        edges, run, i = [], 0.0, 0
-        for q in (1 / 3, 2 / 3):
-            target = q * total
-            while i < len(pairs) - 1 and run + pairs[i][1] < target:
-                run += pairs[i][1]
-                i += 1
-            edges.append(pairs[i][0])
-        cuts[state] = None if edges[0] >= edges[1] else [round(e, 6) for e in edges]
-    return cuts
+def node_key(editor_id: str, journal: str, coauthor_id: str) -> str:
+    """The id of the node of one (editor, journal, co-author)."""
+    return f"{editor_id}||{journal}||{coauthor_id}"
 
 
-def fit_label(pct, state, cuts) -> str:
-    """Discretize a percentile against its own state's cuts."""
-    if pct is None:
-        return ""
-    edge = cuts.get(state)
-    if not edge:
-        return "typical"
-    return ("peripheral" if pct < edge[0]
-            else "core" if pct >= edge[1] else "typical")
+def node_papers(rows) -> dict[str, set]:
+    """node id -> the papers of that node: its evidence."""
+    papers = defaultdict(set)
+    for row in rows:
+        papers[node_key(row["editor_id"], row["journal"], row["coauthor_id"])].add(
+            row["rec_key"])
+    return papers
 
 
-def fit_baseline(nodes: dict) -> dict:
-    """Load-weighted counts[state][network_band][fit], the genuine reference."""
-    counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-    for node in nodes.values():
-        if not node.get("fit"):
-            continue
-        counts[node["state"]][str(node["network_band"])][node["fit"]] += node["load"]
-    return {state: {band: {f: round(vals.get(f, 0.0), 6) for f in FIT_STATES}
-                    for band, vals in bands.items()}
-            for state, bands in counts.items()}
+def pool_stats(coauthor_id, editor_id, collaborators: dict, own_papers,
+               authors_of: dict) -> tuple[int, int]:
+    """(n, k) of the co-author's own network: n collaborators, k of them with whom
+    the co-author shares exactly one publication.
 
-
-def relabel_fit(nodes: dict, cuts=None) -> dict:
-    """Give every node its fit label, and return the fit baseline over them.
-
-    The cuts default to the nodes' own terciles.
+    The editor is left out, and so is what the node's own papers (`own_papers`, its
+    evidence) add to the network, so the habit is measured on the rest of the
+    co-author's record. `collaborators` is the co-author's network from networks_from.
     """
-    cuts = fit_cuts(nodes) if cuts is None else cuts
-    for node in nodes.values():
-        node["fit"] = fit_label(node.get("fit_pct"), node["state"], cuts)
-    return fit_baseline(nodes)
+    taken_out = Counter()
+    for rec in own_papers:
+        ids = counted_authors(authors_of.get(rec, ()))
+        if coauthor_id in ids:
+            taken_out.update(ids - {coauthor_id})
+    n = k = 0
+    for other, shared in collaborators.items():
+        left = shared - taken_out[other]
+        if other == editor_id or left <= 0:
+            continue
+        n += 1
+        k += left == 1
+    return n, k
 
 
-def by_publisher(nodes: dict) -> dict:
-    """publisher -> {node id: node}."""
-    groups = defaultdict(dict)
+def annotate_pools(nodes: dict, papers: dict, depth: dict, authors_of: dict) -> None:
+    """Add `pool_n` and `pool_oneoffs` (pool_stats) to every node; `papers` maps a
+    node id to its own papers (node_papers)."""
     for node_id, node in nodes.items():
-        groups[node.get("publisher", "")][node_id] = node
-    return groups
-
-
-def publisher_fit_cuts(nodes: dict) -> dict:
-    """fit_cuts within each publisher: {publisher: cuts}."""
-    return {p: fit_cuts(group) for p, group in by_publisher(nodes).items()}
-
-
-def relabel_fit_per_publisher(nodes: dict, cuts=None) -> dict:
-    """relabel_fit within each publisher, returning {publisher: fit baseline}.
-
-    `cuts` is {publisher: cuts}; by default each publisher's own nodes' terciles.
-    """
-    return {p: relabel_fit(group, None if cuts is None else cuts.get(p, {}))
-            for p, group in by_publisher(nodes).items()}
+        node["pool_n"], node["pool_oneoffs"] = pool_stats(
+            node["coauthor_id"], node["editor_id"], depth.get(node["coauthor_id"], {}),
+            papers.get(node_id, ()), authors_of)
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +770,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         # Strict reading: venues the editor also edits do not count as outside.
         controlled = controlled_of.get(ed_id, set()) - inside_keys
         outside_strict = {r for r in outside if not is_inside(r, controlled)}
-        node_id = f"{ed_id}||{journal}||{co_id}"
+        node_id = node_key(ed_id, journal, co_id)
         n_pubs = len(pubs_of.get(co_id, set()))
         nodes[node_id] = {
             "editor_id": ed_id, "journal": journal,
@@ -828,8 +784,8 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
             "n_front_matter": entry["n_front_matter"],
             "coauthor_on_board": entry["on_board"],
             "benign_reason": benign_reason(entry, n_pubs),
-            # filled by annotate_fit / relabel_fit, which need the networks
-            "fit_pct": None, "network_band": None, "fit": "",
+            # filled by annotate_pools, which needs the networks; None without them
+            "pool_n": None, "pool_oneoffs": None,
         }
     return nodes
 
@@ -951,30 +907,29 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     for row in tenure:
         controlled_of[row["editor_id"]].update(mapping.get(row["journal"], []))
 
-    nodes = build_nodes([r for r in rows if r["group"] == "suspect"],
-                        pubs_of, mapping, controlled_of, publisher_of=publisher_of)
-    control_nodes = build_nodes([r for r in rows if r["group"] == "control"],
-                                pubs_of, mapping, controlled_of, publisher_of=publisher_of)
+    suspect_rows = [r for r in rows if r["group"] == "suspect"]
+    control_rows = [r for r in rows if r["group"] == "control"]
+    nodes = build_nodes(suspect_rows, pubs_of, mapping, controlled_of,
+                        publisher_of=publisher_of)
+    control_nodes = build_nodes(control_rows, pubs_of, mapping, controlled_of,
+                                publisher_of=publisher_of)
 
     signer_path = out_dir / "signer_pub_authors.csv"
     if signer_path.exists():
+        authors_of = read_authors(signer_path)
         wanted = {n["coauthor_id"] for group in (nodes, control_nodes)
                   for n in group.values()}
-        depth, _ = collaboration_networks(signer_path, wanted)
-        annotate_fit(nodes, depth)
-        annotate_fit(control_nodes, depth)
+        depth, _ = networks_from(authors_of, wanted)
+        annotate_pools(nodes, node_papers(suspect_rows), depth, authors_of)
+        annotate_pools(control_nodes, node_papers(control_rows), depth, authors_of)
+        del authors_of, depth
     else:
-        warn_missing(signer_path, "the partner-pattern (fit) node", "signer_authors")
+        warn_missing(signer_path, "the personal one-off baseline", "signer_authors")
 
-    # Benign nodes leave the evidence and the baseline; the fit cuts come from
-    # the scored nodes only, per publisher.
+    # Benign nodes leave the evidence and the baseline.
     benign = {k: v for k, v in nodes.items() if v["benign_reason"]}
     nodes = {k: v for k, v in nodes.items() if not v["benign_reason"]}
     control_nodes = {k: v for k, v in control_nodes.items() if not v["benign_reason"]}
-    cuts = publisher_fit_cuts(nodes)
-    fit_base = relabel_fit_per_publisher(nodes, cuts)
-    relabel_fit_per_publisher(control_nodes, cuts)
-    relabel_fit_per_publisher(benign, cuts)
 
     editor_index = index_by_editor(nodes)
     control_index = index_by_editor(control_nodes)
@@ -986,7 +941,7 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
         labels.setdefault(paper["editor_id"], paper["editor_name"])
 
     corpus = {
-        "model": "cs2_v1_per_coauthorship_load_weighted",
+        "model": "cs2_v2_tie_with_personal_oneoff_baseline",
         "config": {
             "publishers": sorted(set(publisher_of.values())),
             "states": STATES,
@@ -995,13 +950,10 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
             "outside_bands": OUTSIDE_BANDS,
             "junior_max_pubs": JUNIOR_MAX_PUBS,
             "career_stages": ["junior", "established"],
-            "fit_states": FIT_STATES,
-            "fit_min_collabs": FIT_MIN_COLLABS,
-            "network_bands": NETWORK_BANDS,
+            "max_authors": MAX_AUTHORS,
             "load_rule": "one suspect paper carries load 1, split over its co-authors",
         },
         "journals": baseline_counts(nodes),
-        "fit_baseline": fit_base,
         "coauthorships": nodes,
         "editor_index": {k: sorted(v) for k, v in editor_index.items()},
         "editor_labels": labels,

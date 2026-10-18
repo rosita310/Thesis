@@ -6,6 +6,23 @@ one of its authors on the board. ACM and IEEE journals are covered.
 
 All settings are in `cs2_config.py`; the scripts take only paths on the command line.
 
+## The network
+
+Each co-authorship of an editor E with a co-author A in journal j is one node with a load (one
+suspect paper carries load 1, split over its co-authors) and a tie: `outside_5plus`,
+`outside_2_4`, `outside_1` (papers E and A share outside j), `repeated` or `single` (only inside
+j). The network is G -> tie <- A's one-off habit, with the habit observed. A node adds
+load * log LR to E's log-odds, with LR = g(t) / (alpha m(t) + (1 - alpha) g(t)): m(t) is the
+elicited tie distribution of a coerced co-authorship, g(t) the genuine one.
+
+g(t) is journal j's tie distribution without E's own nodes, smoothed, with a fallback to the
+publisher's pool below `FALLBACK_MIN_N` (N_min) of load. For a co-author with at least N_min
+collaborators of their own (outside E and the node's own papers), g is made personal: A's
+one-off share (k + 0.5) / (n + 1), of n collaborators k with whom A shares one publication only,
+over r_bar_j, the journal's load-weighted typical share (again without E, with the same
+publisher fallback), gives rho, g(single) becomes g(single | j) * rho (at most
+`PERSONAL_SINGLE_CAP`) and the other ties are rescaled to sum to 1.
+
 ## Input
 
 - Per publisher in `PUBLISHERS`, a schema with `front_matter_issues` and `front_matter_board`:
@@ -19,8 +36,8 @@ All settings are in `cs2_config.py`; the scripts take only paths on the command 
 All publishers form one corpus. An editor is one person across publishers: their co-authorships
 in ACM and IEEE journals add up to one P(genuine), and the in/out gate and the strict `outside`
 reading see all their board seats. The genuine baselines stay per publisher: a journal's own
-baseline, the pooled fallback over the journals of the same publisher, and the fit cuts and fit
-baseline per publisher. An editor on the boards of one publisher gets the same score as in a
+baseline, the pooled fallback over the journals of the same publisher, and the same for the
+typical one-off share r_bar. An editor on the boards of one publisher gets the same score as in a
 corpus of that publisher alone.
 
 A front-matter issue is joined to dblp on volume and issue for ACM, and on year and issue for
@@ -43,7 +60,7 @@ existing `reports/journal_mapping.csv` are carried over as `verified`. Check eve
 | `pairs`          | database, extract  | suspect papers, co-authorships, board tenure, pre-tenure control |
 | `coauthors`      | dump               | every publication of the editors and co-authors                  |
 | `editor_authors` | dump               | authors and year of the editors' publications (in/out gate)      |
-| `signer_authors` | dump               | authors of the signers' publications (fit)                       |
+| `signer_authors` | dump               | authors of the signers' publications (co-authors' own networks)  |
 | `corpus`         | the files above    | `bbn_cs2_corpus.json`                                            |
 
 The dump stages are cached; `--force` redoes them.
@@ -52,7 +69,9 @@ The dump stages are cached; `--force` redoes them.
 `bbn/bbn_cs2_scored.json`, with the publishers of each editor. `bbn_report.py` prints the
 diagnostics and sensitivity sweeps, and `bbn_placebo.py` runs the within-paper placebo tests and
 writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` plants coerced papers in every editor's record
-and writes how often the model then shortlists them to `bbn/bbn_cs2_injection.csv`.
+and writes how often the model then shortlists them to `bbn/bbn_cs2_injection.csv`; a planted
+co-authorship copies the career stage and pool stats of a real co-authorship of the same tie in
+that journal, so it gets the personal adjustment a real co-author of that tie gets.
 
 ```
 python ../IEEE/parse_json_to_DB.py         # once, and after new IEEE front matter

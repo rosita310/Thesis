@@ -5,7 +5,8 @@ recomputed with each non-board signer of that paper in the editor's place.
     1. venue-locking: the share of the focal person's co-authors on the paper
        with whom they published only inside this journal.
     2. pattern fit: where the focal person sits in each co-author's own
-       collaborator distribution. Needs bbn/signer_pub_authors.csv.
+       collaborator distribution. Needs bbn/signer_pub_authors.csv. A validation
+       statistic only; the network does not use it.
 
 Writes bbn/bbn_cs2_placebo.csv with the per-editor permutation test.
 
@@ -25,9 +26,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from bbn_extract import (BoardIndex, PeopleIndex, band_of, collaboration_networks,
-                         is_inside, midrank_pct, person_id, publications_of)
-from cs2_config import (BBN_DIR, FIT_MIN_COLLABS, NETWORK_BANDS, PLACEBO_RECORD_BANDS,
-                        PLACEBO_SAMPLES, PLACEBO_SEED, REPORTS_DIR)
+                         is_inside, person_id, publications_of)
+from cs2_config import (BBN_DIR, PATTERN_MIN_COLLABS, PATTERN_NETWORK_BANDS,
+                        PLACEBO_RECORD_BANDS, PLACEBO_SAMPLES, PLACEBO_SEED, REPORTS_DIR)
 from dblp_extract import as_bool, load_mapping, pct, read_csv
 
 P_LEVELS = (0.01, 0.05, 0.10, 0.25)   # p-value levels of the per-editor test report
@@ -144,11 +145,21 @@ PATTERN_SIGN = {"pct_depth": "NEGATIVE", "pct_spread": "NEGATIVE",
                 "is_min_depth": "POSITIVE", "lone_venue": "POSITIVE"}
 
 
+def midrank_pct(values, x) -> float:
+    """Midrank percentile of x within values, ties averaged. 0 = lowest."""
+    n = len(values)
+    if n < 2:
+        return 0.5
+    below = sum(1 for v in values if v < x)
+    equal = sum(1 for v in values if v == x)
+    return (below + (equal - 1) / 2) / (n - 1)
+
+
 def describe(depth, spread) -> dict:
     """Each person's own collaboration pattern, as a distribution to rank into."""
     out = {}
     for a, cols in depth.items():
-        if len(cols) < FIT_MIN_COLLABS:
+        if len(cols) < PATTERN_MIN_COLLABS:
             continue
         d = list(cols.values())
         out[a] = {"depth": d, "spread": [len(spread[a][c]) for c in cols],
@@ -187,9 +198,9 @@ def pattern_units(pools: list[Pool], depth, spread, pattern) -> list[dict]:
         alts = [(i, v) for i, v in alts if v is not None]
         if observed is None or not alts:
             continue
-        ns = [pattern[q]["n"] if q in pattern else 0 for q in signers]
-        same = [v for i, v in alts
-                if band_of(ns[i], NETWORK_BANDS) == band_of(ns[0], NETWORK_BANDS)]
+        bands = [band_of(pattern[q]["n"] if q in pattern else 0, PATTERN_NETWORK_BANDS)
+                 for q in signers]
+        same = [v for i, v in alts if bands[i] == bands[0]]
         units.append({
             "editor": pool.editor, "observed": observed,
             "alternatives": {m: statistics.fmean([v[m] for _, v in alts])
