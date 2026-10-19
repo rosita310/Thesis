@@ -112,15 +112,14 @@ PATTERN_NETWORK_BANDS = [20, 60, 150]   # collaborator-count bands for similar-s
 # The injection test (bbn_inject.py)
 # ---------------------------------------------------------------------------
 
-# Coerced papers planted in one scored editor's record at a time, one run per count.
-INJECT_PAPERS = [0, 1, 2, 3, 5, 10, 20]
+# Fake editors who built a career on coercion, scored one at a time without the gate.
+INJECT_RECORDS = [15, 30]            # papers in the journal they edit
+INJECT_SHARES = [1 / 3, 1 / 2, 2 / 3]   # the coerced share of those papers
 INJECT_COAUTHORS = 3         # co-authors per coerced paper: the median of the suspect papers
 # one-off:   every coerced paper has new co-authors, so each co-authorship is `single`
 # standing:  the same co-authors on every coerced paper, so `repeated` from R_min papers on
-# mix:       the state of each co-authorship drawn from MANIP_DIST, the model's own m(s)
-# follow-up: every coerced co-author later publishes once with the editor elsewhere, so
-#            `outside_1`: a coercion the tie cannot see
-INJECT_PROFILES = ["one-off", "standing", "mix", "follow-up"]
-# An editor on two or more boards also gets the one-off profile spread over two seats.
-INJECT_HOST_BANDS = [2, 10]  # bands of the editor's own suspect papers: <=2 | 3-10 | >10
+# both:      half of the coerced papers one-off, half standing
+INJECT_PROFILES = ["one-off", "standing", "both"]
+INJECT_BOARDS = [1, 2]       # boards the one-off profile is spread over
+INJECT_DRAWS = 20            # fake editors per journal and kind
 INJECT_SEED = 7

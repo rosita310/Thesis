@@ -1,50 +1,61 @@
 """
-Injection test: how many coerced papers does an editor need before the model
-shortlists them?
+Injection test: would the model find an editor who built a career on coercion?
 
-Plants coerced papers in the record of one scored editor at a time, in a journal on
-whose board they sit, scores that editor again and counts how often they fall
-below SHORTLIST_THRESHOLD, with and without the in/out gate. The other editors and
-the baselines stay as they are. A planted co-authorship copies the career stage and
-the pool stats (the co-author's own collaborators and one-off collaborators) of a
-real co-authorship of the same state in that journal, so it gets the personal
-adjustment a real co-author of that tie gets, and differs from a genuine one only in
-its state.
+Makes fake editors, one at a time, and scores each against the real corpus, without
+the in/out gate. A fake editor has a record of INJECT_RECORDS papers in the journal
+they edit, a share INJECT_SHARES of them coerced.
 
-Every profile is planted in one seat. An editor on two or more boards also gets the
-one-off profile spread over two of their seats. The results are split by the
-editor's own record (INJECT_HOST_BANDS) and for the editors on two or more boards.
-Writes bbn_cs2_injection.csv beside the corpus.
+- The genuine papers are real co-authorships of other editors in that journal, drawn
+  at random until their load makes up the genuine papers (the last one counts only
+  with the load still needed). They keep their real ties and co-author habits and,
+  like any editor's own co-authorships, are left out of the baselines.
+- The coerced papers have INJECT_COAUTHORS co-authors each, who share nothing with the
+  editor outside the journal. Each victim's one-off habit is that of a random real
+  co-author in the journal. In the one-off profile every coerced paper has new
+  victims, in the standing profile the same victims sign every coerced paper, and in
+  the both profile half of the coerced papers are one-off and half standing.
+
+Every journal whose load can supply the genuine part and still keep its own baseline
+gets INJECT_DRAWS fake editors per setting. A fake editor on two boards has half of
+their record in a second such journal of the same publisher. Writes
+bbn_cs2_injection.csv beside the corpus.
 
     python bbn_inject.py [--in bbn/bbn_cs2_corpus.json]
 """
 
 from __future__ import annotations
 
+import bisect
 import csv
 import math
 import random
 import statistics
 from collections import defaultdict
 
-from bbn_infer import (corpus_path_argument, load_corpus, log_odds_to_p,
-                       passes_inout_gate, rank_corpus, reference, score_editor)
-from cs2_config import (INJECT_COAUTHORS, INJECT_HOST_BANDS, INJECT_PAPERS,
-                        INJECT_PROFILES, INJECT_SEED, MANIP_DIST, PRIOR,
+from bbn_infer import (corpus_path_argument, load_corpus, rank_corpus, reference,
+                       score_editor)
+from cs2_config import (FALLBACK_MIN_N, INJECT_BOARDS, INJECT_COAUTHORS, INJECT_DRAWS,
+                        INJECT_PROFILES, INJECT_RECORDS, INJECT_SEED, INJECT_SHARES,
                         SHORTLIST_THRESHOLD)
 
-# The node fields a score depends on; planted nodes that agree on all of them merge.
-SCORING_KEYS = ("journal", "state", "career_stage", "pool_n", "pool_oneoffs")
-
-MULTI_BOARD = "multi-board"   # the host group of editors with two or more seats
-
 
 # ---------------------------------------------------------------------------
-# Planting
+# The fake editor
 # ---------------------------------------------------------------------------
 
-def planted_states(profile, papers, rng, repeated_min, coauthors=INJECT_COAUTHORS):
-    """(state, load) of every planted co-authorship; the loads add up to `papers`."""
+def coerced_count(record, share):
+    """The coerced papers of a record, rounded half up: half of 15 is 8."""
+    return int(record * share + 0.5)
+
+
+def split(n, parts):
+    """`n` divided over `parts` as evenly as possible, the larger part first."""
+    return [n // parts + (i < n % parts) for i in range(parts)]
+
+
+def coerced_states(profile, papers, repeated_min, coauthors=INJECT_COAUTHORS):
+    """(state, load) of the co-authorships of `papers` coerced papers; the loads add
+    up to `papers`."""
     if papers == 0:
         return []
     if profile == "one-off":
@@ -52,169 +63,145 @@ def planted_states(profile, papers, rng, repeated_min, coauthors=INJECT_COAUTHOR
     if profile == "standing":
         state = "repeated" if papers >= repeated_min else "single"
         return [(state, papers / coauthors)] * coauthors
-    if profile == "mix":
-        states, weights = zip(*MANIP_DIST.items())
-        return [(rng.choices(states, weights)[0], 1 / coauthors)
-                for _ in range(papers * coauthors)]
-    if profile == "follow-up":
-        return [("outside_1", 1 / coauthors)] * (papers * coauthors)
+    if profile == "both":
+        one_off, standing = split(papers, 2)
+        return (coerced_states("one-off", one_off, repeated_min, coauthors)
+                + coerced_states("standing", standing, repeated_min, coauthors))
     raise ValueError(f"unknown injection profile {profile!r}")
 
 
-class Donors:
-    """The real scored co-authorships a planted one copies its career stage and pool
-    stats from."""
+class Journals:
+    """The real scored co-authorships per journal: the genuine papers and the victims'
+    habits of a fake editor are drawn from them."""
 
     def __init__(self, coauthorships, publisher_of):
         self.publisher_of = publisher_of
-        self.by_journal = defaultdict(list)
-        self.by_publisher = defaultdict(list)
+        self.nodes = defaultdict(list)
         for node in coauthorships.values():
-            self.by_journal[(node["journal"], node["state"])].append(node)
-            self.by_publisher[(publisher_of.get(node["journal"], ""), node["state"])].append(node)
+            self.nodes[node["journal"]].append(node)
 
-    def draw(self, journal, state, rng):
-        """A real co-authorship of `state` in `journal`, else in its publisher, else none."""
-        pool = (self.by_journal.get((journal, state))
-                or self.by_publisher.get((self.publisher_of.get(journal, ""), state)))
-        return rng.choice(pool) if pool else {}
+    def load(self, journal):
+        return sum(n["load"] for n in self.nodes.get(journal, []))
+
+    def eligible(self, records=INJECT_RECORDS, min_n=FALLBACK_MIN_N):
+        """The journals that can supply the largest genuine part and still keep at least
+        N_min of load for their own baseline, sorted."""
+        return sorted(j for j in self.nodes if self.load(j) >= max(records) + min_n)
+
+    def genuine(self, journal, papers, rng):
+        """(nodes, own) for `papers` genuine papers: real co-authorships drawn without
+        replacement until their load makes up `papers`. `nodes` are what the fake
+        editor is scored on, the last one cut to the load still needed; `own` are the
+        originals, which the baselines leave out."""
+        nodes, own, needed = [], [], float(papers)
+        for node in rng.sample(self.nodes[journal], len(self.nodes[journal])):
+            if needed <= 1e-9:
+                break
+            nodes.append({**node, "load": min(node["load"], needed)})
+            own.append(node)
+            needed -= node["load"]
+        return nodes, own
+
+    def victim(self, journal, rng):
+        """A random real co-authorship of the journal, whose co-author lends a coerced
+        co-author their habit."""
+        return rng.choice(self.nodes[journal])
 
 
-def planted_nodes(journal, profile, papers, rng, donors, repeated_min):
+def coerced_nodes(journal, profile, papers, rng, journals, repeated_min):
     """The co-authorships of `papers` coerced papers in `journal`."""
     nodes = []
-    for state, load in planted_states(profile, papers, rng, repeated_min):
-        donor = donors.draw(journal, state, rng)
+    for state, load in coerced_states(profile, papers, repeated_min):
+        donor = journals.victim(journal, rng)
         nodes.append({"journal": journal, "state": state, "load": load,
-                      "career_stage": donor.get("career_stage", "established"),
-                      "pool_n": donor.get("pool_n"),
-                      "pool_oneoffs": donor.get("pool_oneoffs")})
+                      "career_stage": donor["career_stage"],
+                      "pool_n": donor["pool_n"], "pool_oneoffs": donor["pool_oneoffs"]})
     return nodes
 
 
-def merged(nodes):
-    """Planted nodes with the same scoring fields summed into one; a node adds
-    load * log LR, so the score is unchanged."""
-    out = {}
-    for node in nodes:
-        key = tuple(node[k] for k in SCORING_KEYS)
-        if key in out:
-            out[key]["load"] += node["load"]
-        else:
-            out[key] = dict(node)
-    return list(out.values())
-
-
-def with_planted_seat(points, journal, added):
-    """The editor's in/out points after `added` new co-authors in `journal`."""
-    return [{**p, "x": p["x"] + added} if p["journal"] == journal else p
-            for p in points]
-
-
-def split(papers, n_seats):
-    """`papers` divided over `n_seats` seats as evenly as possible, the larger part first."""
-    return [papers // n_seats + (i < papers % n_seats) for i in range(n_seats)]
-
-
-def planted_log_odds(planted, own, ref):
-    """What the planted nodes add to the editor's log-odds.
-
-    The baselines (the journal column and r_bar) leave out only the editor's real
-    nodes: the planted ones were never counted in them, so there is nothing of
-    theirs to take out.
-    """
-    _, log_odds, _ = score_editor(merged(planted), ref, own=own)
-    return log_odds - math.log(PRIOR / (1 - PRIOR))
+def fake_editor(seats, record, share, profile, rng, journals, repeated_min):
+    """(nodes, own) of a fake editor whose record is spread evenly over `seats`."""
+    nodes, own = [], []
+    coerced = coerced_count(record, share)
+    for journal, n_coerced, n_genuine in zip(seats, split(coerced, len(seats)),
+                                             split(record - coerced, len(seats))):
+        genuine, originals = journals.genuine(journal, n_genuine, rng)
+        nodes += genuine + coerced_nodes(journal, profile, n_coerced, rng, journals,
+                                         repeated_min)
+        own += originals
+    return nodes, own
 
 
 # ---------------------------------------------------------------------------
 # The test
 # ---------------------------------------------------------------------------
 
-def host_band(n_papers, edges=INJECT_HOST_BANDS):
-    """The band of the editor's own suspect papers: <=2 | 3-10 | >10."""
-    low = 0
-    for edge in edges:
-        if n_papers <= edge:
-            return f"{low + 1}-{edge}" if low else f"<={edge}"
-        low = edge
-    return f">{edges[-1]}"
+def settings():
+    """(profile, boards, record, share) of every kind of fake editor: every profile on
+    one board, and the one-off profile on each number of boards in INJECT_BOARDS."""
+    kinds = [(p, 1) for p in INJECT_PROFILES] + [("one-off", b) for b in INJECT_BOARDS
+                                                 if b > 1]
+    return [(p, b, r, s) for p, b in kinds for r in INJECT_RECORDS for s in INJECT_SHARES]
 
 
-def runs():
-    """(profile, seats the coerced papers are spread over): every profile in one
-    seat, and the one-off profile over two seats of an editor on two or more boards."""
-    return [(p, 1) for p in INJECT_PROFILES] + [("one-off", 2)]
+def seats_for(journal, boards, eligible, publisher_of, rng):
+    """`journal` and `boards - 1` other eligible journals of its publisher, or None."""
+    others = [j for j in eligible if j != journal
+              and publisher_of.get(j) == publisher_of.get(journal)]
+    if len(others) < boards - 1:
+        return None
+    return [journal] + rng.sample(others, boards - 1)
 
 
-def plant(row, profile, n_seats, papers, seats, ref, donors, repeated_min):
-    """P(genuine) and the gate of one editor after planting `papers` coerced papers
-    spread over `n_seats` of their `seats`."""
-    rng = random.Random(f"{INJECT_SEED}|{row['ident']}|{profile}|{n_seats}|{papers}")
-    points = row["inout_points"]
-    planted = []
-    for journal, k in zip(rng.sample(seats, n_seats), split(papers, n_seats)):
-        nodes = planted_nodes(journal, profile, k, rng, donors, repeated_min)
-        planted += nodes
-        points = with_planted_seat(points, journal, len(nodes))
-    real = row["woe"] * math.log(10)
-    p = log_odds_to_p(real + planted_log_odds(planted, row["nodes"], ref))
-    return p, passes_inout_gate(points)
+def rank_among(woe, real_woes):
+    """The rank a weight of evidence takes among the real editors' (sorted), 1 = lowest."""
+    return bisect.bisect_left(real_woes, woe) + 1
 
 
 def run(data):
-    """One trial per scored editor, run and number of planted papers."""
+    """One trial per fake editor."""
     ref = reference(data)
-    donors = Donors(data["coauthorships"], ref.publisher_of)
+    journals = Journals(data["coauthorships"], ref.publisher_of)
+    eligible = journals.eligible()
     repeated_min = data["config"]["repeated_min"]
+    real_woes = sorted(r["woe"] for r in rank_corpus(data, inout_gate=False))
     trials = []
-    for row in rank_corpus(data, inout_gate=False):
-        seats = [p["journal"] for p in row["inout_points"] or []
-                 if p["journal"] in ref.journals]
-        if not seats:
-            continue
-        host = {"band": host_band(row["n_suspect_papers"]), "multi_board": len(seats) >= 2}
-        for profile, n_seats in runs():
-            if n_seats > len(seats):
-                continue
-            for papers in INJECT_PAPERS:
-                p, gate = plant(row, profile, n_seats, papers, seats, ref, donors,
-                                repeated_min)
-                trials.append({"profile": profile, "seats": n_seats, "papers": papers,
-                               **host, "p": p, "gate": gate})
-    return trials
-
-
-def host_groups(trial):
-    """The host groups a trial counts in: all, its record band, and multi-board."""
-    return ["all", trial["band"]] + ([MULTI_BOARD] if trial["multi_board"] else [])
+    for profile, boards, record, share in settings():
+        for journal in eligible:
+            for draw in range(INJECT_DRAWS):
+                rng = random.Random(f"{INJECT_SEED}|{profile}|{boards}|{record}|"
+                                    f"{share:.4f}|{journal}|{draw}")
+                seats = seats_for(journal, boards, eligible, ref.publisher_of, rng)
+                if seats is None:
+                    continue
+                nodes, own = fake_editor(seats, record, share, profile, rng, journals,
+                                         repeated_min)
+                p, log_odds, _ = score_editor(nodes, ref, own=own)
+                woe = log_odds / math.log(10)
+                trials.append({"profile": profile, "boards": boards, "record": record,
+                               "share": share, "journal": journal, "p": p, "woe": woe,
+                               "rank": rank_among(woe, real_woes)})
+    return trials, len(real_woes), eligible
 
 
 def summarise(trials):
-    """Per run, number of papers and host group: the share shortlisted without and
-    with the gate, and the median P(genuine)."""
+    """Per kind of fake editor: how many there are, the share found (P below the
+    threshold), and the median P and rank."""
     groups = defaultdict(list)
     for t in trials:
-        for group in host_groups(t):
-            groups[(t["profile"], t["seats"], t["papers"], group)].append(t)
+        groups[(t["profile"], t["boards"], t["record"], t["share"])].append(t)
     rows = []
-    for (profile, seats, papers, group), ts in groups.items():
-        short = [t for t in ts if t["p"] < SHORTLIST_THRESHOLD]
-        rows.append({"profile": profile, "seats": seats, "papers": papers,
-                     "hosts": group, "n_hosts": len(ts),
-                     "shortlisted": len(short) / len(ts),
-                     "shortlisted_gated": sum(t["gate"] for t in short) / len(ts),
-                     "median_p": statistics.median(t["p"] for t in ts)})
-    order = {r: i for i, r in enumerate(runs())}
-    group_order = ["all"] + host_band_names() + [MULTI_BOARD]
-    rows.sort(key=lambda r: (order[(r["profile"], r["seats"])], r["papers"],
-                             group_order.index(r["hosts"])))
+    for (profile, boards, record, share), ts in groups.items():
+        rows.append({"profile": profile, "boards": boards, "record": record,
+                     "share": round(share, 4), "coerced": coerced_count(record, share),
+                     "fakes": len(ts),
+                     "found": sum(t["p"] < SHORTLIST_THRESHOLD for t in ts) / len(ts),
+                     "median_p": statistics.median(t["p"] for t in ts),
+                     "median_rank": statistics.median(t["rank"] for t in ts),
+                     "worst_rank": max(t["rank"] for t in ts)})
+    order = {s[:3] + (round(s[3], 4),): i for i, s in enumerate(settings())}
+    rows.sort(key=lambda r: order[(r["profile"], r["boards"], r["record"], r["share"])])
     return rows
-
-
-def host_band_names(edges=INJECT_HOST_BANDS):
-    """The record bands in order: <=2, 3-10, >10."""
-    return [host_band(edge) for edge in edges] + [host_band(edges[-1] + 1)]
 
 
 def write_csv(path, rows):
@@ -222,38 +209,32 @@ def write_csv(path, rows):
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         for r in rows:
-            writer.writerow({**r, "shortlisted": round(r["shortlisted"], 4),
-                             "shortlisted_gated": round(r["shortlisted_gated"], 4),
-                             "median_p": round(r["median_p"], 4)})
+            writer.writerow({**r, "found": round(r["found"], 4),
+                             "median_p": round(r["median_p"], 6)})
 
 
-def print_table(rows):
-    at = {(r["profile"], r["seats"], r["papers"], r["hosts"]): r for r in rows}
-    groups = ["all"] + host_band_names() + [MULTI_BOARD]
-    print(f"\n=== INJECTION TEST: share shortlisted (P < {SHORTLIST_THRESHOLD}), "
-          f"with the gate / without ===")
-    print("  hosts: " + ", ".join(f"{g} {at[('one-off', 1, 0, g)]['n_hosts']}"
-                                  for g in groups))
-    for profile, seats in runs():
-        where = "in one seat" if seats == 1 else f"spread over {seats} seats"
-        print(f"\n  {profile}, {INJECT_COAUTHORS} co-authors per coerced paper, {where}")
-        print(f"  {'papers':>6}" + "".join(f"{g:>16}" for g in groups))
-        for papers in INJECT_PAPERS:
-            cells = []
-            for g in groups:
-                r = at.get((profile, seats, papers, g))
-                cells.append(f"{r['shortlisted_gated']:>7.1%} /{r['shortlisted']:>6.1%}"
-                             if r else f"{'-':>16}")
-            print(f"  {papers:>6}" + "".join(f"{c:>16}" for c in cells))
+def print_table(rows, n_real, eligible):
+    print(f"\n=== INJECTION TEST: fake editors scored against {n_real} real editors, "
+          f"no gate ===")
+    print(f"  {len(eligible)} journals, {INJECT_DRAWS} fake editors per journal and kind; "
+          f"found = P < {SHORTLIST_THRESHOLD}; rank 1 = most suspect")
+    print(f"  {'profile':<9}{'boards':>7}{'record':>7}{'coerced':>8}{'fakes':>7}"
+          f"{'found':>8}{'median P':>11}{'median rank':>12}{'worst rank':>11}")
+    for r in rows:
+        print(f"  {r['profile']:<9}{r['boards']:>7}{r['record']:>7}{r['coerced']:>8}"
+              f"{r['fakes']:>7}{r['found']:>8.1%}{r['median_p']:>11.2e}"
+              f"{r['median_rank']:>12.0f}{r['worst_rank']:>11}")
 
 
 def main():
-    in_path = corpus_path_argument("CS2 injection test: detection of planted coerced papers.")
+    in_path = corpus_path_argument("CS2 injection test: fake editors who built a career "
+                                   "on coercion.")
     data = load_corpus(in_path)
-    rows = summarise(run(data))
+    trials, n_real, eligible = run(data)
+    rows = summarise(trials)
     out_path = in_path.resolve().parent / "bbn_cs2_injection.csv"
     write_csv(out_path, rows)
-    print_table(rows)
+    print_table(rows, n_real, eligible)
     print(f"\nWrote {out_path}")
 
 

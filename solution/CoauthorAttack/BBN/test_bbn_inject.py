@@ -27,10 +27,10 @@ def approx(a, b, tol=1e-9):
 
 
 # --- the synthetic corpus --------------------------------------------------
-# One ACM journal J1 whose baseline includes the host's real nodes, as the extract
-# emits it. The host E has one outside co-authorship and a seat below the diagonal.
-# Every co-author has 40 collaborators; those of the `single` co-authorships have
-# more one-offs than the rest, so a planted `single` gets a personal adjustment.
+# One ACM journal J1 with 77 of load, as the extract emits it: editor E with one
+# outside co-authorship, editor O with the rest. Every co-author has 40 collaborators;
+# those of the `single` co-authorships have more one-offs than the rest, so a coerced
+# co-author can get a personal adjustment.
 
 STATES = ["outside_5plus", "outside_2_4", "outside_1", "repeated", "single"]
 
@@ -48,7 +48,7 @@ OTHERS = {f"O||J1||{s}{i}": {**node(s, 1.0, f"{s}{i}"), "editor_id": "O"}
                        ("repeated", 2), ("single", 8)] for i in range(n)}
 
 
-def corpus(real=REAL, points=None):
+def corpus(real=REAL):
     nodes = {**OTHERS, **{f"E||J1||{n['coauthor_id']}": n for n in real}}
     counts = {}
     for n in nodes.values():
@@ -60,172 +60,160 @@ def corpus(real=REAL, points=None):
             "editor_index": {"E": [f"E||J1||{n['coauthor_id']}" for n in real],
                              "O": list(OTHERS)},
             "editors": {"E": {"n_suspect_papers": 2, "inout_points":
-                              points or [{"journal": "J1", "x": 2, "y": 20}]},
+                              [{"journal": "J1", "x": 2, "y": 20}]},
                         "O": {"n_suspect_papers": 75, "inout_points":
                               [{"journal": "J1", "x": 75, "y": 300}]}}}
 
 
-def with_in_baseline(data, planted):
-    """The corpus as it would be had the planted nodes been extracted with it: in
-    the journal's baseline and among the co-authorships r_bar is taken over."""
-    data = copy.deepcopy(data)
-    counts = data["journals"]["J1"]["baseline_counts"]["established"]
-    for i, n in enumerate(planted):
-        counts[n["state"]] = counts.get(n["state"], 0.0) + n["load"]
-        data["coauthorships"][f"E||J1||planted{i}"] = {**n, "editor_id": "E"}
+def two_journal_corpus():
+    """The synthetic corpus with J2, a copy of J1 with its own co-authorships."""
+    data = corpus()
+    data["journals"]["J2"] = copy.deepcopy(data["journals"]["J1"])
+    for key, n in list(data["coauthorships"].items()):
+        data["coauthorships"][key.replace("J1", "J2")] = {**n, "journal": "J2"}
     return data
 
 
-# --- planting ---------------------------------------------------------------
+def with_in_baseline(data, coerced):
+    """The corpus as it would be had the coerced nodes been extracted with it: in
+    the journal's baseline and among the co-authorships r_bar is taken over."""
+    data = copy.deepcopy(data)
+    counts = data["journals"]["J1"]["baseline_counts"]["established"]
+    for i, n in enumerate(coerced):
+        counts[n["state"]] = counts.get(n["state"], 0.0) + n["load"]
+        data["coauthorships"][f"F||J1||coerced{i}"] = {**n, "editor_id": "F"}
+    return data
 
-def test_planted_states():
-    print("\n-- the planted co-authorships --")
-    rng = random.Random(1)
-    one_off = inject.planted_states("one-off", 2, rng, 2, coauthors=3)
+
+# --- the fake editor -----------------------------------------------------------
+
+def test_counts():
+    print("\n-- coerced papers and splits --")
+    check("a third, half, and two-thirds of 15 papers are 5, 8, and 10 coerced",
+          [inject.coerced_count(15, s) for s in (1 / 3, 1 / 2, 2 / 3)] == [5, 8, 10])
+    check("a third, half, and two-thirds of 30 papers are 10, 15, and 20 coerced",
+          [inject.coerced_count(30, s) for s in (1 / 3, 1 / 2, 2 / 3)] == [10, 15, 20])
+    check("a record is split as evenly as possible, the larger part first",
+          inject.split(5, 2) == [3, 2] and inject.split(4, 2) == [2, 2]
+          and inject.split(3, 1) == [3])
+
+
+def test_coerced_states():
+    print("\n-- the coerced co-authorships --")
+    one_off = inject.coerced_states("one-off", 2, 2, coauthors=3)
     check("one-off: every paper brings three new `single` co-authorships",
           len(one_off) == 6 and all(s == "single" for s, _ in one_off))
     check("one-off: each paper weighs 1, split over its co-authors",
           approx(sum(load for _, load in one_off), 2.0))
-    check("standing, one paper: the co-authors are still `single`",
-          {s for s, _ in inject.planted_states("standing", 1, rng, 2, coauthors=3)}
-          == {"single"})
-    standing = inject.planted_states("standing", 5, rng, 2, coauthors=3)
-    check("standing, R_min papers or more: three `repeated` co-authors carrying all the load",
+    standing = inject.coerced_states("standing", 5, 2, coauthors=3)
+    check("standing: three `repeated` co-authors carrying all the load",
           len(standing) == 3 and {s for s, _ in standing} == {"repeated"}
           and approx(sum(load for _, load in standing), 5.0))
-    drawn = [s for _ in range(300)
-             for s, _ in inject.planted_states("mix", 1, rng, 2, coauthors=3)]
-    check("mix: states drawn from m(s), never one it gives no mass",
-          "outside_5plus" not in drawn and {"single", "repeated"} <= set(drawn))
-    check("follow-up: every co-authorship has one tie outside the journal",
-          {s for s, _ in inject.planted_states("follow-up", 3, rng, 2)} == {"outside_1"})
-    check("no papers, nothing planted",
-          inject.planted_states("one-off", 0, rng, 2) == [])
+    check("standing, one paper: the co-authors are still `single`",
+          {s for s, _ in inject.coerced_states("standing", 1, 2)} == {"single"})
+    both = inject.coerced_states("both", 5, 2, coauthors=3)
+    check("both, five papers: three one-off papers and two standing ones",
+          [s for s, _ in both].count("single") == 9
+          and [s for s, _ in both].count("repeated") == 3
+          and approx(sum(load for _, load in both), 5.0))
+    check("no coerced papers, no co-authorships", inject.coerced_states("one-off", 0, 2) == [])
 
 
-def test_donors():
-    print("\n-- the donor of career stage and pool stats --")
-    real = {"x": node("single", 1.0, "x", stage="junior", pool_n=77, pool_oneoffs=11),
-            "y": {**node("single", 1.0, "y", pool_n=50, pool_oneoffs=5), "journal": "J2"}}
-    donors = inject.Donors(real, {"J1": "acm", "J2": "acm", "J3": "acm", "K1": "ieee"})
-    rng = random.Random(1)
-    check("a planted node copies a real one of its state in the same journal",
-          donors.draw("J1", "single", rng)["pool_n"] == 77)
-    check("a journal without one falls back to the publisher",
-          donors.draw("J3", "single", rng)["pool_n"] in {77, 50})
-    check("no real node of that state in the publisher: no donor",
-          donors.draw("K1", "single", rng) == {})
-    planted = inject.planted_nodes("J1", "one-off", 1, rng, donors, 2)
-    check("planted nodes take the donor's pool stats and career stage",
-          all(n["pool_n"] == 77 and n["pool_oneoffs"] == 11 and n["career_stage"] == "junior"
-              for n in planted))
-    bare = inject.planted_nodes("K1", "one-off", 1, rng, donors, 2)
-    check("without a donor a planted node has no pool stats, so no adjustment",
-          all(n["pool_n"] is None and n["career_stage"] == "established" for n in bare))
+def test_journals():
+    print("\n-- drawing from the real journal --")
+    data = two_journal_corpus()
+    journals = inject.Journals(data["coauthorships"], {"J1": "acm", "J2": "acm"})
+    check("a journal with 77 of load can supply a record of 30 and keep 30 for itself",
+          journals.eligible(records=[30]) == ["J1", "J2"])
+    check("...but not a record of 50", journals.eligible(records=[50]) == [])
+    rng = random.Random(4)
+    nodes, own = journals.genuine("J1", 7, rng)
+    check("the genuine co-authorships make up exactly the genuine papers",
+          approx(sum(n["load"] for n in nodes), 7.0))
+    check("they are drawn without replacement, from the journal itself",
+          len({n["coauthor_id"] for n in own}) == len(own)
+          and all(n["journal"] == "J1" for n in own))
+    check("the baselines leave out the whole originals",
+          [n["coauthor_id"] for n in own] == [n["coauthor_id"] for n in nodes]
+          and sum(n["load"] for n in own) >= 7.0)
+    cut = journals.genuine("J1", 1.5, random.Random(1))
+    check("the last co-authorship counts only with the load still needed",
+          approx(sum(n["load"] for n in cut[0]), 1.5))
 
 
-def test_seat():
-    print("\n-- the in/out gate after planting --")
-    points = [{"journal": "J1", "x": 2, "y": 8}, {"journal": "J2", "x": 0, "y": 5}]
-    after = inject.with_planted_seat(points, "J1", 6)
-    check("only the seat of the planted journal gains the new co-authors",
-          after[0]["x"] == 8 and after[1]["x"] == 0)
-    check("enough new co-authors push a failing editor through the gate",
-          not infer.passes_inout_gate(points) and infer.passes_inout_gate(after))
-    check("papers are split over seats as evenly as possible, the larger part first",
-          inject.split(5, 2) == [3, 2] and inject.split(4, 2) == [2, 2]
-          and inject.split(0, 2) == [0, 0] and inject.split(3, 1) == [3])
+def test_fake_editor():
+    print("\n-- a fake editor --")
+    data = two_journal_corpus()
+    journals = inject.Journals(data["coauthorships"], {"J1": "acm", "J2": "acm"})
+    nodes, own = inject.fake_editor(["J1"], 15, 1 / 2, "one-off", random.Random(2),
+                                    journals, 2)
+    coerced = [n for n in nodes if "coauthor_id" not in n]
+    check("half of 15 papers: 8 coerced and 7 genuine",
+          approx(sum(n["load"] for n in coerced), 8.0)
+          and approx(sum(n["load"] for n in nodes) - 8.0, 7.0))
+    check("the coerced co-authors share nothing outside the journal",
+          {n["state"] for n in coerced} == {"single"})
+    check("a coerced co-author takes the habit of a real co-author of the journal",
+          all(n["pool_n"] == 40 for n in coerced))
+    two, _ = inject.fake_editor(["J1", "J2"], 30, 2 / 3, "one-off", random.Random(2),
+                                journals, 2)
+    load = {j: sum(n["load"] for n in two if n["journal"] == j) for j in ("J1", "J2")}
+    check("on two boards, the record is split evenly over both journals",
+          approx(load["J1"], 15.0) and approx(load["J2"], 15.0))
 
-
-# --- scoring ------------------------------------------------------------------
 
 def test_leave_out_is_exact():
-    print("\n-- the planted score equals a corpus extracted with the planted papers --")
+    print("\n-- the fake score equals a corpus extracted with the fake editor --")
     data = corpus()
     ref = infer.reference(data)
-    rng = random.Random(3)
-    donors = inject.Donors(data["coauthorships"], ref.publisher_of)
-    planted = inject.planted_nodes("J1", "mix", 4, rng, donors, 2)
-    check("the planted co-authorships get the personal adjustment of their donors",
-          all(d["adjusted"] for d in infer.score_editor(planted, ref, own=REAL)[2]))
-    _, real, _ = infer.score_editor(REAL, ref)
-    quick = real + inject.planted_log_odds(planted, REAL, ref)
-    full_ref = infer.reference(with_in_baseline(data, planted))
-    _, full, _ = infer.score_editor(REAL + planted, full_ref)
-    check(f"real + planted log-odds == scoring the full record ({quick:.6f} vs {full:.6f})",
+    journals = inject.Journals(data["coauthorships"], ref.publisher_of)
+    nodes, own = inject.fake_editor(["J1"], 15, 2 / 3, "both", random.Random(3),
+                                    journals, 2)
+    coerced = [n for n in nodes if "coauthor_id" not in n]
+    _, quick, _ = infer.score_editor(nodes, ref, own=own)
+    full_ref = infer.reference(with_in_baseline(data, coerced))
+    _, full, _ = infer.score_editor(nodes, full_ref, own=own + coerced)
+    check(f"scored against the real corpus == extracted with it ({quick:.6f} vs {full:.6f})",
           approx(quick, full))
-    check("merging planted nodes with the same scoring fields changes nothing",
-          approx(infer.score_editor(planted, ref, own=REAL)[1],
-                 infer.score_editor(inject.merged(planted), ref, own=REAL)[1]))
-    check("merging sums the load", approx(sum(n["load"] for n in inject.merged(planted)), 4.0))
 
 
-def two_board_corpus():
-    """The synthetic corpus with E also on the board of J2, a copy of J1 with the same
-    seat below the diagonal."""
-    data = corpus(points=[{"journal": "J1", "x": 2, "y": 20},
-                          {"journal": "J2", "x": 2, "y": 20}])
-    data["journals"]["J2"] = copy.deepcopy(data["journals"]["J1"])
-    return data
-
+# --- the test --------------------------------------------------------------------
 
 def test_run():
-    print("\n-- the run over every editor --")
-    trials = inject.run(corpus())
-    def host(profile, seats=1, ts=trials):
-        return {t["papers"]: t for t in ts if t["profile"] == profile
-                and t["seats"] == seats and t["band"] == "<=2"}
-
-    by_papers = host("one-off")
-    real = {r["ident"]: r for r in infer.rank_corpus(corpus(), inout_gate=False)}
-    check("no planted papers reproduces the real score",
-          approx(by_papers[0]["p"], real["E"]["p_genuine"]))
-    ps = [by_papers[k]["p"] for k in sorted(by_papers)]
-    check("every extra one-off paper lowers P(genuine)",
-          all(a > b for a, b in zip(ps, ps[1:])))
-    check("one coerced paper does not clear the gate, twenty do",
-          not by_papers[1]["gate"] and by_papers[20]["gate"])
-    follow_up = host("follow-up")
-    check("follow-up co-authorships (one tie outside) never lower P(genuine)",
-          all(follow_up[k]["p"] >= follow_up[0]["p"] for k in follow_up))
-    check("an editor on one board gets no run spread over two seats",
-          not any(t["seats"] == 2 for t in trials))
+    print("\n-- the run --")
+    trials, n_real, eligible = inject.run(two_journal_corpus())
+    check("every kind of fake editor is made in every eligible journal",
+          {(t["profile"], t["boards"], t["record"], round(t["share"], 4), t["journal"])
+           for t in trials}
+          == {s[:3] + (round(s[3], 4), j) for s in inject.settings() for j in eligible})
+    check("the real ranking the fakes are placed in has every real editor", n_real == 2)
+    by = {}
+    for t in trials:
+        if t["profile"] == "one-off" and t["boards"] == 1 and t["record"] == 30:
+            by.setdefault(round(t["share"], 4), []).append(t["p"])
+    medians = [sorted(by[s])[len(by[s]) // 2] for s in sorted(by)]
+    check("a larger coerced share lowers P(genuine)",
+          all(a > b for a, b in zip(medians, medians[1:])))
+    check("a career two-thirds built on one-off coercion is found",
+          all(p < 0.5 for p in by[round(2 / 3, 4)]))
     rows = inject.summarise(trials)
-    check("the summary has a row over all hosts for every one-seat run and count",
-          {(r["profile"], r["seats"], r["papers"]) for r in rows if r["hosts"] == "all"}
-          == {run + (k,) for run in inject.runs() if run[1] == 1
-              for k in inject.INJECT_PAPERS})
-    check("a gated share never exceeds the ungated one",
-          all(r["shortlisted_gated"] <= r["shortlisted"] for r in rows))
-
-    two = inject.run(two_board_corpus())
-    one_seat, spread = host("one-off", 1, two), host("one-off", 2, two)
-    check("an editor on two boards gets the one-off run spread over two seats",
-          set(spread) == set(inject.INJECT_PAPERS))
-    check("spread over two seats, no planted papers still reproduces the real score",
-          approx(spread[0]["p"], one_seat[0]["p"]))
-    check("ten papers in one seat clear the gate, five in each of two seats do not",
-          one_seat[10]["gate"] and not spread[10]["gate"])
-    check("the editor on two boards is counted in the multi-board host group",
-          any(r["hosts"] == inject.MULTI_BOARD and r["seats"] == 2
-              for r in inject.summarise(two)))
-
-
-def test_host_band():
-    print("\n-- host bands --")
-    check("1, 2 | 3, 10 | 11 papers fall in <=2 | 3-10 | >10",
-          [inject.host_band(n) for n in (1, 2, 3, 10, 11)]
-          == ["<=2", "<=2", "3-10", "3-10", ">10"])
-    check("the band names come in order", inject.host_band_names() == ["<=2", "3-10", ">10"])
+    check("the summary has a row for every kind of fake editor",
+          len(rows) == len(inject.settings()))
+    check("rank 1 is below every real editor, and ties rank before",
+          inject.rank_among(-5.0, [-1.0, 0.5]) == 1 and inject.rank_among(0.5, [-1.0, 0.5]) == 2
+          and inject.rank_among(9.0, [-1.0, 0.5]) == 3)
+    one = inject.run(corpus())[0]
+    check("with one eligible journal, no fake editor can sit on two boards",
+          not any(t["boards"] == 2 for t in one))
 
 
 def main():
-    test_planted_states()
-    test_donors()
-    test_seat()
+    test_counts()
+    test_coerced_states()
+    test_journals()
+    test_fake_editor()
     test_leave_out_is_exact()
     test_run()
-    test_host_band()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")
     raise SystemExit(1 if _failures else 0)
 
