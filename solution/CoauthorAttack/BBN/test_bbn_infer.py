@@ -77,9 +77,10 @@ def ranking_corpus():
         editor_labels={"E1": "Ed One", "E2": "Ed Two", "E3": "Ed Three"},
         editors={
             "E1": {"n_suspect_papers": 3, "is_pid": False,
-                   "inout_points": [{"journal": "J1", "x": 1, "y": 5}]},
+                   "inout_points": [{"year": 2010, "x": 1, "y": 5}]},
             "E2": {"n_suspect_papers": 3, "is_pid": True,
-                   "inout_points": [{"journal": "J1", "x": 4, "y": 2}]},
+                   "inout_points": [{"year": 2010, "x": 0, "y": 3},
+                                    {"year": 2011, "x": 4, "y": 2}]},
             "E3": {"n_suspect_papers": 1, "is_pid": False},
         })
 
@@ -391,9 +392,9 @@ def test_ranking():
           all(r["publishers"] == "acm" for r in rows))
 
     by_name = {r["name"]: r for r in rows}
-    check("the in/out gate flag follows the reddest board seat",
+    check("the in/out gate flag follows the reddest year on a board",
           by_name["Ed Two"]["passes_inout_gate"] and not by_name["Ed One"]["passes_inout_gate"]
-          and by_name["Ed Two"]["inout_x"] == 4)
+          and by_name["Ed Two"]["inout_x"] == 4 and by_name["Ed Two"]["inout_year"] == 2011)
     check("an editor without gate points does not pass",
           not by_name["Ed Three"]["passes_inout_gate"])
 
@@ -443,18 +444,20 @@ def test_records():
 
 def test_inout_gate():
     print("\n-- the in/out boundary (figure 8.7) --")
-    check("a seat exactly on the diagonal passes",
-          infer.passes_inout_gate([{"journal": "J", "x": 3, "y": 3}]))
-    check("one red seat carries an editor whose other seat is blameless",
-          infer.passes_inout_gate([{"journal": "A", "x": 1, "y": 9},
-                                   {"journal": "B", "x": 4, "y": 2}]))
-    check("more outside than inside on every seat fails",
-          not infer.passes_inout_gate([{"journal": "A", "x": 2, "y": 3}]))
+    check("a year exactly on the diagonal passes",
+          infer.passes_inout_gate([{"year": 2010, "x": 3, "y": 3}]))
+    check("one red year carries an editor whose other years are blameless",
+          infer.passes_inout_gate([{"year": 2010, "x": 1, "y": 9},
+                                   {"year": 2011, "x": 4, "y": 2}]))
+    check("more outside than inside in every year fails",
+          not infer.passes_inout_gate([{"year": 2010, "x": 2, "y": 3}]))
+    check("a year with no co-author at all (only solo papers) does not pass",
+          not infer.passes_inout_gate([{"year": 2010, "x": 0, "y": 0}]))
     check("an editor who was never plotted is never a pass",
           not infer.passes_inout_gate(None) and not infer.passes_inout_gate([]))
     check("the reddest point is the largest x - y, not the largest ratio",
-          infer.reddest_point([{"journal": "A", "x": 2, "y": 1},
-                               {"journal": "B", "x": 30, "y": 25}])["journal"] == "B")
+          infer.reddest_point([{"year": 2010, "x": 2, "y": 1},
+                               {"year": 2011, "x": 30, "y": 25}])["year"] == 2011)
     check("no points means no reddest point", infer.reddest_point([]) is None)
 
 

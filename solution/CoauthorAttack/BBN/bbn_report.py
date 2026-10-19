@@ -20,8 +20,8 @@ from collections import Counter, defaultdict
 
 from bbn_extract import baseline_counts, classify
 from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
-                       qualifies, rank_corpus, reference, score_editor, smooth,
-                       state_shares, typical_oneoff_share)
+                       passes_inout_gate, qualifies, rank_corpus, reference,
+                       score_editor, smooth, state_shares, typical_oneoff_share)
 from cs2_config import (ALPHA, ALPHA_SWEEP, FALLBACK_MIN_N, HEAD_P_LEVELS, INOUT_GATE,
                         MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES, MIN_RECORD_SWEEP,
                         OUTSIDE_READINGS, PERSONAL_SINGLE_CAP, POOL_MIN_SWEEP, PRIOR,
@@ -76,10 +76,10 @@ def print_gate(rows):
         print("  then rebuild the corpus with --stage corpus.")
         return
     points = [p for r in plotted for p in r["inout_points"]]
-    red = [p for p in points if p["x"] >= p["y"]]
+    red = [p for p in points if passes_inout_gate([p])]
     passing = [r for r in plotted if r["passes_inout_gate"]]
     print(f"  editors plotted {len(plotted)} of {len(rows)}; "
-          f"points (editor x board seat) {len(points)}")
+          f"points (editor x year on a board) {len(points)}")
     print(f"  points in the red region x >= y  {len(red):>6}"
           f"  ({pct(len(red), len(points))})")
     print(f"  editors with >= 1 red point      {len(passing):>6}"
@@ -90,6 +90,10 @@ def print_gate(rows):
     print(f"  passing editors: median "
           f"{statistics.median(r['n_suspect_papers'] for r in passing)} suspect papers, "
           f"{sum(r['n_suspect_papers'] >= 5 for r in passing)} with >= 5")
+    quiet = [r for r in passing
+             if all(p["y"] == 0 for p in r["inout_points"] if passes_inout_gate([p]))]
+    print(f"  ...of which {len(quiet)} pass only in years with nothing published outside "
+          f"({sum(r['p_genuine'] < SHORTLIST_THRESHOLD for r in quiet)} shortlisted)")
     margins = sorted((p["x"] - p["y"] for p in points), reverse=True)
     n = len(margins)
     print("  x - y at the top of the distribution: "

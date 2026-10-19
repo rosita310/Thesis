@@ -35,7 +35,9 @@ publisher fallback), gives rho, g(single) becomes g(single | j) * rho (at most
 
 All publishers form one corpus. An editor is one person across publishers: their co-authorships
 in ACM and IEEE journals add up to one P(genuine), and the in/out gate and the strict `outside`
-reading see all their board seats. The genuine baselines stay per publisher: a journal's own
+reading see all their board seats. The gate has one point per year the editor sits on a board:
+x counts their co-authors in the journals they edit that year, y those elsewhere that year, and
+an editor passes when one year has x >= y (and x >= 1). The genuine baselines stay per publisher: a journal's own
 baseline, the pooled fallback over the journals of the same publisher, and the same for the
 typical one-off share r_bar. An editor on the boards of one publisher gets the same score as in a
 corpus of that publisher alone.
@@ -59,8 +61,7 @@ existing `reports/journal_mapping.csv` are carried over as `verified`. Check eve
 |------------------|--------------------|------------------------------------------------------------------|
 | `pairs`          | database, extract  | suspect papers, co-authorships, board tenure, pre-tenure control |
 | `coauthors`      | dump               | every publication of the editors and co-authors                  |
-| `years`          | dump               | the year of each of those publications (co-author's career stage) |
-| `editor_authors` | dump               | authors and year of the editors' publications (in/out gate)      |
+| `editor_authors` | dump               | authors of the editors' publications, year of all of the above   |
 | `signer_authors` | dump               | authors of the signers' publications (co-authors' own networks)  |
 | `corpus`         | the files above    | `bbn_cs2_corpus.json`                                            |
 

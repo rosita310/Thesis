@@ -67,7 +67,7 @@ def corpus():
                              ("E1", "E2", "E3")},
             "editor_labels": {"E1": "Ed One", "E2": "Ed Two", "E3": "Ed Three"},
             "editors": {e: {"n_suspect_papers": 2, "is_pid": False,
-                            "inout_points": [{"journal": "J", "x": x, "y": y}]}
+                            "inout_points": [{"year": 2010, "x": x, "y": y}]}
                         for e, (x, y) in seats.items()}}
 
 
@@ -177,7 +177,7 @@ def pooled_corpus():
     nodes["O||J||small"] = node("O", "small", "single", 1.0, pool_n=5, pool_oneoffs=5)
     index = {e: [k for k in nodes if k.startswith(e + "|")] for e in ("E1", "E2", "E3", "O")}
     editors = {**data["editors"], "O": {"n_suspect_papers": 40, "is_pid": False,
-                                        "inout_points": [{"journal": "J", "x": 1, "y": 9}]}}
+                                        "inout_points": [{"year": 2010, "x": 1, "y": 9}]}}
     return {**data, "coauthorships": nodes, "editor_index": index, "editors": editors}
 
 

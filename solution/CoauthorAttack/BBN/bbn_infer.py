@@ -327,12 +327,13 @@ def state_shares(nodes):
 # ---------------------------------------------------------------------------
 
 def passes_inout_gate(points) -> bool:
-    """At least one board seat with x >= y (in-journal vs. outside co-authors)."""
-    return bool(points) and any(p["x"] >= p["y"] for p in points)
+    """At least one year on a board with x >= y (co-authors in the journals the editor
+    edits that year vs. elsewhere), and x at least 1."""
+    return bool(points) and any(p["x"] >= max(p["y"], 1) for p in points)
 
 
 def reddest_point(points):
-    """The board seat with the largest x - y."""
+    """The year on a board with the largest x - y."""
     return max(points, key=lambda p: p["x"] - p["y"]) if points else None
 
 
@@ -379,7 +380,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
             "n_suspect_papers": info.get("n_suspect_papers", 0),
             "n_pubs_outside_journal": info.get("n_pubs_outside_journal", 0),
             "inout_points": info.get("inout_points"),
-            "inout_journal": (reddest or {}).get("journal", ""),
+            "inout_year": (reddest or {}).get("year", ""),
             "inout_x": (reddest or {}).get("x", ""),
             "inout_y": (reddest or {}).get("y", ""),
             "passes_inout_gate": passes_inout_gate(info.get("inout_points")),
@@ -411,7 +412,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
 RANKING_COLUMNS = ["name", "pid", "publishers", "p_genuine", "woe", "n_suspect_papers",
                    "n_nodes", "load", "share_single", "share_outside",
                    "share_outside_1", "n_pubs_outside_journal",
-                   "inout_journal", "inout_x", "inout_y",
+                   "inout_year", "inout_x", "inout_y",
                    "passes_inout_gate", "n_control_nodes",
                    "control_share_single", "journals"]
 

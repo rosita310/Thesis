@@ -332,20 +332,21 @@ def test_scan_signatures():
         f'<{JKEY}A1> <{ns}yearOfPublication> '
         f'"2019"^^<http://www.w3.org/2001/XMLSchema#gYear> .\n'
         f'_:Sig_3 <{ns}signaturePublication> <{CONF}Orphan> .\n', suffix=".nt")
-    rows = extract.scan_signatures(dump, "a test",
-                                   lambda person, rec: {"person_id": person, "rec_key": rec})
+    rows, years = extract.scan_signatures(
+        dump, "a test", lambda person, rec: {"person_id": person, "rec_key": rec})
     check("a signature is resolved when its publication line arrives",
           {"person_id": "https://dblp.org/pid/1/2", "rec_key": JKEY + "A1"} in rows)
     check("a signature without a creator falls back to the base name",
           {"person_id": "No Pid", "rec_key": CONF + "B1"} in rows)
     check("a publication line with no buffered signature is dropped", len(rows) == 2)
-    kept = extract.scan_signatures(dump, "a test",
-                                   lambda person, rec: {"rec_key": rec, "person_id": person}
-                                   if rec == JKEY + "A1" else None)
+    check("without years_for no years are collected", years == {})
+    kept, _ = extract.scan_signatures(dump, "a test",
+                                      lambda person, rec: {"rec_key": rec, "person_id": person}
+                                      if rec == JKEY + "A1" else None)
     check("row_for decides what is kept", len(kept) == 1)
-    dated = extract.scan_signatures(dump, "a test",
-                                    lambda person, rec: {"rec_key": rec, "person_id": person},
-                                    years_for={JKEY + "A1", CONF + "B1"})
+    dated, years = extract.scan_signatures(
+        dump, "a test", lambda person, rec: {"rec_key": rec, "person_id": person},
+        years_for={JKEY + "A1", CONF + "B1"})
     year = {r["rec_key"]: r["year"] for r in dated}
     check("years_for adds the year, even when it follows the signatures in the dump",
           year[JKEY + "A1"] == "2019")
@@ -353,12 +354,12 @@ def test_scan_signatures():
           year[CONF + "B1"] == "")
     check("without years_for the rows carry no year at all",
           all("year" not in r for r in rows))
-
-    years = extract.scan_years(dump, {JKEY + "A1", CONF + "B1"})
-    check("scan_years finds the year of a wanted publication, and skips one without",
-          years == [{"rec_key": JKEY + "A1", "year": "2019"}])
-    check("scan_years ignores publications it was not asked for",
-          extract.scan_years(dump, {CONF + "B1"}) == [])
+    check("the years are returned for the publications that have one",
+          years == {JKEY + "A1": "2019"})
+    _, only = extract.scan_signatures(dump, "a test", lambda person, rec: None,
+                                      years_for={JKEY + "A1"})
+    check("a year is collected even for a publication none of whose rows is kept",
+          only == {JKEY + "A1": "2019"})
 
 
 # --- stage corpus -----------------------------------------------------------------
@@ -538,29 +539,38 @@ def test_editor_diagnostics_and_inout():
                CONF + "Old": "2005", CONF + "Undated": ""}
     mapping = {"J1": ["jkey"], "J2": ["jtwo"], "J3": []}
     seats = {"J1": (2010, 2015), "J2": (2010, 2015), "J3": (2010, 2015)}
-    pts = {p["journal"]: p for p in
+    pts = {p["year"]: p for p in
            extract.inout_points("E", seats, set(authors_of_pub), mapping,
                                 authors_of_pub, year_of)}
-    check("one point per mapped journal; an unmapped one is not plotted",
-          sorted(pts) == ["J1", "J2"])
-    check("x counts distinct in-journal co-authors, editor excluded",
-          pts["J1"]["x"] == 2)
-    check("a co-author seen both inside and outside is on both axes",
-          pts["J1"]["y"] == 2)
-    check("the same record read against another board seat moves to y",
-          pts["J2"] == {"journal": "J2", "x": 0, "y": 3})
+    check("one point per year on a board with a dated publication; 2005 is before "
+          "every seat and the undated one has no year",
+          sorted(pts) == [2010, 2012, 2015])
+    check("x counts distinct co-authors in the journals edited that year, editor excluded",
+          pts[2012] == {"year": 2012, "x": 2, "y": 0})
+    check("y counts the co-authors of that year's other publications",
+          pts[2010] == {"year": 2010, "x": 0, "y": 1} and pts[2015]["y"] == 1)
+    two = JKEY.replace("jkey", "jtwo")
+    authors_two = {**authors_of_pub, two + "Q": {"E", "C"}}
+    year_two = {**year_of, two + "Q": "2011"}
+    both = extract.inout_points("E", {"J1": (2010, 2015), "J2": (2010, 2015)},
+                                set(authors_two), mapping, authors_two, year_two)
+    check("a paper in another journal the editor edits that year counts inside",
+          {p["year"]: p for p in both}[2011] == {"year": 2011, "x": 1, "y": 0})
+    later = extract.inout_points("E", {"J1": (2010, 2015), "J2": (2013, 2015)},
+                                 set(authors_two), mapping, authors_two, year_two)
+    check("...but outside in a year before they joined that journal's board",
+          {p["year"]: p for p in later}[2011] == {"year": 2011, "x": 0, "y": 1})
+    check("a journal without a DBLP key gives no points",
+          extract.inout_points("E", {"J3": (2010, 2015)}, set(authors_of_pub), mapping,
+                               authors_of_pub, year_of) == [])
     check("a publication with no author list contributes nobody",
           extract.inout_points("E", {"J1": (2010, 2015)}, {CONF + "Q"}, mapping, {},
                                {CONF + "Q": "2012"})
-          == [{"journal": "J1", "x": 0, "y": 0}])
-    late = extract.inout_points("E", {"J1": (2013, 2015)}, set(authors_of_pub), mapping,
-                                authors_of_pub, year_of)
-    check("only the seat's own window counts, on both axes (P1 and X fall before it)",
-          late == [{"journal": "J1", "x": 0, "y": 1}])
+          == [{"year": 2012, "x": 0, "y": 0}])
     check("the window bounds are inclusive",
           extract.inout_points("E", {"J1": (2012, 2012)}, set(authors_of_pub), mapping,
                                authors_of_pub, year_of)
-          == [{"journal": "J1", "x": 2, "y": 0}])
+          == [{"year": 2012, "x": 2, "y": 0}])
 
     nodes = {"E||J1||A": {"editor_id": "E", "coauthor_id": "A"},
              "E||J1||B": {"editor_id": "E", "coauthor_id": "B"}}
@@ -575,8 +585,10 @@ def test_editor_diagnostics_and_inout():
     check("the editor's suspect papers and whole-career outside publications are counted",
           diag["E"]["n_pubs_outside_journal"] == 4
           and diag["E"]["n_suspect_papers"] == 1)
-    check("the gate point of a seat is read within that seat's window",
-          diag["E"]["inout_points"] == [{"journal": "J1", "x": 2, "y": 2}])
+    check("the gate points are the years within the editor's board windows",
+          diag["E"]["inout_points"] == [{"year": 2010, "x": 0, "y": 1},
+                                        {"year": 2012, "x": 2, "y": 0},
+                                        {"year": 2015, "x": 0, "y": 1}])
     check("a seat without a window gets no gate point",
           extract.editor_diagnostics({"E": list(nodes)}, {}, papers,
                                      {"E": set(authors_of_pub)}, mapping, authors_of_pub,

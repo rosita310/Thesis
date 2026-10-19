@@ -9,11 +9,10 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
         reads the database.
     python bbn_extract.py --stage coauthors
         Dump pass: every publication of those people.
-    python bbn_extract.py --stage years
-        Dump pass: the year of each of those publications, for the co-author's
-        career stage at the first paper with the editor.
     python bbn_extract.py --stage editor_authors
-        Dump pass: authors and year of every publication of the editors.
+        Dump pass: authors of every publication of the editors, and the year of
+        every publication the coauthors pass found (the in/out gate and the
+        co-author's career stage at the first paper with the editor).
     python bbn_extract.py --stage signer_authors
         Dump pass: authors of every publication of the suspect papers' signers:
         the co-authors' own networks, for the personal one-off baseline.
@@ -587,18 +586,19 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Stages: coauthors, years, editor_authors, signer_authors  (one dump pass each)
+# Stages: coauthors, editor_authors, signer_authors  (one dump pass each)
 # ---------------------------------------------------------------------------
 
 KEEP_PREDS = (SIG_PREDS - {P_SIG_ORDINAL}) | {P_SIG_PUBLICATION, P_YEAR}
 
 
 def scan_signatures(dump: Path, looking_for: str, row_for,
-                    years_for: set = frozenset()) -> list[dict]:
-    """The dump's author signatures, as `row_for(person, publication)` shapes them.
+                    years_for: set = frozenset()) -> tuple[list[dict], dict[str, str]]:
+    """The dump's author signatures, as `row_for(person, publication)` shapes them,
+    and the year of every publication in `years_for` that the dump gives one.
 
-    `row_for` returns the CSV row to keep, or None to drop the signature. Rows of
-    the publications in `years_for` also get the publication year.
+    `row_for` returns the CSV row to keep, or None to drop the signature. With
+    `years_for`, every kept row also gets the year of its publication.
     """
     pending: dict[str, dict] = {}
     rows: list[dict] = []
@@ -640,7 +640,7 @@ def scan_signatures(dump: Path, looking_for: str, row_for,
     if years_for:
         for row in rows:
             row["year"] = years.get(row["rec_key"], "")
-    return rows
+    return rows, years
 
 
 def stage_coauthors(out_dir: Path, dump: Path, force: bool) -> None:
@@ -652,74 +652,55 @@ def stage_coauthors(out_dir: Path, dump: Path, force: bool) -> None:
     if not wanted:
         sys.exit("\nERROR: wanted_pids.csv is empty. Run --stage pairs first.\n")
     print(f"\n=== COAUTHORS: one pass over the dump for {len(wanted)} people ===")
-    write_csv(out_path, scan_signatures(
+    rows, _ = scan_signatures(
         dump, f"the signatures of {len(wanted)} people",
         lambda person, rec: {"person_id": person, "rec_key": rec}
-        if person in wanted else None))
-    print("\nNext: --stage years")
-
-
-def scan_years(dump: Path, recs: set) -> list[dict]:
-    """The year of every publication in `recs` that the dump gives one."""
-    years: dict[str, str] = {}
-    start = time.time()
-    print(f"  scanning {dump} for the years of {len(recs)} publications ...")
-    with open_dump(dump) as f:
-        for i, line in enumerate(f, 1):
-            if i % PROGRESS_EVERY == 0:
-                print(f"    {i / 1e6:.0f}M lines, {len(years)} years found, "
-                      f"{time.time() - start:.0f}s")
-            if predicate_of(line) != P_YEAR:
-                continue
-            triple = parse_triple(line)
-            if triple is not None and triple[0] in recs:
-                years[triple[0]] = triple[2]
-    print(f"  done in {time.time() - start:.0f}s: {len(years)} of {len(recs)} "
-          f"publications have a year")
-    return [{"rec_key": rec, "year": year} for rec, year in sorted(years.items())]
-
-
-def stage_years(out_dir: Path, dump: Path, force: bool) -> None:
-    """The year of every publication the coauthors pass found, for the co-author's
-    career stage at the first paper with the editor."""
-    out_path = out_dir / "publication_years.csv"
-    if is_cached(out_path, force):
-        return
-    recs = {r["rec_key"] for r in read_csv(out_dir / "pid_publications.csv")}
-    if not recs:
-        sys.exit("\nERROR: pid_publications.csv is empty. Run --stage coauthors first.\n")
-    print(f"\n=== YEARS: one pass over the dump for {len(recs)} publications ===")
-    write_csv(out_path, scan_years(dump, recs))
+        if person in wanted else None)
+    write_csv(out_path, rows)
     print("\nNext: --stage editor_authors")
 
 
 def scan_authors_of(out_path: Path, out_dir: Path, dump: Path, people: set,
-                    banner: str, next_stage: str, with_year=False) -> None:
-    """The full author list of every publication of `people`, from one dump pass."""
-    pubs = {r["rec_key"] for r in read_csv(out_dir / "pid_publications.csv")
-            if r["person_id"] in people}
+                    banner: str, next_stage: str, years_path: Path | None = None) -> None:
+    """The full author list of every publication of `people`, from one dump pass.
+
+    With `years_path`, the same pass also writes there the year of every publication
+    in pid_publications.csv, and the author rows carry the year.
+    """
+    records = read_csv(out_dir / "pid_publications.csv")
+    pubs = {r["rec_key"] for r in records if r["person_id"] in people}
     if not pubs:
         sys.exit("\nERROR: no publications for any of them. Run --stage coauthors first.\n")
+    dated = {r["rec_key"] for r in records} if years_path else frozenset()
+    del records
     print(f"\n=== {banner}: one pass over the dump for the {len(pubs)} publications "
           f"of {len(people)} people ===")
-    write_csv(out_path, scan_signatures(
+    rows, years = scan_signatures(
         dump, f"the authors of {len(pubs)} publications",
         lambda person, rec: {"rec_key": rec, "person_id": person}
         if rec in pubs else None,
-        years_for=pubs if with_year else frozenset()))
+        years_for=dated)
+    write_csv(out_path, rows)
+    if years_path:
+        print(f"  {len(years)} of {len(dated)} publications have a year")
+        write_csv(years_path, [{"rec_key": rec, "year": year}
+                               for rec, year in sorted(years.items())])
     print(f"\nNext: --stage {next_stage}")
 
 
 def stage_editor_authors(out_dir: Path, dump: Path, force: bool) -> None:
-    """The full author list and the year of every publication an editor signed."""
+    """The full author list and the year of every publication an editor signed (for
+    the in/out gate), and the year of every publication of the editors and co-authors
+    (for the co-author's career stage at the first paper with the editor)."""
     out_path = out_dir / "editor_pub_authors.csv"
-    if is_cached(out_path, force):
+    years_path = out_dir / "publication_years.csv"
+    if is_cached(out_path, force) and is_cached(years_path, force):
         return
     editors = {r["editor_id"] for r in read_csv(out_dir / "suspect_papers.csv")}
     if not editors:
         sys.exit("\nERROR: suspect_papers.csv is empty. Run --stage pairs first.\n")
     scan_authors_of(out_path, out_dir, dump, editors, "EDITOR AUTHORS", "signer_authors",
-                    with_year=True)
+                    years_path=years_path)
 
 
 def stage_signer_authors(out_dir: Path, reports_dir: Path, dump: Path, force: bool) -> None:
@@ -741,27 +722,29 @@ def stage_signer_authors(out_dir: Path, reports_dir: Path, dump: Path, force: bo
 
 def inout_points(editor_id: str, seats: dict, pubs, mapping, authors_of_pub,
                  year_of: dict) -> list:
-    """The in/out gate: one (x, y) point per board seat the editor holds.
+    """The in/out gate: one (x, y) point per year the editor sits on a board.
 
-    `seats` maps each journal to the editor's (first, last) board year there; only
-    publications with a year inside that window count.
+    `seats` maps each journal to the editor's (first, last) board year there. In a
+    year, x counts the co-authors on the editor's publications in the journals whose
+    board they sit on that year, and y the co-authors on their other publications of
+    that year. A journal without a DBLP key is left out.
     """
-    points = []
-    for journal, (first, last) in seats.items():
-        keys = set(mapping.get(journal, []))
-        if not keys:
+    keys_of = {j: set(mapping.get(j, [])) for j in seats}
+    inside, outside = defaultdict(set), defaultdict(set)
+    for rec in pubs:
+        year = year_of.get(rec, "")
+        if not year:
             continue
-        inside, outside = set(), set()
-        for rec in pubs:
-            year = year_of.get(rec, "")
-            if not year or not first <= int(year) <= last:
-                continue
-            target = inside if is_inside(rec, keys) else outside
-            target.update(authors_of_pub.get(rec, ()))
-        inside.discard(editor_id)
-        outside.discard(editor_id)
-        points.append({"journal": journal, "x": len(inside), "y": len(outside)})
-    return points
+        year = int(year)
+        on_board = [j for j, (first, last) in seats.items()
+                    if first <= year <= last and keys_of[j]]
+        if not on_board:
+            continue
+        here = any(is_inside(rec, keys_of[j]) for j in on_board)
+        (inside if here else outside)[year].update(authors_of_pub.get(rec, ()))
+    return [{"year": year, "x": len(inside[year] - {editor_id}),
+             "y": len(outside[year] - {editor_id})}
+            for year in sorted(set(inside) | set(outside))]
 
 
 def benign_reason(entry, coauthor_pubs=None) -> str:
@@ -872,11 +855,15 @@ def editor_diagnostics(editor_index, labels, papers, pubs_of, mapping,
     """Per editor: what they published, where, and their in/out gate points.
 
     `inout_points` is None when --stage editor_authors has not been run.
-    `windows` maps (journal, editor) to the (first, last) board year.
+    `windows` maps (journal, editor) to the (first, last) board year, for the seats
+    in which the editor has a suspect paper.
     """
     papers_by_editor = defaultdict(list)
     for paper in papers:
         papers_by_editor[paper["editor_id"]].append(paper)
+    seats_of = defaultdict(dict)
+    for (journal, ed_id), window in windows.items():
+        seats_of[ed_id][journal] = window
 
     per_editor = {}
     for ed_id in sorted(set(editor_index) | set(papers_by_editor)):
@@ -884,8 +871,7 @@ def editor_diagnostics(editor_index, labels, papers, pubs_of, mapping,
         in_journals = {p["journal"] for p in own}
         in_keys = {k for j in in_journals for k in mapping.get(j, [])}
         pubs = pubs_of.get(ed_id, set())
-        seats = {j: windows[(j, ed_id)] for j in sorted(in_journals)
-                 if (j, ed_id) in windows}
+        seats = seats_of.get(ed_id, {})
         per_editor[ed_id] = {
             "name": labels.get(ed_id, ed_id),
             "is_pid": ed_id.startswith(PID_PREFIX),
@@ -944,7 +930,8 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     pubs_of = publications_of(out_dir / "pid_publications.csv")
     years_path = out_dir / "publication_years.csv"
     if not years_path.exists():
-        sys.exit(f"\nERROR: {years_path.name} not found. Run --stage years first.\n")
+        sys.exit(f"\nERROR: {years_path.name} not found. Run --stage editor_authors "
+                 "--force.\n")
     pub_year = {row["rec_key"]: row["year"] for row in read_csv(years_path)}
 
     authors_path = out_dir / "editor_pub_authors.csv"
@@ -1044,7 +1031,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the CS2 co-authorship BBN corpus (read-only).")
     parser.add_argument("--stage", required=True,
-                        choices=["pairs", "coauthors", "years", "editor_authors",
+                        choices=["pairs", "coauthors", "editor_authors",
                                  "signer_authors", "corpus", "all"])
     parser.add_argument("--reports-dir", default=str(REPORTS_DIR),
                         help="dblp_extract.py's --out-dir (holds extract/ and the mapping)")
@@ -1057,7 +1044,7 @@ def main() -> None:
                         help="verified journal mapping CSV "
                              "(default: <reports-dir>/journal_mapping.csv)")
     parser.add_argument("--force", action="store_true",
-                        help="redo a cached dump pass (coauthors, years, editor_authors, "
+                        help="redo a cached dump pass (coauthors, editor_authors, "
                              "signer_authors)")
     args = parser.parse_args()
 
@@ -1074,8 +1061,6 @@ def main() -> None:
         stage_pairs(db, reports_dir, out_dir, mapping_path)
     if args.stage in ("coauthors", "all"):
         stage_coauthors(out_dir, dump, args.force)
-    if args.stage in ("years", "all"):
-        stage_years(out_dir, dump, args.force)
     if args.stage in ("editor_authors", "all"):
         stage_editor_authors(out_dir, dump, args.force)
     if args.stage in ("signer_authors", "all"):
