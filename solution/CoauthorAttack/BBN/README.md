@@ -6,22 +6,6 @@ one of its authors on the board. ACM and IEEE journals are covered.
 
 All settings are in `cs2_config.py`; the scripts take only paths on the command line.
 
-## The network
-
-Each co-authorship of an editor E with a co-author A in journal j is one node with a load (one
-suspect paper carries load 1, split over its co-authors) and a tie: `outside_5plus`,
-`outside_2_4`, `outside_1` (papers E and A share outside j), `repeated` or `single` (only inside
-j). The network is G -> tie <- A's one-off habit, with the habit observed. A node adds
-load * log LR to E's log-odds, with LR = g(t) / (alpha m(t) + (1 - alpha) g(t)): m(t) is the
-elicited tie distribution of a coerced co-authorship, g(t) the genuine one.
-
-g(t) is journal j's tie distribution without E's own nodes, smoothed, with a fallback to the
-publisher's pool below `FALLBACK_MIN_N` (N_min) of load. For a co-author with at least N_min
-collaborators of their own (outside E and the node's own papers), g is made personal: A's
-one-off habit (k + 0.5) / (n + 1), of n collaborators k with whom A shares one publication only,
-over the journal's typical habit, its load-weighted mean (again without E, with the same
-publisher fallback), gives the habit ratio; g(single) becomes g(single | j) times that ratio
-(at most `PERSONAL_SINGLE_CAP`) and the other ties are rescaled to sum to 1.
 
 ## Input
 
@@ -33,19 +17,10 @@ publisher fallback), gives the habit ratio; g(single) becomes g(single | j) time
 
 ## Publishers
 
-All publishers form one corpus. An editor is one person across publishers: their co-authorships
-in ACM and IEEE journals add up to one P(genuine), and the in/out gate and the strict `outside`
-reading see all their board seats. The gate has one point per year the editor sits on a board:
-x counts their co-authors in the journals they edit that year, y those elsewhere that year, and
-an editor passes when one year has x >= y (and x >= 1). The genuine baselines stay per publisher: a journal's own
-baseline, the pooled fallback over the journals of the same publisher, and the same for the
-typical one-off habit. An editor on the boards of one publisher gets the same score as in a
-corpus of that publisher alone.
-
 A front-matter issue is joined to dblp on volume and issue for ACM, and on year and issue for
 IEEE. Parts of one IEEE issue (`2_Part_1`, `2_Part_2`) map to the same dblp issue and are merged.
 A board name matches a signer when the names agree ignoring case, accents and punctuation, or,
-failing that, on the surname with a compatible first initial (`W. R. STONE` and `W. Ross Stone`).
+failing that, on the surname with a compatible first initial (`J. A. DOE` and `J. Aron Doe`).
 
 ## Pipeline
 
@@ -71,11 +46,7 @@ The dump stages are cached; `--force` redoes them.
 `bbn/bbn_cs2_scored.json`, with the publishers of each editor. `bbn_report.py` prints the
 diagnostics and sensitivity sweeps, and `bbn_placebo.py` runs the within-paper placebo tests and
 writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` makes fake editors who built a career on
-coercion: a record of 15 or 30 papers in one journal, a third, half or two-thirds of them
-coerced. The genuine papers are real co-authorships of other editors in that journal, the
-coerced ones have co-authors who share nothing with the editor outside it. Each fake editor is
-scored on its own against the real corpus, without the gate, and placed in the real ranking; how
-often they fall below 0.5 and their median rank go to `bbn/bbn_cs2_injection.csv`.
+coercion; how often they fall below 0.5 and their median rank go to `bbn/bbn_cs2_injection.csv`.
 
 ```
 python ../IEEE/parse_json_to_DB.py         # once, and after new IEEE front matter
