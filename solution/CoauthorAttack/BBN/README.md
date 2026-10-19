@@ -18,10 +18,10 @@ elicited tie distribution of a coerced co-authorship, g(t) the genuine one.
 g(t) is journal j's tie distribution without E's own nodes, smoothed, with a fallback to the
 publisher's pool below `FALLBACK_MIN_N` (N_min) of load. For a co-author with at least N_min
 collaborators of their own (outside E and the node's own papers), g is made personal: A's
-one-off share (k + 0.5) / (n + 1), of n collaborators k with whom A shares one publication only,
-over r_bar_j, the journal's load-weighted typical share (again without E, with the same
-publisher fallback), gives rho, g(single) becomes g(single | j) * rho (at most
-`PERSONAL_SINGLE_CAP`) and the other ties are rescaled to sum to 1.
+one-off habit (k + 0.5) / (n + 1), of n collaborators k with whom A shares one publication only,
+over the journal's typical habit, its load-weighted mean (again without E, with the same
+publisher fallback), gives the habit ratio; g(single) becomes g(single | j) times that ratio
+(at most `PERSONAL_SINGLE_CAP`) and the other ties are rescaled to sum to 1.
 
 ## Input
 
@@ -39,7 +39,7 @@ reading see all their board seats. The gate has one point per year the editor si
 x counts their co-authors in the journals they edit that year, y those elsewhere that year, and
 an editor passes when one year has x >= y (and x >= 1). The genuine baselines stay per publisher: a journal's own
 baseline, the pooled fallback over the journals of the same publisher, and the same for the
-typical one-off share r_bar. An editor on the boards of one publisher gets the same score as in a
+typical one-off habit. An editor on the boards of one publisher gets the same score as in a
 corpus of that publisher alone.
 
 A front-matter issue is joined to dblp on volume and issue for ACM, and on year and issue for

@@ -139,44 +139,44 @@ def personal_corpus():
                   editors={e: {"n_suspect_papers": 1} for e in index}), mine
 
 
-def test_oneoff_share():
-    print("\n-- the co-author's one-off share --")
-    check("share_A = (k + 0.5) / (n + 1)",
-          approx(infer.oneoff_share({"pool_n": 39, "pool_oneoffs": 9}), 9.5 / 40))
-    zero = infer.oneoff_share({"pool_n": 40, "pool_oneoffs": 0})
-    check(f"the pseudo-count keeps share_A above 0 when k = 0 (got {zero:.4f})",
+def test_oneoff_habit():
+    print("\n-- the co-author's one-off habit --")
+    check("the habit is (k + 0.5) / (n + 1)",
+          approx(infer.oneoff_habit({"pool_n": 39, "pool_oneoffs": 9}), 9.5 / 40))
+    zero = infer.oneoff_habit({"pool_n": 40, "pool_oneoffs": 0})
+    check(f"the pseudo-count keeps the habit above 0 when k = 0 (got {zero:.4f})",
           zero > 0 and approx(zero, 0.5 / 41))
     check("...and below 1 when every collaborator is a one-off",
-          infer.oneoff_share({"pool_n": 40, "pool_oneoffs": 40}) < 1)
+          infer.oneoff_habit({"pool_n": 40, "pool_oneoffs": 40}) < 1)
     check("N_min collaborators qualify, one fewer do not, no network never",
           infer.qualifies({"pool_n": N_MIN}, N_MIN)
           and not infer.qualifies({"pool_n": N_MIN - 1}, N_MIN)
           and not infer.qualifies({"pool_n": None}, 0))
 
 
-def test_typical_share():
-    print("\n-- r_bar_j: leave-one-editor-out and the publisher fallback --")
+def test_typical_habit():
+    print("\n-- the typical habit: leave-one-editor-out and the publisher fallback --")
     data, mine = personal_corpus()
     r = infer.reference(data)
     others_acm = 20 * share(39, 19) + 20 * share(39, 29) + 10 * share(39, 14)
     with_mine = others_acm + 10 * share(39, 9) + 4 * share(59, 50)
-    whole, level = infer.typical_oneoff_share(r, "J1", [])
+    whole, level = infer.typical_habit(r, "J1", [])
     expected = (20 * share(39, 19) + 20 * share(39, 29) + 10 * share(39, 9)) / 50
-    check(f"r_bar of J1 is the load-weighted mean share_A of its qualifying "
+    check(f"J1's typical habit is the load-weighted mean habit of its qualifying "
           f"co-authorships ({whole:.4f})", level == "journal" and approx(whole, expected))
-    loo, level = infer.typical_oneoff_share(r, "J1", mine)
+    loo, level = infer.typical_habit(r, "J1", mine)
     check(f"leaving the editor out removes their own co-authorships ({loo:.4f})",
           level == "journal"
           and approx(loo, (20 * share(39, 19) + 20 * share(39, 29)) / 40))
-    pooled, level = infer.typical_oneoff_share(r, "J2", [])
-    thin, level_mine = infer.typical_oneoff_share(r, "J2", mine)
+    pooled, level = infer.typical_habit(r, "J2", [])
+    thin, level_mine = infer.typical_habit(r, "J2", mine)
     check(f"a journal below N_min falls back to its publisher (got {level}, "
           f"{level_mine} with the editor left out)", level == level_mine == "pooled")
     check("...whose pool is the ACM journals only, without the editor's own "
           "co-authorships", approx(thin, others_acm / 50)
           and approx(pooled, with_mine / 64))
-    check("a publisher with no qualifying load gives no r_bar",
-          infer.typical_oneoff_share(infer.reference(corpus()), "J1", []) == (None, ""))
+    check("a publisher with no qualifying load gives no typical habit",
+          infer.typical_habit(infer.reference(corpus()), "J1", []) == (None, ""))
     off = infer.reference(data, pool_min=math.inf)
     check("pool_min = inf leaves the sums empty",
           off.oneoff_journal == {} and off.oneoff_pooled == {})
@@ -185,15 +185,16 @@ def test_typical_share():
 def test_personal_column():
     print("\n-- the personal genuine column --")
     gdist, _ = infer.genuine_dist(REF, "J1", "established", [])
-    for rho in (0.1, 0.8, 1.0, 1.7):
-        g = infer.personal_column(gdist, rho)
-        check(f"rho={rho}: g_i(single) = g(single|j) * rho and the column sums to 1",
-              approx(g["single"], gdist["single"] * rho) and approx(sum(g.values()), 1.0))
+    for habit_ratio in (0.1, 0.8, 1.0, 1.7):
+        g = infer.personal_column(gdist, habit_ratio)
+        check(f"habit ratio {habit_ratio}: g_i(single) = g(single|j) * ratio and the "
+              f"column sums to 1",
+              approx(g["single"], gdist["single"] * habit_ratio) and approx(sum(g.values()), 1.0))
     g = infer.personal_column(gdist, 1.7)
     check("the other ties are rescaled by one common factor",
           approx(g["outside"] / gdist["outside"], g["repeated"] / gdist["repeated"]))
     capped = infer.personal_column(gdist, 1e6)
-    check(f"a huge rho is capped at {infer.PERSONAL_SINGLE_CAP}, still summing to 1",
+    check(f"a huge habit ratio is capped at {infer.PERSONAL_SINGLE_CAP}, still summing to 1",
           approx(capped["single"], infer.PERSONAL_SINGLE_CAP)
           and approx(sum(capped.values()), 1.0))
 
@@ -252,11 +253,12 @@ def test_no_qualifying_node_is_the_tie_model():
     check("with qualifying co-authors the score does move",
           not approx(adjusted["E"]["woe"], off["E"]["woe"]))
     d = {x["journal"]: x for x in adjusted["E"]["detail"]}
-    check("the detail records rho, the journal's and the adjusted g, and the r_bar level",
+    check("the detail records the habit ratio, the journal's and the adjusted g, and the "
+          "typical habit's level",
           d["J1"]["adjusted"] and d["J1"]["oneoff_level"] == "journal"
           and d["J2"]["oneoff_level"] == "pooled"
           and approx(d["J2"]["single_p"],
-                     min(d["J2"]["journal_single_p"] * d["J2"]["rho"],
+                     min(d["J2"]["journal_single_p"] * d["J2"]["habit_ratio"],
                          infer.PERSONAL_SINGLE_CAP), 1e-5))
 
 
@@ -472,8 +474,8 @@ def test_formatting():
 
 def main():
     test_likelihood_ratios()
-    test_oneoff_share()
-    test_typical_share()
+    test_oneoff_habit()
+    test_typical_habit()
     test_personal_column()
     test_no_qualifying_node_is_the_tie_model()
     test_load_accumulation()

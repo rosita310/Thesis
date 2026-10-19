@@ -1,14 +1,20 @@
 """
-Within-paper placebo tests: every statistic of the editor on a suspect paper is
-recomputed with each non-board signer of that paper in the editor's place.
+Within-paper placebo: do editors look different from the other authors of their
+own suspect papers?
 
-    1. venue-locking: the share of the focal person's co-authors on the paper
-       with whom they published only inside this journal.
-    2. pattern fit: where the focal person sits in each co-author's own
-       collaborator distribution. Needs bbn/signer_pub_authors.csv. A validation
-       statistic only; the network does not use it.
+On every suspect paper, each statistic is computed for the editor and again for
+every author who is not on the board, as if that author were the editor. If
+board membership changed nothing, the editor would look like these stand-ins.
 
-Writes bbn/bbn_cs2_placebo.csv with the per-editor permutation test.
+    1. venue-locked share: the share of the person's co-authors on the paper
+       with whom they have published only in this journal.
+    2. pattern fit: how close the person is to each co-author, compared with that
+       co-author's other collaborators. Needs bbn/signer_pub_authors.csv. Only a
+       check; the network does not use it.
+
+Both are printed. A permutation test per editor then asks whether the editor's
+venue-locked share, over all their papers, is higher than with stand-ins drawn
+at random in their place. The result is written to bbn/bbn_cs2_placebo.csv.
 
     python bbn_placebo.py [--in bbn]
 """

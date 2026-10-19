@@ -4,11 +4,9 @@ and writes, beside the corpus, bbn_cs2_ranking.csv (one row per ranked editor)
 and bbn_cs2_scored.json (the same editors with the per-node evidence).
 
 Every co-authorship adds load * log LR of its tie to the editor's log-odds. The
-genuine column of a tie is the journal's, without the editor's own nodes, made
-personal for a co-author with at least FALLBACK_MIN_N collaborators of their own:
-g(single) is scaled by rho, the co-author's one-off share over the journal's
-typical one, and the other ties make up the rest. The network is G -> tie <- the
-co-author's one-off habit (observed).
+genuine column of a tie is the journal's, without the editor's own nodes.
+g(single) is scaled by the co-author's one-off habit over the journal's
+typical habit. The network is G -> tie <- the co-author's one-off habit (observed).
 
     python bbn_infer.py [--in bbn/bbn_cs2_corpus.json]
 """
@@ -60,7 +58,7 @@ class Reference:
     publisher_of    journal -> publisher
     pool_min        collaborators a co-author needs for the personal adjustment;
                     math.inf switches the adjustment off
-    oneoff_journal  journal -> (sum of load * share_A, sum of load) over the scored
+    oneoff_journal  journal -> (sum of load * habit, sum of load) over the scored
                     co-authorships that reach pool_min
     oneoff_pooled   publisher -> the same, summed over its journals
     """
@@ -164,9 +162,9 @@ def genuine_dist(ref: Reference, journal, stage, own,
 # The personal one-off baseline: g(single) scaled by the co-author's own habit
 # ---------------------------------------------------------------------------
 
-def oneoff_share(node):
-    """share_A = (k + lambda) / (n + 2 lambda): how often the co-author publishes
-    only once with a collaborator, from pool_oneoffs (k) of pool_n (n)."""
+def oneoff_habit(node):
+    """The co-author's one-off habit (k + lambda) / (n + 2 lambda): how often they
+    publish only once with a collaborator, from pool_oneoffs (k) of pool_n (n)."""
     return ((node["pool_oneoffs"] + PSEUDO_COUNT)
             / (node["pool_n"] + 2 * PSEUDO_COUNT))
 
@@ -177,14 +175,14 @@ def qualifies(node, pool_min) -> bool:
 
 
 def oneoff_sums(nodes, publisher_of, pool_min) -> tuple[dict, dict]:
-    """(sum of load * share_A, sum of load) over the qualifying nodes, per journal
+    """(sum of load * habit, sum of load) over the qualifying nodes, per journal
     and per publisher."""
     by_journal = defaultdict(lambda: [0.0, 0.0])
     by_publisher = defaultdict(lambda: [0.0, 0.0])
     for node in nodes:
         if not qualifies(node, pool_min):
             continue
-        weighted = node["load"] * oneoff_share(node)
+        weighted = node["load"] * oneoff_habit(node)
         for sums in (by_journal[node["journal"]],
                      by_publisher[publisher_of.get(node["journal"], "")]):
             sums[0] += weighted
@@ -197,18 +195,21 @@ def without_own(sums, own, match, pool_min) -> tuple[float, float]:
     weighted, load = sums
     for node in own:
         if match(node) and qualifies(node, pool_min):
-            weighted -= node["load"] * oneoff_share(node)
+            weighted -= node["load"] * oneoff_habit(node)
             load -= node["load"]
     return weighted, load
 
 
-def typical_oneoff_share(ref: Reference, journal, own):
-    """r_bar_j: the load-weighted mean share_A of the journal's qualifying
-    co-authorships, without the `own` nodes.
+def typical_habit(ref: Reference, journal, own):
+    """The journal's typical one-off habit, and where it came from.
 
-    Returns (r_bar, level). The journal is used when its qualifying load after
-    removing `own` reaches FALLBACK_MIN_N, else the pool of the journal's publisher;
-    (None, "") when that has no load left either.
+    This is the load-weighted mean one-off habit over the journal's co-authors with
+    enough collaborators, leaving out the scored editor's own co-authorships
+    (`own`). If less than FALLBACK_MIN_N of load is left, all journals of the same
+    publisher are pooled instead.
+
+    Returns (typical_habit, "journal"), (typical_habit, "pooled"), or (None, "")
+    when even the pool has no load left.
     """
     publisher = ref.publisher_of.get(journal, "")
     weighted, load = without_own(ref.oneoff_journal.get(journal, (0.0, 0.0)), own,
@@ -223,26 +224,27 @@ def typical_oneoff_share(ref: Reference, journal, own):
     return None, ""
 
 
-def personal_column(gdist, rho, cap=PERSONAL_SINGLE_CAP) -> dict:
-    """g_i: the journal's column with g(single) scaled by rho (at most `cap`) and
-    every other state rescaled by the same factor, so that it sums to 1."""
-    single = min(gdist["single"] * rho, cap)
+def personal_column(gdist, habit_ratio, cap=PERSONAL_SINGLE_CAP) -> dict:
+    """g_i: the journal's column with g(single) scaled by the habit ratio (at most
+    `cap`) and every other state rescaled by the same factor, so that it sums to 1."""
+    single = min(gdist["single"] * habit_ratio, cap)
     rest = (1 - single) / (1 - gdist["single"])
     return {s: single if s == "single" else p * rest for s, p in gdist.items()}
 
 
 def personal_dist(ref: Reference, node, gdist, own):
-    """The genuine column of one co-authorship: (g_i, rho, level of r_bar).
+    """The genuine column of one co-authorship: (g_i, the habit ratio, the level of
+    the typical habit).
 
-    A co-author below ref.pool_min keeps the journal's column, with rho None.
+    A co-author below ref.pool_min keeps the journal's column, with no habit ratio.
     """
     if not qualifies(node, ref.pool_min):
         return gdist, None, ""
-    r_bar, level = typical_oneoff_share(ref, node["journal"], own)
-    if r_bar is None:
+    typical, level = typical_habit(ref, node["journal"], own)
+    if typical is None:
         return gdist, None, ""
-    rho = oneoff_share(node) / r_bar
-    return personal_column(gdist, rho), rho, level
+    habit_ratio = oneoff_habit(node) / typical
+    return personal_column(gdist, habit_ratio), habit_ratio, level
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +271,7 @@ def score_editor(nodes, ref: Reference, alpha=ALPHA, prior=PRIOR,
     """log_odds = log prior_odds + SUM load * log LR over one editor's nodes.
 
     `own` are the editor's nodes that the reference counts, and so the ones the
-    baselines (the journal column and r_bar) leave out; by default all of `nodes`.
+    baselines (the journal column and the typical habit) leave out; by default all of `nodes`.
     Returns (P(genuine), log_odds, detail), with one detail record per node.
     """
     own = nodes if own is None else own
@@ -278,16 +280,17 @@ def score_editor(nodes, ref: Reference, alpha=ALPHA, prior=PRIOR,
     for node in nodes:
         gdist, level = genuine_dist(ref, node["journal"], node["career_stage"], own,
                                     condition_on_career_stage=condition_on_career_stage)
-        pdist, rho, oneoff_level = personal_dist(ref, node, gdist, own)
+        pdist, habit_ratio, oneoff_level = personal_dist(ref, node, gdist, own)
         lr = node_lr(node["state"], pdist, alpha, manip)
         contribution = node["load"] * math.log(lr)
         log_odds += contribution
-        detail.append(node_detail(node, gdist, level, pdist, rho, oneoff_level,
+        detail.append(node_detail(node, gdist, level, pdist, habit_ratio, oneoff_level,
                                   lr, contribution))
     return log_odds_to_p(log_odds), log_odds, detail
 
 
-def node_detail(node, gdist, level, pdist, rho, oneoff_level, lr, contribution) -> dict:
+def node_detail(node, gdist, level, pdist, habit_ratio, oneoff_level, lr,
+                contribution) -> dict:
     """The record of one scored co-authorship: its tie, the journal's and its own
     genuine column, and what it adds to the editor's log-odds."""
     state = node["state"]
@@ -304,8 +307,8 @@ def node_detail(node, gdist, level, pdist, rho, oneoff_level, lr, contribution) 
         "journal_genuine_p": round(gdist[state], 6),
         "journal_single_p": round(gdist["single"], 6),
         "pool_n": node.get("pool_n"), "pool_oneoffs": node.get("pool_oneoffs"),
-        "adjusted": rho is not None,
-        "rho": round(rho, 6) if rho is not None else None,
+        "adjusted": habit_ratio is not None,
+        "habit_ratio": round(habit_ratio, 6) if habit_ratio is not None else None,
         "oneoff_level": oneoff_level,
         "single_p": round(pdist["single"], 6),
         "genuine_p": round(pdist[state], 6),
@@ -473,11 +476,11 @@ def print_shortlist(shortlist, records) -> None:
     print(f"\n=== EVIDENCE BREAKDOWN (lowest-scoring editor: {top['name']!r}) ===")
     print("  (LR<1 lowers genuineness; the contribution is load * log LR)")
     for d in top["coauthorships"][:BREAKDOWN_PRINT_CAP]:
-        rho = f"{d['rho']:.2f}" if d["adjusted"] else "-"
+        habit_ratio = f"{d['habit_ratio']:.2f}" if d["adjusted"] else "-"
         print(f"     {d['state']:<9} load={d['load']:>5.2f} "
               f"{d['coauthor'][:26]:<26} pubs={str(d['coauthor_pubs']):>5} "
               f"[{d['fallback_level']:<14}] journal g={d['journal_genuine_p']:.4f} "
-              f"rho={rho:>5} g={d['genuine_p']:.4f} "
+              f"habit ratio={habit_ratio:>5} g={d['genuine_p']:.4f} "
               f"LR={d['lr']:>6.3f} w.logLR={d['weighted_log_lr']:>+7.3f}")
     if len(top["coauthorships"]) > BREAKDOWN_PRINT_CAP:
         print(f"     ... (+{len(top['coauthorships']) - BREAKDOWN_PRINT_CAP} "

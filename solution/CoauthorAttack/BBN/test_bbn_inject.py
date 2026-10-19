@@ -76,7 +76,7 @@ def two_journal_corpus():
 
 def with_in_baseline(data, coerced):
     """The corpus as it would be had the coerced nodes been extracted with it: in
-    the journal's baseline and among the co-authorships r_bar is taken over."""
+    the journal's baseline and among the co-authorships the typical habit is taken over."""
     data = copy.deepcopy(data)
     counts = data["journals"]["J1"]["baseline_counts"]["established"]
     for i, n in enumerate(coerced):

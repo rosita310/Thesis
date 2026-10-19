@@ -181,24 +181,25 @@ def pooled_corpus():
     return {**data, "coauthorships": nodes, "editor_index": index, "editors": editors}
 
 
-def test_rho_bins():
-    print("\n-- the bins of rho --")
+def test_habit_ratio_bins():
+    print("\n-- the bins of the habit ratio --")
     check("an edge belongs to the bin above it",
-          [report.rho_bin(r, [0.5, 1.0]) for r in (0.1, 0.5, 0.99, 1.0, 7)] == [0, 1, 1, 2, 2])
+          [report.habit_ratio_bin(r, [0.5, 1.0]) for r in (0.1, 0.5, 0.99, 1.0, 7)]
+          == [0, 1, 1, 2, 2])
     check("the labels name every bin, the open ends included",
-          report.rho_labels([0.25, 0.5, 2.0]) == ["<0.25", "0.25-0.5", "0.5-2", ">2"])
-    details = [{"rho": 0.4, "load": 1.0, "state": "single", "single_p": 0.04,
+          report.habit_ratio_labels([0.25, 0.5, 2.0]) == ["<0.25", "0.25-0.5", "0.5-2", ">2"])
+    details = [{"habit_ratio": 0.4, "load": 1.0, "state": "single", "single_p": 0.04,
                 "journal_single_p": 0.1},
-               {"rho": 0.6, "load": 3.0, "state": "outside_1", "single_p": 0.06,
+               {"habit_ratio": 0.6, "load": 3.0, "state": "outside_1", "single_p": 0.06,
                 "journal_single_p": 0.1},
-               {"rho": 1.5, "load": 2.0, "state": "single", "single_p": 0.15,
+               {"habit_ratio": 1.5, "load": 2.0, "state": "single", "single_p": 0.15,
                 "journal_single_p": 0.1}]
     rows = report.calibration(details, edges=[1.0])
     check("the calibration has one row per non-empty bin",
           [r["bin"] for r in rows] == ["<1", ">1"])
     low = rows[0]
     check("...with load-weighted means and the observed `single` load share",
-          approx(low["load"], 4.0) and approx(low["rho"], 0.55)
+          approx(low["load"], 4.0) and approx(low["habit_ratio"], 0.55)
           and approx(low["observed"], 0.25) and approx(low["predicted"], 0.055)
           and approx(low["journal"], 0.1))
 
@@ -211,9 +212,9 @@ def test_personal_reports():
     check("coverage: the share of the load whose co-author reaches N_min",
           f"{'acm':<10}{45:>8}{46.5:>10.1f}" in out
           and f"{report.pct(43.5, 46.5):>15}" in out)
-    out = captured(report.print_typical_share, report.reference(data), ungated)
-    check("r_bar: J has its own value, no journal falls back",
-          "1 journals: 1 with their own r_bar" in out and "0 fall back" in out)
+    out = captured(report.print_typical_habit, report.reference(data), ungated)
+    check("typical habit: J has its own value, no journal falls back",
+          "1 journals: 1 with their own typical habit" in out and "0 fall back" in out)
     out = captured(report.print_zero_oneoffs, ungated)
     check("k = 0: the one co-author without a one-off collaborator is reported",
           "1 co-authorships, load 0.50" in out and "collaborators 60" in out)
@@ -254,7 +255,7 @@ def main():
     test_gate_report()
     test_publishers()
     test_sweeps_run()
-    test_rho_bins()
+    test_habit_ratio_bins()
     test_personal_reports()
     test_ranking_head()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")

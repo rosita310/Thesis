@@ -4,7 +4,7 @@ Diagnostics and sensitivity sweeps over the scored corpus, printed to the consol
 Reports: the shortlist per publisher, benign exclusions, the in/out gate, the
 journals of the shortlist, co-author career stage, the within-editor board-term
 control, the head of the ranking, and the personal one-off baseline (coverage,
-the spread of r_bar, co-authors without a one-off, and a calibration table).
+the spread of the typical habit, co-authors without a one-off, and a calibration table).
 Sweeps: alpha, the prior, m(s), the personal adjustment (off, and its boundary
 N_min), R_min and the `outside` reading, the entry conditions (gate and minimum
 record), and the network against a count.
@@ -21,11 +21,11 @@ from collections import Counter, defaultdict
 from bbn_extract import baseline_counts, classify
 from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
                        passes_inout_gate, qualifies, rank_corpus, reference,
-                       score_editor, smooth, state_shares, typical_oneoff_share)
+                       score_editor, smooth, state_shares, typical_habit)
 from cs2_config import (ALPHA, ALPHA_SWEEP, FALLBACK_MIN_N, HEAD_P_LEVELS, INOUT_GATE,
                         MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES, MIN_RECORD_SWEEP,
                         OUTSIDE_READINGS, PERSONAL_SINGLE_CAP, POOL_MIN_SWEEP, PRIOR,
-                        PRIOR_SWEEP, REPEATED_SWEEP, RHO_BINS, SHORTLIST_THRESHOLD)
+                        PRIOR_SWEEP, REPEATED_SWEEP, HABIT_RATIO_BINS, SHORTLIST_THRESHOLD)
 from dblp_extract import pct
 
 # Console layout only.
@@ -228,25 +228,27 @@ def print_coverage(data):
                       for s in data["config"]["states"]))
 
 
-def print_typical_share(ref, ungated):
-    """The spread of r_bar_j over the journals (each journal whole, no editor left
-    out), and how often the scored co-authorships fall back to the publisher."""
-    print("\n=== THE JOURNAL'S TYPICAL ONE-OFF SHARE r_bar_j ===")
+def print_typical_habit(ref, ungated):
+    """The spread of the typical habit over the journals (each journal whole, no
+    editor left out), and how often the scored co-authorships fall back to the
+    publisher."""
+    print("\n=== THE JOURNAL'S TYPICAL ONE-OFF HABIT ===")
     for publisher in sorted(set(ref.publisher_of.values())):
         journals = [j for j, p in ref.publisher_of.items() if p == publisher]
-        values = [typical_oneoff_share(ref, j, []) for j in journals]
+        values = [typical_habit(ref, j, []) for j in journals]
         own = sorted(r for r, level in values if level == "journal")
         weighted, load = ref.oneoff_pooled.get(publisher, (0.0, 0.0))
         pooled = f"{weighted / load:.3f}" if load else "-"
         spread = (f"min {own[0]:.3f}, median {statistics.median(own):.3f}, "
                   f"max {own[-1]:.3f}" if own else "none")
-        print(f"  {publisher:<6} {len(journals)} journals: {len(own)} with their own r_bar "
+        print(f"  {publisher:<6} {len(journals)} journals: {len(own)} with their own "
+              f"typical habit "
               f"({spread}); {len(journals) - len(own)} fall back to the publisher's "
               f"{pooled}")
     details = adjusted_details(ungated)
     fallback = [d for d in details if d["oneoff_level"] == "pooled"]
     print(f"  scored, with the editor left out: {len(fallback)} of {len(details)} adjusted "
-          f"co-authorships use the publisher's r_bar "
+          f"co-authorships use the publisher's typical habit "
           f"({load_share(details, lambda d: d['oneoff_level'] == 'pooled')} of their load)")
 
 
@@ -255,28 +257,29 @@ def adjusted_details(rows):
     return [d for r in rows for d in r["detail"] if d["adjusted"]]
 
 
-def rho_bin(rho, edges=RHO_BINS) -> int:
-    """Index of the bin of rho, given ascending exclusive upper edges."""
+def habit_ratio_bin(habit_ratio, edges=HABIT_RATIO_BINS) -> int:
+    """Index of the bin of the habit ratio, given ascending exclusive upper edges."""
     for i, edge in enumerate(edges):
-        if rho < edge:
+        if habit_ratio < edge:
             return i
     return len(edges)
 
 
-def rho_labels(edges=RHO_BINS) -> list[str]:
-    """'<0.25', '0.25-0.5', ..., '>2' for the bins of rho_bin."""
+def habit_ratio_labels(edges=HABIT_RATIO_BINS) -> list[str]:
+    """'<0.25', '0.25-0.5', ..., '>2' for the bins of habit_ratio_bin."""
     return ([f"<{edges[0]:g}"] + [f"{a:g}-{b:g}" for a, b in zip(edges, edges[1:])]
             + [f">{edges[-1]:g}"])
 
 
-def calibration(details, edges=RHO_BINS) -> list[dict]:
-    """Per bin of rho, load-weighted over the adjusted co-authorships: mean rho, the
-    observed `single` share, the predicted g_i(single) and the journal's g(single)."""
+def calibration(details, edges=HABIT_RATIO_BINS) -> list[dict]:
+    """Per bin of the habit ratio, load-weighted over the adjusted co-authorships:
+    its mean, the observed `single` share, the predicted g_i(single) and the
+    journal's g(single)."""
     bins = defaultdict(list)
     for d in details:
-        bins[rho_bin(d["rho"], edges)].append(d)
+        bins[habit_ratio_bin(d["habit_ratio"], edges)].append(d)
     out = []
-    for i, label in enumerate(rho_labels(edges)):
+    for i, label in enumerate(habit_ratio_labels(edges)):
         group = bins.get(i, [])
         load = sum(d["load"] for d in group)
         if not load:
@@ -286,7 +289,7 @@ def calibration(details, edges=RHO_BINS) -> list[dict]:
             return sum(d[key] * d["load"] for d in group) / load
 
         out.append({"bin": label, "nodes": len(group), "load": load,
-                    "rho": mean("rho"),
+                    "habit_ratio": mean("habit_ratio"),
                     "observed": sum(d["load"] for d in group if d["state"] == "single") / load,
                     "predicted": mean("single_p"), "journal": mean("journal_single_p")})
     return out
@@ -296,28 +299,30 @@ def print_calibration_table(details, label):
     rows = calibration(details)
     print(f"\n  {label}: {len(details)} adjusted co-authorships, "
           f"load {sum(d['load'] for d in details):.1f}")
-    print(f"  {'rho':>9}{'nodes':>8}{'load':>9}{'mean rho':>10}{'obs single':>12}"
+    print(f"  {'ratio':>9}{'nodes':>8}{'load':>9}{'mean ratio':>11}{'obs single':>12}"
           f"{'g_i(single)':>13}{'journal g':>11}{'obs/pred':>10}")
     for r in rows:
-        print(f"  {r['bin']:>9}{r['nodes']:>8}{r['load']:>9.1f}{r['rho']:>10.2f}"
+        print(f"  {r['bin']:>9}{r['nodes']:>8}{r['load']:>9.1f}{r['habit_ratio']:>11.2f}"
               f"{r['observed']:>12.3f}{r['predicted']:>13.3f}{r['journal']:>11.3f}"
               f"{r['observed'] / r['predicted']:>10.2f}")
     total = sum(r["load"] for r in rows)
     if total:
         print(f"  {'all':>9}{len(details):>8}{total:>9.1f}"
-              f"{sum(r['rho'] * r['load'] for r in rows) / total:>10.2f}"
+              f"{sum(r['habit_ratio'] * r['load'] for r in rows) / total:>11.2f}"
               + "".join(f"{sum(r[k] * r['load'] for r in rows) / total:>{w}.3f}"
                         for k, w in (("observed", 12), ("predicted", 13), ("journal", 11))))
 
 
 def print_calibration(ungated, ref):
-    """Is the scaling g(single|j) * rho monotone, roughly proportional, and
+    """Is the scaling g(single|j) * habit ratio monotone, roughly proportional, and
     conservative? Observed against predicted, over every scored editor."""
     details = adjusted_details(ungated)
-    capped = [d for d in details if d["journal_single_p"] * d["rho"] > PERSONAL_SINGLE_CAP]
-    print("\n=== CALIBRATION OF THE PERSONAL ONE-OFF BASELINE (bins of rho) ===")
+    capped = [d for d in details
+              if d["journal_single_p"] * d["habit_ratio"] > PERSONAL_SINGLE_CAP]
+    print("\n=== CALIBRATION OF THE PERSONAL ONE-OFF BASELINE (bins of the habit ratio) ===")
     print("  (obs single = the load share of `single` among the adjusted co-authorships;")
-    print("   g_i(single) = the model's g(single|j) * rho, journal g = g(single|j) unadjusted;")
+    print("   g_i(single) = the model's g(single|j) * habit ratio, "
+          "journal g = g(single|j) unadjusted;")
     print("   both with the editor left out, as scored; the evidence is not genuine-only)")
     print(f"  the cap {PERSONAL_SINGLE_CAP} binds for {len(capped)} co-authorships")
     print_calibration_table(details, "all publishers")
@@ -328,17 +333,17 @@ def print_calibration(ungated, ref):
 
 
 def print_zero_oneoffs(ungated):
-    """Adjusted co-authors who never published once only with anyone: share_A rests
-    on the pseudo-count alone."""
+    """Adjusted co-authors who never published once only with anyone: their one-off
+    habit rests on the pseudo-count alone."""
     zero = [d for d in adjusted_details(ungated) if d["pool_oneoffs"] == 0]
     print("\n=== ADJUSTED CO-AUTHORS WITH NO ONE-OFF COLLABORATOR (k_A = 0) ===")
     if not zero:
         print("  none")
         return
-    rhos = sorted(d["rho"] for d in zero)
+    habit_ratios = sorted(d["habit_ratio"] for d in zero)
     print(f"  {len(zero)} co-authorships, load {sum(d['load'] for d in zero):.2f}; "
-          f"rho {', '.join(f'{r:.3f}' for r in rhos)}; collaborators "
-          f"{', '.join(str(d['pool_n']) for d in sorted(zero, key=lambda d: d['rho']))}; "
+          f"habit ratio {', '.join(f'{r:.3f}' for r in habit_ratios)}; collaborators "
+          f"{', '.join(str(d['pool_n']) for d in sorted(zero, key=lambda d: d['habit_ratio']))}; "
           f"ties {dict(Counter(d['state'] for d in zero))}")
 
 
@@ -556,7 +561,7 @@ def main():
     print_record_diagnostic(rows, data, base_pos)
     print_board_terms(rows, data)
     print_coverage(data)
-    print_typical_share(reference(data), ungated)
+    print_typical_habit(reference(data), ungated)
     print_zero_oneoffs(ungated)
     print_calibration(ungated, reference(data))
     print_sweeps(data, rows, shortlist, base_pos)

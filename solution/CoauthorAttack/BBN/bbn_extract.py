@@ -11,11 +11,10 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
         Dump pass: every publication of those people.
     python bbn_extract.py --stage editor_authors
         Dump pass: authors of every publication of the editors, and the year of
-        every publication the coauthors pass found (the in/out gate and the
-        co-author's career stage at the first paper with the editor).
+        every publication the coauthors pass found.
     python bbn_extract.py --stage signer_authors
         Dump pass: authors of every publication of the suspect papers' signers:
-        the co-authors' own networks, for the personal one-off baseline.
+        the co-authors' own networks.
     python bbn_extract.py --stage corpus
         Writes bbn/bbn_cs2_corpus.json.
     python bbn_extract.py --stage all
@@ -689,9 +688,7 @@ def scan_authors_of(out_path: Path, out_dir: Path, dump: Path, people: set,
 
 
 def stage_editor_authors(out_dir: Path, dump: Path, force: bool) -> None:
-    """The full author list and the year of every publication an editor signed (for
-    the in/out gate), and the year of every publication of the editors and co-authors
-    (for the co-author's career stage at the first paper with the editor)."""
+    """The full author list and the year of every publication an editor signed, and the year of every publication of the editors and co-authors."""
     out_path = out_dir / "editor_pub_authors.csv"
     years_path = out_dir / "publication_years.csv"
     if is_cached(out_path, force) and is_cached(years_path, force):

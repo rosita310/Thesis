@@ -50,9 +50,9 @@ FALLBACK_MIN_N = 30.0        # N_min: post-exclusion load a fallback level needs
                              # collaborators a co-author needs for the personal adjustment
 
 # The personal one-off baseline. For a co-author with at least FALLBACK_MIN_N
-# collaborators, g(single) is the journal's times rho = share_A / r_bar_j (the co-author's
-# one-off share over the journal's typical one), at most this cap; the other states are
-# rescaled to make up the rest.
+# collaborators, g(single) is the journal's times the habit ratio, the co-author's one-off
+# habit over the journal's typical habit, at most this cap; the other states are rescaled
+# to make up the rest.
 PERSONAL_SINGLE_CAP = 0.95
 
 CONDITION_ON_CAREER_STAGE = False   # also condition the genuine baseline on career stage
@@ -87,8 +87,9 @@ OUTSIDE_READINGS = ["any", "strict"]   # strict: a venue the editor also edits i
 # The boundary of the personal adjustment (collaborators the co-author needs), swept for
 # the adjustment only; the model itself uses FALLBACK_MIN_N.
 POOL_MIN_SWEEP = [10, 30, 50]
-# Bins of rho (the co-author's one-off share over the journal's) for the calibration table.
-RHO_BINS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # upper edges, exclusive
+# Bins of the habit ratio (the co-author's one-off habit over the journal's typical habit)
+# for the calibration table.
+HABIT_RATIO_BINS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # upper edges, exclusive
 
 MIN_CONTROL_NODES = 3        # pre-board co-authorships needed for a per-editor comparison
 
