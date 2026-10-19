@@ -269,24 +269,24 @@ def test_dated_issues_and_collector():
           and pairs.papers[0]["year"] == "2020" and pairs.papers[0]["dblp_key"] == "jkey")
     check("every board name of a dated issue gets that roster year, under its key",
           pairs.board_years == {("J", "ed x"): ["2020"]})
-    check("the editor's tenure and printed name are recorded per journal",
-          pairs.tenure_years == {("J", "https://dblp.org/pid/e"): ["2020"]}
-          and pairs.tenure_names[("J", "https://dblp.org/pid/e")] == Counter({"Ed X": 1}))
+    check("the editor's board term and printed name are recorded per journal",
+          pairs.term_years == {("J", "https://dblp.org/pid/e"): ["2020"]}
+          and pairs.term_names[("J", "https://dblp.org/pid/e")] == Counter({"Ed X": 1}))
 
     pairs.add_issue("J", "2021", {"Ed Y"}, [{**ARTICLE, "rec_key": JKEY + "P2"}],
                     {JKEY + "P2": [sig("", "Ed Y"), A]})
     check("an editor without a PID is identified by name and counted",
-          pairs.n_no_pid == 1 and ("J", "Ed Y") in pairs.tenure_years)
+          pairs.n_no_pid == 1 and ("J", "Ed Y") in pairs.term_years)
 
 
-def test_board_tenure_and_control():
-    print("\n-- board tenure and the pre-tenure control --")
-    tenure_years = {("J", "pE"): ["2019", "2020"], ("J", "pF"): ["2021"]}
-    tenure_names = {("J", "pE"): Counter({"Ed Xavier": 2}), ("J", "pF"): Counter({"Fay": 1})}
-    tenure_keys = {("J", "pE"): Counter({"e x": 2}), ("J", "pF"): Counter({"fay": 1})}
+def test_board_terms_and_control():
+    print("\n-- board terms and the pre-board control --")
+    term_years = {("J", "pE"): ["2019", "2020"], ("J", "pF"): ["2021"]}
+    term_names = {("J", "pE"): Counter({"Ed Xavier": 2}), ("J", "pF"): Counter({"Fay": 1})}
+    term_keys = {("J", "pE"): Counter({"e x": 2}), ("J", "pF"): Counter({"fay": 1})}
     board_years = {("J", "e x"): ["2018", "2019", "2020", "2021"]}
-    tenure = extract.board_tenure(tenure_years, tenure_names, tenure_keys, board_years)
-    e, f = tenure
+    terms = extract.board_terms(term_years, term_names, term_keys, board_years)
+    e, f = terms
     check("the window comes from the roster under the matched board name",
           (e["first_board_year"], e["last_board_year"], e["roster_window"])
           == ("2018", "2021", 1) and e["editor_name"] == "Ed Xavier")
@@ -297,10 +297,10 @@ def test_board_tenure_and_control():
           (f["first_board_year"], f["last_board_year"], f["roster_window"])
           == ("2021", "2021", 0))
 
-    tenure = [{"journal": "J", "editor_id": "pE", "editor_name": "Ed X",
-               "first_board_year": "2018"},
-              {"journal": "K", "editor_id": "pG", "editor_name": "G",
-               "first_board_year": ""}]
+    terms = [{"journal": "J", "editor_id": "pE", "editor_name": "Ed X",
+              "first_board_year": "2018"},
+             {"journal": "K", "editor_id": "pG", "editor_name": "G",
+              "first_board_year": ""}]
     art = lambda key, year, rec: {"rec_key": rec, "journal_key": key, "year": year,
                                   "title": "t"}
     before, during, elsewhere, undated = (art("jkey", "2016", "r1"), art("jkey", "2018", "r2"),
@@ -308,7 +308,7 @@ def test_board_tenure_and_control():
     authors_of = {a["rec_key"]: [sig("pE", "Ed X"), A] for a in
                   (before, during, elsewhere, undated)}
     rows, n_papers = extract.control_coauthorships(
-        tenure, {"pE": [before, during, elsewhere, undated], "pG": [before]},
+        terms, {"pE": [before, during, elsewhere, undated], "pG": [before]},
         authors_of, {"J": ["jkey"]}, {"J": extract.BoardIndex()})
     check("only the editor's earlier papers IN the edited journal are controls",
           n_papers == 1 and [r["rec_key"] for r in rows] == ["r1"])
@@ -621,7 +621,7 @@ def main():
     test_coauthorship_rows()
     test_front_matter()
     test_dated_issues_and_collector()
-    test_board_tenure_and_control()
+    test_board_terms_and_control()
     test_scan_signatures()
     test_build_nodes()
     test_pool_stats()

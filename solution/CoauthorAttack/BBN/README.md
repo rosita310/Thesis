@@ -59,7 +59,7 @@ existing `reports/journal_mapping.csv` are carried over as `verified`. Check eve
 
 | Stage            | Reads              | Builds                                                           |
 |------------------|--------------------|------------------------------------------------------------------|
-| `pairs`          | database, extract  | suspect papers, co-authorships, board tenure, pre-tenure control |
+| `pairs`          | database, extract  | suspect papers, co-authorships, board terms, pre-board control   |
 | `coauthors`      | dump               | every publication of the editors and co-authors                  |
 | `editor_authors` | dump               | authors of the editors' publications, year of all of the above   |
 | `signer_authors` | dump               | authors of the signers' publications (co-authors' own networks)  |

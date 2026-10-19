@@ -90,7 +90,7 @@ POOL_MIN_SWEEP = [10, 30, 50]
 # Bins of rho (the co-author's one-off share over the journal's) for the calibration table.
 RHO_BINS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # upper edges, exclusive
 
-MIN_CONTROL_NODES = 3        # pre-tenure co-authorships needed for a per-editor comparison
+MIN_CONTROL_NODES = 3        # pre-board co-authorships needed for a per-editor comparison
 
 # Entry conditions: rank only editors with at least this many suspect papers (n_min).
 MIN_RECORD_SWEEP = [1, 2, 3, 5]

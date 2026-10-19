@@ -2,7 +2,7 @@
 Diagnostics and sensitivity sweeps over the scored corpus, printed to the console.
 
 Reports: the shortlist per publisher, benign exclusions, the in/out gate, the
-journals of the shortlist, co-author career stage, the within-editor tenure
+journals of the shortlist, co-author career stage, the within-editor board-term
 control, the head of the ranking, and the personal one-off baseline (coverage,
 the spread of r_bar, co-authors without a one-off, and a calibration table).
 Sweeps: alpha, the prior, m(s), the personal adjustment (off, and its boundary
@@ -145,11 +145,11 @@ def print_record_diagnostic(rows, data, base_pos):
                      rank_corpus(data, condition_on_career_stage=True), base_pos)
 
 
-def print_tenure(rows, data):
-    """The state mix before and during tenure, pooled and per editor."""
+def print_board_terms(rows, data):
+    """The state mix before and during the board term, pooled and per editor."""
     controls = data.get("control_coauthorships", {})
     if not controls:
-        print("\n=== WITHIN-EDITOR TENURE CONTROL: no pre-tenure co-authorships extracted ===")
+        print("\n=== WITHIN-EDITOR BOARD-TERM CONTROL: no pre-board co-authorships extracted ===")
         return
     suspect_nodes = [n for r in rows for n in r["nodes"]]
     scored = {r["ident"] for r in rows}
@@ -157,9 +157,9 @@ def print_tenure(rows, data):
     s_shares, s_load = state_shares(suspect_nodes)
     c_shares, c_load = state_shares(control_nodes)
 
-    print("\n=== WITHIN-EDITOR TENURE CONTROL (same editor, same journal, before the board) ===")
+    print("\n=== WITHIN-EDITOR BOARD-TERM CONTROL (same editor, same journal, before the board) ===")
     print("  (a diagnostic, NOT evidence in the network)")
-    print(f"  {'state':<12}{'during tenure':>15}{'before tenure':>15}{'shift':>10}")
+    print(f"  {'state':<12}{'during term':>15}{'before term':>15}{'shift':>10}")
     for state in data["config"]["states"]:
         during, before = s_shares.get(state, 0.0), c_shares.get(state, 0.0)
         print(f"  {state:<12}{during:>14.1%}{before:>15.1%}{during - before:>+10.1%}")
@@ -554,7 +554,7 @@ def main():
     print_journals(shortlist)
     print_head(rows, ungated)
     print_record_diagnostic(rows, data, base_pos)
-    print_tenure(rows, data)
+    print_board_terms(rows, data)
     print_coverage(data)
     print_typical_share(reference(data), ungated)
     print_zero_oneoffs(ungated)

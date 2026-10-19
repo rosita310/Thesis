@@ -4,7 +4,7 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
 (dblp_extract.py) and further passes over the dump.
 
     python bbn_extract.py --stage pairs
-        Suspect papers, their co-authorships, board tenure, the pre-tenure
+        Suspect papers, their co-authorships, board terms, the pre-board
         control and the people whose full record is needed. The only stage that
         reads the database.
     python bbn_extract.py --stage coauthors
@@ -400,9 +400,9 @@ class PairsCollector:
                                  for j, names in board_of_journal.items()}
         self.papers: list[dict] = []          # one row per (suspect paper x editor)
         self.rows: list[dict] = []            # suspect co-authorship rows
-        self.tenure_years = defaultdict(list)      # (journal, editor id) -> issue years
-        self.tenure_names = defaultdict(Counter)   # (journal, editor id) -> DBLP names
-        self.tenure_keys = defaultdict(Counter)    # (journal, editor id) -> board name keys
+        self.term_years = defaultdict(list)        # (journal, editor id) -> issue years
+        self.term_names = defaultdict(Counter)     # (journal, editor id) -> DBLP names
+        self.term_keys = defaultdict(Counter)      # (journal, editor id) -> board name keys
         self.board_years = defaultdict(list)       # (journal, board name key) -> roster years
         self.identities_of_name = defaultdict(set)
         self.n_no_pid = 0
@@ -429,9 +429,9 @@ class PairsCollector:
         if not editor_sig["pid"]:
             self.n_no_pid += 1
         self.identities_of_name[ed_name].add(ed_id)
-        self.tenure_years[(journal, ed_id)].append(year)
-        self.tenure_names[(journal, ed_id)][ed_name] += 1
-        self.tenure_keys[(journal, ed_id)][board_key or name_key(ed_name)] += 1
+        self.term_years[(journal, ed_id)].append(year)
+        self.term_names[(journal, ed_id)][ed_name] += 1
+        self.term_keys[(journal, ed_id)][board_key or name_key(ed_name)] += 1
 
         front_matter = int(is_front_matter(article.get("title")))
         rows = coauthorship_rows(article, sigs, ed_id, ed_name, journal, "suspect",
@@ -448,16 +448,16 @@ class PairsCollector:
         })
 
 
-def board_tenure(tenure_years, tenure_names, tenure_keys, board_years) -> list[dict]:
-    """A tenure row per (journal, editor), with their window on that board.
+def board_terms(term_years, term_names, term_keys, board_years) -> list[dict]:
+    """A board term row per (journal, editor), with their window on that board.
 
     The window comes from the roster, or from the years the editor published
     when the name is on no dated issue.
     """
     rows = []
-    for (journal, ed_id), years in tenure_years.items():
-        name = tenure_names[(journal, ed_id)].most_common(1)[0][0]
-        key = tenure_keys[(journal, ed_id)].most_common(1)[0][0]
+    for (journal, ed_id), years in term_years.items():
+        name = term_names[(journal, ed_id)].most_common(1)[0][0]
+        key = term_keys[(journal, ed_id)].most_common(1)[0][0]
         published = sorted(y for y in years if y)
         roster = sorted(board_years.get((journal, key), []))
         known = roster or published
@@ -473,11 +473,11 @@ def board_tenure(tenure_years, tenure_names, tenure_keys, board_years) -> list[d
     return rows
 
 
-def control_coauthorships(tenure, articles_of_person, authors_of, mapping,
+def control_coauthorships(terms, articles_of_person, authors_of, mapping,
                           board_of_journal) -> tuple[list[dict], int]:
     """The within-editor control: same journal, before the editor joined its board."""
     rows, n_papers = [], 0
-    for t in tenure:
+    for t in terms:
         first = t["first_board_year"]
         if not first:
             continue
@@ -497,13 +497,13 @@ def control_coauthorships(tenure, articles_of_person, authors_of, mapping,
     return rows, n_papers
 
 
-def print_pairs_summary(pairs: PairsCollector, control_rows, tenure, wanted,
+def print_pairs_summary(pairs: PairsCollector, control_rows, terms, wanted,
                         n_control_papers, issue_stats) -> None:
     n_solo = sum(1 for p in pairs.papers if p["n_coauthors"] == 0)
     editors = {p["editor_id"] for p in pairs.papers}
     ambiguous = [n for n, ids in pairs.identities_of_name.items() if len(ids) > 1]
-    from_roster = sum(1 for t in tenure if t["roster_window"])
-    later = sum(1 for t in tenure if t["first_paper_year"] and t["first_board_year"]
+    from_roster = sum(1 for t in terms if t["roster_window"])
+    later = sum(1 for t in terms if t["first_paper_year"] and t["first_board_year"]
                 and t["first_paper_year"] > t["first_board_year"])
 
     for publisher in sorted({p for p, _ in issue_stats}):
@@ -519,11 +519,11 @@ def print_pairs_summary(pairs: PairsCollector, control_rows, tenure, wanted,
           f"(the homonyms DBLP does split)")
     print(f"  ...signatures with no DBLP PID      {pairs.n_no_pid:>7}  "
           f"(identity falls back to the name)")
-    print(f"  control papers (pre-tenure, same j) {n_control_papers:>7}")
+    print(f"  control papers (pre-board, same j)  {n_control_papers:>7}")
     print(f"  board windows taken from the roster   {from_roster:>7}  "
-          f"({pct(from_roster, len(tenure))})")
+          f"({pct(from_roster, len(terms))})")
     print(f"  ...where the editor first published later than joining "
-          f"{later} ({pct(later, len(tenure))})")
+          f"{later} ({pct(later, len(terms))})")
     print(f"  control co-authorship rows          {len(control_rows):>7}")
     print(f"  people whose full record is needed  {len(wanted):>7}")
     print("\nNext: --stage coauthors  (the first dump pass)")
@@ -555,8 +555,8 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
     for journal, year, board, arts in dated_issues(issues, mapping, issue_index,
                                                    board_of_issue, issue_stats):
         pairs.add_issue(journal, year, board, arts, authors_of)
-    tenure = board_tenure(pairs.tenure_years, pairs.tenure_names, pairs.tenure_keys,
-                          pairs.board_years)
+    terms = board_terms(pairs.term_years, pairs.term_names, pairs.term_keys,
+                        pairs.board_years)
 
     article_of = {a["rec_key"]: a for a in articles}
     articles_of_person = defaultdict(list)
@@ -565,7 +565,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
         if article:
             articles_of_person[person_id(sig["pid"], sig["name"])].append(article)
     control_rows, n_control_papers = control_coauthorships(
-        tenure, articles_of_person, authors_of, mapping, pairs.board_of_journal)
+        terms, articles_of_person, authors_of, mapping, pairs.board_of_journal)
 
     all_rows = pairs.rows + control_rows
     wanted = sorted({r["editor_id"] for r in all_rows}
@@ -574,7 +574,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
 
     write_csv(out_dir / "suspect_papers.csv", pairs.papers)
     write_csv(out_dir / "coauthorships.csv", all_rows)
-    write_csv(out_dir / "editor_tenure.csv", tenure)
+    write_csv(out_dir / "editor_board_terms.csv", terms)
     # Every name on every board, also those who never published there.
     write_csv(out_dir / "board_roster.csv",
               [{"journal": j, "name": n, "first_year": min(v),
@@ -582,7 +582,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
                for (j, n), v in sorted(pairs.board_years.items())])
     write_csv(out_dir / "wanted_pids.csv", [{"person_id": p} for p in wanted])
 
-    print_pairs_summary(pairs, control_rows, tenure, wanted, n_control_papers, issue_stats)
+    print_pairs_summary(pairs, control_rows, terms, wanted, n_control_papers, issue_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +909,7 @@ def print_corpus_summary(nodes, control_nodes, benign, papers,
     print(f"  junior co-authors (at most {JUNIOR_MAX_PUBS} publications before the first "
           f"with the editor) {pct(junior, total_load)} of the load, on their record "
           f"today {pct(junior_today, total_load)}")
-    print(f"  control nodes (pre-tenure)  {len(control_nodes)} over "
+    print(f"  control nodes (pre-board)   {len(control_nodes)} over "
           f"{n_control_editors} editors")
     print(f"  excluded before scoring     {len(benign)} nodes, load {benign_load:.1f} "
           f"({pct(benign_load, benign_load + total_load)} of what was extracted); "
@@ -926,7 +926,7 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     publisher_of = load_publishers(mapping_path)
     rows = read_csv(out_dir / "coauthorships.csv")
     papers = read_csv(out_dir / "suspect_papers.csv")
-    tenure = read_csv(out_dir / "editor_tenure.csv")
+    terms = read_csv(out_dir / "editor_board_terms.csv")
     pubs_of = publications_of(out_dir / "pid_publications.csv")
     years_path = out_dir / "publication_years.csv"
     if not years_path.exists():
@@ -948,11 +948,11 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
 
     windows = {(row["journal"], row["editor_id"]):
                (int(row["first_board_year"]), int(row["last_board_year"]))
-               for row in tenure if row["first_board_year"] and row["last_board_year"]}
+               for row in terms if row["first_board_year"] and row["last_board_year"]}
 
     # The journals each editor sits on a board of.
     controlled_of = defaultdict(set)
-    for row in tenure:
+    for row in terms:
         controlled_of[row["editor_id"]].update(mapping.get(row["journal"], []))
 
     suspect_rows = [r for r in rows if r["group"] == "suspect"]
@@ -984,7 +984,7 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     control_index = index_by_editor(control_nodes)
 
     labels: dict[str, str] = {}
-    for row in tenure:
+    for row in terms:
         labels.setdefault(row["editor_id"], row["editor_name"])
     for paper in papers:
         labels.setdefault(paper["editor_id"], paper["editor_name"])
