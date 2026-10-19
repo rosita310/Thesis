@@ -403,8 +403,8 @@ def test_build_nodes():
           b_node["career_stage"] == "junior")
     check("A's long record makes A an established co-author",
           a_node["career_stage"] == "established")
-    check("B, whose whole record is the shared paper, is state-determined",
-          b_node["benign_reason"] == "state_determined" and a_node["benign_reason"] == "")
+    check("B, whose whole record is the shared paper, stays in the evidence",
+          b_node["benign_reason"] == "" and a_node["benign_reason"] == "")
 
     # With years: A's first paper with E is X (2014), and A's other papers come later.
     year_of = {JKEY + "P1": "2015", JKEY + "P2": "2016", CONF + "X": "2014"}
@@ -513,13 +513,7 @@ def test_benign():
           extract.benign_reason({"on_board": True, "n_papers": 1,
                                  "n_front_matter": 1}) == "board_member")
     plain = {"on_board": False, "n_papers": 1, "n_front_matter": 0}
-    check("an ordinary pair is not benign", extract.benign_reason(plain, 12) == "")
-    check("a co-author with no record beyond the shared paper is state-determined",
-          extract.benign_reason(plain, 1) == "state_determined")
-    check("...but two publications leave room for an outside tie",
-          extract.benign_reason(plain, 2) == "")
-    check("an unknown record size is not a reason to exclude",
-          extract.benign_reason(plain) == "")
+    check("an ordinary pair is not benign", extract.benign_reason(plain) == "")
 
 
 def test_editor_diagnostics_and_inout():

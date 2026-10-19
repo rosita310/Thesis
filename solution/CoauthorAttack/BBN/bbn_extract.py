@@ -747,19 +747,16 @@ def inout_points(editor_id: str, seats: dict, pubs, mapping, authors_of_pub,
             for year in sorted(set(inside) | set(outside))]
 
 
-def benign_reason(entry, coauthor_pubs=None) -> str:
+def benign_reason(entry) -> str:
     """Why this co-authorship is excluded from the evidence, or "" if it is not.
 
-    board_member      the co-author sits on the same board.
-    front_matter      every paper the pair shares is front matter.
-    state_determined  the co-author's whole record is the shared paper.
+    board_member  the co-author sits on the same board.
+    front_matter  every paper the pair shares is front matter.
     """
     if entry["on_board"]:
         return "board_member"
     if entry["n_papers"] and entry["n_front_matter"] == entry["n_papers"]:
         return "front_matter"
-    if coauthor_pubs == 1:
-        return "state_determined"
     return ""
 
 
@@ -817,7 +814,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
             "state": classify(len(outside), len(inside), repeated_min),
             "n_front_matter": entry["n_front_matter"],
             "coauthor_on_board": entry["on_board"],
-            "benign_reason": benign_reason(entry, n_pubs),
+            "benign_reason": benign_reason(entry),
             # filled by annotate_pools, which needs the networks; None without them
             "pool_n": None, "pool_oneoffs": None,
         }
