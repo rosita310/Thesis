@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "parsing.log"
 
-MAX_FILES = None                        # Set to None to process all valid files
+MAX_FILES = None                       # Set to None to process all valid files
 OVERWRITE_EXISTING = True              # True: re-parse and overwrite. False: skip if JSON exists.
 SKIP_PREFIXES = (                       # Files starting with these prefixes will be skipped
     "ACM Transactions on Graphics",     # Doesn't contain information we want   
