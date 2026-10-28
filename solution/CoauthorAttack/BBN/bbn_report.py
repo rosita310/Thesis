@@ -2,29 +2,42 @@
 Diagnostics and sensitivity sweeps over the scored corpus, printed to the console.
 
 Reports: the shortlist per publisher, benign exclusions, the in/out gate, the
-journals of the shortlist,
-co-author career stage and the within-editor tenure control.
-Sweeps: alpha, the prior, m(s), the fit factor, R_min and the `outside` reading.
+journals of the shortlist, co-author career stage, the within-editor board-term
+control, the head of the ranking, and the personal one-off baseline (coverage,
+the spread of the typical habit, co-authors without a one-off, and a calibration table).
+Sweeps: alpha, the prior, m(s), the personal adjustment (off, and its boundary
+N_min), R_min and the `outside` reading, the co-author's record boundary, the split
+into recent and earlier co-authorships (and leaving recent ones out instead), the
+entry conditions (gate and minimum record), and the network against a count.
 
     python bbn_report.py [--in bbn/bbn_cs2_corpus.json]
 """
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections import Counter, defaultdict
 
-from bbn_extract import baseline_counts, classify, relabel_fit_per_publisher
-from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, rank_corpus,
-                       reference, score_editor, state_shares)
-from cs2_config import (ALPHA, ALPHA_SWEEP, INOUT_GATE, MANIP_DIST, MANIP_SWEEP,
-                        MIN_CONTROL_NODES, OUTSIDE_READINGS, PRIOR,
-                        PRIOR_SWEEP, REPEATED_SWEEP, SHORTLIST_THRESHOLD)
+from bbn_extract import baseline_counts, classify, index_by_editor
+from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
+                       passes_inout_gate, qualifies, rank_corpus, reference,
+                       score_editor, smooth, state_shares, typical_habit)
+from cs2_config import (ALPHA, ALPHA_SWEEP, COAUTHOR_MIN_PUBS_SWEEP, FALLBACK_MIN_N,
+                        HEAD_P_LEVELS, INOUT_GATE, MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES,
+                        MIN_RECORD_SWEEP, OUTSIDE_READINGS, POOL_MIN_SWEEP, PRIOR, PRIOR_SWEEP, RECENT_FROM, RECENT_FROM_SWEEP,
+                        REPEATED_SWEEP, HABIT_RATIO_BINS, SHORTLIST_THRESHOLD)
 from dblp_extract import pct
 
 # Console layout only.
 SWEEP_PRINT_CAP = 12
+LOWEST_PRINT_CAP = 3        # ungated editors described without names
 JOURNAL_PRINT_CAP = 25
 MIN_SHORTLISTED_PER_JOURNAL = 5
+HEAD_SIZE = 10              # the head of the ranking: #1 and the next nine
+YEARS_PRINT_FROM = 2018     # first years before this one are printed together
+
+NO_ADJUSTMENT = math.inf    # a boundary no co-author reaches: the plain tie model
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +78,24 @@ def print_gate(rows):
         print("  then rebuild the corpus with --stage corpus.")
         return
     points = [p for r in plotted for p in r["inout_points"]]
-    red = [p for p in points if p["x"] >= p["y"]]
+    red = [p for p in points if passes_inout_gate([p])]
     passing = [r for r in plotted if r["passes_inout_gate"]]
     print(f"  editors plotted {len(plotted)} of {len(rows)}; "
-          f"points (editor x board seat) {len(points)}")
+          f"points (editor x year on a board) {len(points)}")
     print(f"  points in the red region x >= y  {len(red):>6}"
           f"  ({pct(len(red), len(points))})")
     print(f"  editors with >= 1 red point      {len(passing):>6}"
           f"  ({pct(len(passing), len(plotted))})")
+    strict = [r for r in plotted if any(p["x"] > p["y"] for p in r["inout_points"])]
+    print(f"  ...with Westerbaan's strict x > y: {sum(p['x'] > p['y'] for p in points)} "
+          f"points, {len(strict)} editors")
+    print(f"  passing editors: median "
+          f"{statistics.median(r['n_suspect_papers'] for r in passing)} suspect papers, "
+          f"{sum(r['n_suspect_papers'] >= 5 for r in passing)} with >= 5")
+    quiet = [r for r in passing
+             if all(p["y"] == 0 for p in r["inout_points"] if passes_inout_gate([p]))]
+    print(f"  ...of which {len(quiet)} pass only in years with nothing published outside "
+          f"({sum(r['p_genuine'] < SHORTLIST_THRESHOLD for r in quiet)} shortlisted)")
     margins = sorted((p["x"] - p["y"] for p in points), reverse=True)
     n = len(margins)
     print("  x - y at the top of the distribution: "
@@ -110,7 +133,7 @@ def print_record_diagnostic(rows, data, base_pos):
     nodes = [n for r in rows for n in r["nodes"]]
     stages = sorted({n["career_stage"] for n in nodes})
     print("\n=== CO-AUTHOR CAREER STAGE (diagnostic; NOT a parent of the state node) ===")
-    print("  (the co-author's record as of the dump, not as of the paper)")
+    print("  (the co-author's publications before their first one with the editor)")
     print(f"  {'career stage':<14}{'nodes':>8}{'load':>10}"
           + "".join(f"{s:>11}" for s in data["config"]["states"]))
     for stage in stages:
@@ -124,11 +147,11 @@ def print_record_diagnostic(rows, data, base_pos):
                      rank_corpus(data, condition_on_career_stage=True), base_pos)
 
 
-def print_tenure(rows, data):
-    """The state mix before and during tenure, pooled and per editor."""
+def print_board_terms(rows, data):
+    """The state mix before and during the board term, pooled and per editor."""
     controls = data.get("control_coauthorships", {})
     if not controls:
-        print("\n=== WITHIN-EDITOR TENURE CONTROL: no pre-tenure co-authorships extracted ===")
+        print("\n=== WITHIN-EDITOR BOARD-TERM CONTROL: no pre-board co-authorships extracted ===")
         return
     suspect_nodes = [n for r in rows for n in r["nodes"]]
     scored = {r["ident"] for r in rows}
@@ -136,9 +159,9 @@ def print_tenure(rows, data):
     s_shares, s_load = state_shares(suspect_nodes)
     c_shares, c_load = state_shares(control_nodes)
 
-    print("\n=== WITHIN-EDITOR TENURE CONTROL (same editor, same journal, before the board) ===")
+    print("\n=== WITHIN-EDITOR BOARD-TERM CONTROL (same editor, same journal, before the board) ===")
     print("  (a diagnostic, NOT evidence in the network)")
-    print(f"  {'state':<12}{'during tenure':>15}{'before tenure':>15}{'shift':>10}")
+    print(f"  {'state':<12}{'during term':>15}{'before term':>15}{'shift':>10}")
     for state in data["config"]["states"]:
         during, before = s_shares.get(state, 0.0), c_shares.get(state, 0.0)
         print(f"  {state:<12}{during:>14.1%}{before:>15.1%}{during - before:>+10.1%}")
@@ -154,12 +177,198 @@ def print_tenure(rows, data):
               f"({pct(rose, len(have))})")
 
 
+def print_ranking_head(rows, label):
+    """P(genuine) of #1, the range over the next nine, and how many editors fall
+    below each level of HEAD_P_LEVELS and below the prior."""
+    if not rows:
+        return
+    ps = [r["p_genuine"] for r in rows]
+    nxt = ps[1:HEAD_SIZE]
+    print(f"  {label:<8} ranked {len(rows)}; #1 P={fmt_p(ps[0])}"
+          + (f", #2-#{len(nxt) + 1} P {fmt_p(min(nxt))}-{fmt_p(max(nxt))}" if nxt else "")
+          + "".join(f"; below {q}: {sum(p < q for p in ps)}" for q in HEAD_P_LEVELS)
+          + f"; below the prior {PRIOR}: {sum(p < PRIOR for p in ps)}")
+
+
+def print_head(rows, ungated):
+    print("\n=== THE HEAD OF THE RANKING ===")
+    print_ranking_head(rows, "gate" if INOUT_GATE else "run")
+    print_ranking_head(ungated, "no gate")
+
+
+# ---------------------------------------------------------------------------
+# The personal one-off baseline
+# ---------------------------------------------------------------------------
+
+def load_share(nodes, keep) -> str:
+    """The load share of `nodes` for which `keep` holds, as a percentage."""
+    total = sum(n["load"] for n in nodes)
+    return pct(sum(n["load"] for n in nodes if keep(n)), total) if total else "-"
+
+
+def print_coverage(data):
+    """How much of the scored load has a co-author with N_min collaborators of their
+    own, per publisher and per tie."""
+    nodes = list(data["coauthorships"].values())
+    publishers = sorted({n.get("publisher", "") for n in nodes})
+
+    def adjusted(n):
+        return qualifies(n, FALLBACK_MIN_N)
+
+    print(f"\n=== PERSONAL ONE-OFF BASELINE: COVERAGE "
+          f"(co-authors with >= {FALLBACK_MIN_N:g} collaborators) ===")
+    print(f"  {'publisher':<10}{'nodes':>8}{'load':>10}{'adjusted nodes':>16}"
+          f"{'adjusted load':>15}{'no network':>12}")
+    for label in publishers + ["all"]:
+        group = [n for n in nodes if label == "all" or n.get("publisher", "") == label]
+        print(f"  {label:<10}{len(group):>8}{sum(n['load'] for n in group):>10.1f}"
+              f"{pct(sum(map(adjusted, group)), len(group)):>16}"
+              f"{load_share(group, adjusted):>15}"
+              f"{load_share(group, lambda n: not n.get('pool_n')):>12}")
+    print("  adjusted load share per tie: "
+          + ", ".join(f"{s} {load_share([n for n in nodes if n['state'] == s], adjusted)}"
+                      for s in data["config"]["states"]))
+
+
+def print_typical_habit(ref, ungated):
+    """The spread of the typical habit over the journals (each journal whole, no
+    editor left out), and how often the scored co-authorships fall back to the
+    publisher."""
+    print("\n=== THE JOURNAL'S TYPICAL ONE-OFF HABIT ===")
+    for publisher in sorted(set(ref.publisher_of.values())):
+        journals = [j for j, p in ref.publisher_of.items() if p == publisher]
+        values = [typical_habit(ref, j, []) for j in journals]
+        own = sorted(r for r, level in values if level == "journal")
+        weighted, load = ref.oneoff_pooled.get(publisher, (0.0, 0.0))
+        pooled = f"{weighted / load:.3f}" if load else "-"
+        spread = (f"min {own[0]:.3f}, median {statistics.median(own):.3f}, "
+                  f"max {own[-1]:.3f}" if own else "none")
+        print(f"  {publisher:<6} {len(journals)} journals: {len(own)} with their own "
+              f"typical habit "
+              f"({spread}); {len(journals) - len(own)} fall back to the publisher's "
+              f"{pooled}")
+    details = adjusted_details(ungated)
+    fallback = [d for d in details if d["oneoff_level"] == "pooled"]
+    print(f"  scored, with the editor left out: {len(fallback)} of {len(details)} adjusted "
+          f"co-authorships use the publisher's typical habit "
+          f"({load_share(details, lambda d: d['oneoff_level'] == 'pooled')} of their load)")
+
+
+def adjusted_details(rows):
+    """The detail records of every adjusted co-authorship in `rows`."""
+    return [d for r in rows for d in r["detail"] if d["adjusted"]]
+
+
+def habit_ratio_bin(habit_ratio, edges=HABIT_RATIO_BINS) -> int:
+    """Index of the bin of the habit ratio, given ascending exclusive upper edges."""
+    for i, edge in enumerate(edges):
+        if habit_ratio < edge:
+            return i
+    return len(edges)
+
+
+def habit_ratio_labels(edges=HABIT_RATIO_BINS) -> list[str]:
+    """'<0.25', '0.25-0.5', ..., '>2' for the bins of habit_ratio_bin."""
+    return ([f"<{edges[0]:g}"] + [f"{a:g}-{b:g}" for a, b in zip(edges, edges[1:])]
+            + [f">{edges[-1]:g}"])
+
+
+def calibration(details, edges=HABIT_RATIO_BINS) -> list[dict]:
+    """Per bin of the habit ratio, load-weighted over the adjusted co-authorships:
+    its mean, the observed `single` share, the predicted g_i(single) and the
+    journal's g(single)."""
+    bins = defaultdict(list)
+    for d in details:
+        bins[habit_ratio_bin(d["habit_ratio"], edges)].append(d)
+    out = []
+    for i, label in enumerate(habit_ratio_labels(edges)):
+        group = bins.get(i, [])
+        load = sum(d["load"] for d in group)
+        if not load:
+            continue
+
+        def mean(key):
+            return sum(d[key] * d["load"] for d in group) / load
+
+        out.append({"bin": label, "nodes": len(group), "load": load,
+                    "habit_ratio": mean("habit_ratio"),
+                    "observed": sum(d["load"] for d in group if d["state"] == "single") / load,
+                    "predicted": mean("single_p"), "journal": mean("journal_single_p")})
+    return out
+
+
+def print_calibration_table(details, label):
+    rows = calibration(details)
+    print(f"\n  {label}: {len(details)} adjusted co-authorships, "
+          f"load {sum(d['load'] for d in details):.1f}")
+    print(f"  {'ratio':>9}{'nodes':>8}{'load':>9}{'mean ratio':>11}{'obs single':>12}"
+          f"{'g_i(single)':>13}{'journal g':>11}{'obs/pred':>10}")
+    for r in rows:
+        print(f"  {r['bin']:>9}{r['nodes']:>8}{r['load']:>9.1f}{r['habit_ratio']:>11.2f}"
+              f"{r['observed']:>12.3f}{r['predicted']:>13.3f}{r['journal']:>11.3f}"
+              f"{r['observed'] / r['predicted']:>10.2f}")
+    total = sum(r["load"] for r in rows)
+    if total:
+        print(f"  {'all':>9}{len(details):>8}{total:>9.1f}"
+              f"{sum(r['habit_ratio'] * r['load'] for r in rows) / total:>11.2f}"
+              + "".join(f"{sum(r[k] * r['load'] for r in rows) / total:>{w}.3f}"
+                        for k, w in (("observed", 12), ("predicted", 13), ("journal", 11))))
+
+
+def print_calibration(ungated, ref):
+    """Does g(single|j) with its odds times the habit ratio follow the observed share,
+    and is it conservative? Observed against predicted, over every scored editor."""
+    details = adjusted_details(ungated)
+    print("\n=== CALIBRATION OF THE PERSONAL ONE-OFF BASELINE (bins of the habit ratio) ===")
+    print("  (obs single = the load share of `single` among the adjusted co-authorships;")
+    print("   g_i(single) = the model's g(single|j) with its odds times the habit ratio, "
+          "journal g = g(single|j) unadjusted;")
+    print("   both with the editor left out, as scored; the evidence is not genuine-only)")
+    print_calibration_table(details, "all publishers")
+    for publisher in sorted(set(ref.publisher_of.values())):
+        print_calibration_table([d for d in details
+                                 if ref.publisher_of.get(d["journal"]) == publisher],
+                                publisher)
+
+
+def print_zero_oneoffs(ungated):
+    """Adjusted co-authors who never published once only with anyone: their one-off
+    habit rests on the pseudo-count alone."""
+    zero = [d for d in adjusted_details(ungated) if d["pool_oneoffs"] == 0]
+    print("\n=== ADJUSTED CO-AUTHORS WITH NO ONE-OFF COLLABORATOR (k_A = 0) ===")
+    if not zero:
+        print("  none")
+        return
+    habit_ratios = sorted(d["habit_ratio"] for d in zero)
+    print(f"  {len(zero)} co-authorships, load {sum(d['load'] for d in zero):.2f}; "
+          f"habit ratio {', '.join(f'{r:.3f}' for r in habit_ratios)}; collaborators "
+          f"{', '.join(str(d['pool_n']) for d in sorted(zero, key=lambda d: d['habit_ratio']))}; "
+          f"ties {dict(Counter(d['state'] for d in zero))}")
+
+
+def print_adjustment_sweep(data, base_pos, ungated_pos):
+    """The shortlists without the personal adjustment and at other boundaries N_min,
+    against the run's (gated and ungated)."""
+    nodes = list(data["coauthorships"].values())
+    print(f"\n=== PERSONAL ADJUSTMENT: ABLATION AND BOUNDARY "
+          f"(the run: N_min = {FALLBACK_MIN_N:g}) ===")
+    variants = [("no personal adjustment", NO_ADJUSTMENT)] + [
+        (f"N_min = {n:g}", n) for n in POOL_MIN_SWEEP]
+    for label, pool_min in variants:
+        ungated = rank_corpus(data, inout_gate=False, pool_min=pool_min)
+        gated = [r for r in ungated if r["passes_inout_gate"]]
+        share = load_share(nodes, lambda n: qualifies(n, pool_min))
+        report_stability(f"{label}, gate", gated, base_pos,
+                         extra=f"adjusted load {share.strip()}")
+        report_stability(f"{label}, no gate", ungated, ungated_pos)
+
+
 # ---------------------------------------------------------------------------
 # Sweeps
 # ---------------------------------------------------------------------------
 
 def reclassify_corpus(data, repeated_min, outside_reading="any"):
-    """A copy of `data` with every node re-stated and the baselines and fit rebuilt."""
+    """A copy of `data` with every node re-stated and the baselines rebuilt."""
     count = "n_shared_outside_strict" if outside_reading == "strict" else "n_shared_outside"
 
     def restate(nodes):
@@ -169,8 +378,83 @@ def reclassify_corpus(data, repeated_min, outside_reading="any"):
     nodes = restate(data["coauthorships"])
     return {**data, "coauthorships": nodes,
             "control_coauthorships": restate(data.get("control_coauthorships", {})),
-            "journals": baseline_counts(nodes),
-            "fit_baseline": relabel_fit_per_publisher(nodes)}
+            "journals": baseline_counts(nodes)}
+
+
+def with_nodes(data, nodes):
+    """A copy of `data` scored on `nodes` alone, with the baselines and the editor
+    index rebuilt."""
+    return {**data, "coauthorships": nodes, "journals": baseline_counts(nodes),
+            "editor_index": dict(index_by_editor(nodes))}
+
+
+def print_record_boundary(data, base_pos, ungated_pos):
+    """The shortlists when co-authors with a shorter record are left out at other
+    boundaries, against the run's (gated and ungated)."""
+    short = {k: n for k, n in data.get("benign_coauthorships", {}).items()
+             if n["benign_reason"] == "short_record"}
+    pool = {**data["coauthorships"], **short}
+    print(f"\n=== CO-AUTHOR RECORD BOUNDARY (the run: at least "
+          f"{data['config'].get('coauthor_min_pubs')} publications) ===")
+    for min_pubs in COAUTHOR_MIN_PUBS_SWEEP:
+        nodes = {k: n for k, n in pool.items() if n["coauthor_pubs"] >= min_pubs}
+        ungated = rank_corpus(with_nodes(data, nodes), inout_gate=False)
+        shares, load = state_shares(list(nodes.values()))
+        report_stability(f">= {min_pubs} publications, gate",
+                         [r for r in ungated if r["passes_inout_gate"]], base_pos,
+                         extra=f"load {load:.0f} single={shares.get('single', 0):.1%}")
+        report_stability(f">= {min_pubs} publications, no gate", ungated, ungated_pos)
+
+
+def print_recency(data, ungated, base_pos, ungated_pos):
+    """The state mix by the year of the first shared publication, where the recent
+    co-authorships find their baseline, and the shortlists at other first years of a
+    recent co-authorship, without the split, and with recent co-authorships left out."""
+    nodes = data["coauthorships"]
+    by_year = defaultdict(list)
+    for n in nodes.values():
+        year = n.get("first_year")
+        by_year["undated" if year is None else
+                f"<{YEARS_PRINT_FROM}" if year < YEARS_PRINT_FROM else str(year)].append(n)
+    states = data["config"]["states"]
+    print(f"\n=== RECENT CO-AUTHORSHIPS (the run: recent from {RECENT_FROM}) ===")
+    print("  the state mix by the year of the first shared publication")
+    print(f"  {'first year':<12}{'load':>9}" + "".join(f"{s:>14}" for s in states))
+    for year in sorted(by_year):
+        shares, load = state_shares(by_year[year])
+        print(f"  {year:<12}{load:>9.1f}"
+              + "".join(f"{shares.get(s, 0.0):>13.1%} " for s in states))
+
+    recent = [d for r in ungated for d in r["detail"]
+              if RECENT_FROM is not None and (d["first_year"] or 0) >= RECENT_FROM]
+    levels = Counter()
+    for d in recent:
+        levels[d["fallback_level"]] += d["load"]
+    total = sum(levels.values())
+    print("  baseline of the recent co-authorships: "
+          + ", ".join(f"{level} {pct(load, total)}" for level, load in levels.most_common()))
+
+    for recent_from in RECENT_FROM_SWEEP:
+        label = f"recent from {recent_from}" if recent_from is not None else "no split"
+        rows = rank_corpus(data, inout_gate=False, recent_from=recent_from)
+        report_stability(f"{label}, gate", [r for r in rows if r["passes_inout_gate"]],
+                         base_pos)
+        report_stability(f"{label}, no gate", rows, ungated_pos)
+    if RECENT_FROM is None:
+        return
+
+    def is_recent(n):
+        return (n.get("first_year") or 0) >= RECENT_FROM
+
+    for label, keep in (("recent `single` left out", lambda n: not (
+                            is_recent(n) and n["state"] == "single")),
+                        ("all recent left out", lambda n: not is_recent(n))):
+        kept = {k: n for k, n in nodes.items() if keep(n)}
+        rows = rank_corpus(with_nodes(data, kept), inout_gate=False, recent_from=None)
+        report_stability(f"{label}, gate", [r for r in rows if r["passes_inout_gate"]],
+                         base_pos, extra=f"ranked {sum(r['passes_inout_gate'] for r in rows)}")
+        report_stability(f"{label}, no gate", rows, ungated_pos,
+                         extra=f"ranked {len(rows)}")
 
 
 def report_stability(label, rows, base_pos, extra=""):
@@ -180,7 +464,7 @@ def report_stability(label, rows, base_pos, extra=""):
     common = set(base_pos) & set(pos)
     shifts = sorted(abs(base_pos[i] - pos[i]) for i in common)
     median = shifts[len(shifts) // 2] if shifts else 0
-    print(f"  {label:<28} size={len(shortlist):<5} "
+    print(f"  {label:<38} size={len(shortlist):<5} "
           f"in-common={len(common):>4}/{len(base_pos):<4} "
           f"median|Drank|={median:<4} max|Drank|={shifts[-1] if shifts else 0:<4} {extra}")
 
@@ -204,9 +488,11 @@ def print_sweeps(data, rows, shortlist, base_pos):
               f"the {len(sweep)} lowest-scoring instead)")
 
     ref = reference(data)
+    boundaries = [("none", NO_ADJUSTMENT)] + [(n, n) for n in POOL_MIN_SWEEP]
+    refs = {pool_min: reference(data, pool_min) for _, pool_min in boundaries}
 
-    def posterior(row, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST):
-        return score_editor(row["nodes"], ref, alpha, prior, manip=manip)[0]
+    def posterior(row, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, r=ref):
+        return score_editor(row["nodes"], r, alpha, prior, manip=manip)[0]
 
     print_posterior_sweep(
         f"ALPHA SENSITIVITY  (P(genuine), prior={PRIOR}; top {len(sweep)})",
@@ -221,12 +507,14 @@ def print_sweeps(data, rows, shortlist, base_pos):
         "  shape       ", list(MANIP_SWEEP.items()), 11, sweep,
         lambda r, m: posterior(r, manip=m))
 
+    print_posterior_sweep(
+        f"PERSONAL ADJUSTMENT BOUNDARY N_min  (P(genuine); top {len(sweep)})",
+        "  N_min  ", boundaries, 6, sweep,
+        lambda r, pool_min: posterior(r, r=refs[pool_min]))
+
     print(f"\n=== m(s) RANKING STABILITY vs baseline (shortlist n={len(shortlist)}) ===")
     for name, manip in MANIP_SWEEP.items():
         report_stability(name, rank_corpus(data, manip=manip), base_pos)
-
-    print("\n=== FIT-FACTOR ABLATION: every node scored on its state alone ===")
-    report_stability("no fit factor", rank_corpus({**data, "fit_baseline": None}), base_pos)
 
     print("\n=== DEFINITION SENSITIVITY: `repeated` threshold and `outside` reading ===")
     print("  (re-derived from the corpus's own counts; the extract's setting is "
@@ -238,6 +526,91 @@ def print_sweeps(data, rows, shortlist, base_pos):
             report_stability(f"outside={reading}, R>={repeated_min}", v_rows, base_pos,
                              extra=f"single={shares.get('single', 0):.1%} "
                                    f"out1={shares.get('outside_1', 0):.1%}")
+
+
+def shortlisted(rows):
+    return [r for r in rows if r["p_genuine"] < SHORTLIST_THRESHOLD]
+
+
+def print_entry_conditions(ungated, base_pos):
+    """Who is ranked, not how they are scored: the gate and a minimum record.
+    `ungated` is the ranking of every scored editor."""
+    gated = [r for r in ungated if r["passes_inout_gate"]]
+    strict = [r for r in ungated if any(p["x"] > p["y"] for p in r["inout_points"] or [])]
+    print("\n=== ENTRY CONDITIONS: who is ranked, not how they are scored ===")
+    report_stability("gate x >= y (the run)", gated, base_pos)
+    report_stability("gate x > y (Westerbaan)", strict, base_pos)
+    report_stability("no gate", ungated, base_pos)
+    for n_min in MIN_RECORD_SWEEP:
+        report_stability(f"gate, >= {n_min} suspect papers",
+                         [r for r in gated if r["n_suspect_papers"] >= n_min], base_pos)
+        report_stability(f"no gate, >= {n_min} suspect papers",
+                         [r for r in ungated if r["n_suspect_papers"] >= n_min], base_pos)
+
+    short = shortlisted(ungated)
+    if not short:
+        return
+    papers = [r["n_suspect_papers"] for r in short]
+    publishers = Counter(p for r in short for p in r["publishers"].split("|") if p)
+    print(f"\n  without the gate: {len(short)} below {SHORTLIST_THRESHOLD}, "
+          f"{dict(publishers)}; median {statistics.median(papers)} suspect papers, "
+          f"{sum(p >= 5 for p in papers)} with >= 5; "
+          f"{sum(r['passes_inout_gate'] for r in short)} pass the gate; "
+          f"the gated shortlist sits at "
+          f"{[i + 1 for i, r in enumerate(short) if r['passes_inout_gate']]}")
+    print("  the lowest, without names:")
+    for i, r in enumerate(short[:LOWEST_PRINT_CAP], 1):
+        repeated = sum(n["load"] for n in r["nodes"] if n["state"] == "repeated") / r["load"]
+        print(f"    {i}. P={fmt_p(r['p_genuine'])} papers={r['n_suspect_papers']} "
+              f"co-authorships={r['n_nodes']} single={r['share_single']:.0%} "
+              f"repeated={repeated:.0%} outside={r['share_outside']:.0%} "
+              f"journals={len(r['journals'].split('|'))} "
+              f"x={r['inout_x']} y={r['inout_y']}")
+
+
+def print_count_ablation(data, ungated):
+    """The network against a count: one fixed log LR per tie class and publisher,
+    from the pooled baseline, with no per-journal baseline and no personal adjustment."""
+    ref = reference(data)
+    states = ref.states
+    log_lr = {(publisher, s): math.log(node_lr(s, smooth(merge(stages.values(), states),
+                                                         states), ALPHA))
+              for publisher, stages in ref.pooled.items() for s in states}
+    prior = math.log(PRIOR / (1 - PRIOR))
+
+    def counted(r):
+        return prior + sum(n["load"] * log_lr[(ref.publisher_of.get(n["journal"], ""),
+                                               n["state"])] for n in r["nodes"])
+
+    def locked_share(journal):
+        counts = merge(ref.journals[journal]["baseline_counts"].values(), states)
+        total = sum(counts.values())
+        return (counts["single"] + counts["repeated"]) / total if total else None
+
+    def editor_locked(r):
+        shares = [s for s in (locked_share(n["journal"]) for n in r["nodes"]) if s is not None]
+        return statistics.fmean(shares) if shares else None
+
+    def median_locked(rows):
+        values = [v for v in map(editor_locked, rows) if v is not None]
+        return f"{statistics.median(values):.1%}" if values else "-"
+
+    plain = {r["ident"]: r for r in rank_corpus(data, inout_gate=False,
+                                                 pool_min=NO_ADJUSTMENT)}
+    print("\n=== THE NETWORK AGAINST A COUNT (fixed log LR per tie class and publisher) ===")
+    for label, rows in (("gate", [r for r in ungated if r["passes_inout_gate"]]),
+                        ("no gate", ungated)):
+        net = {r["ident"] for r in shortlisted(rows)}
+        count = {r["ident"] for r in rows if counted(r) < 0}
+        tie = {r["ident"] for r in rows if plain[r["ident"]]["p_genuine"] < SHORTLIST_THRESHOLD}
+        print(f"  {label:<8} network {len(net)} | count {len(count)}, {len(net & count)} in common"
+              f" | network without the personal adjustment {len(tie)}, "
+              f"{len(net & tie)} in common")
+        if label == "no gate":
+            print(f"  share of venue-locked load in the editors' journals (median): "
+                  f"all {median_locked(rows)}, count only "
+                  f"{median_locked([r for r in rows if r['ident'] in count - net])}, "
+                  f"network only {median_locked([r for r in rows if r['ident'] in net - count])}")
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +626,25 @@ def main():
     print(f"Ranked {len(rows)} editors; {len(shortlist)} below threshold "
           f"{SHORTLIST_THRESHOLD}.")
 
+    ungated = rank_corpus(data, inout_gate=False)
+    ungated_pos = {r["ident"]: i for i, r in enumerate(shortlisted(ungated))}
     print_publishers(rows, shortlist)
     print_benign(data)
-    print_gate(rank_corpus(data, inout_gate=False))
+    print_gate(ungated)
     print_journals(shortlist)
+    print_head(rows, ungated)
     print_record_diagnostic(rows, data, base_pos)
-    print_tenure(rows, data)
+    print_board_terms(rows, data)
+    print_coverage(data)
+    print_typical_habit(reference(data), ungated)
+    print_zero_oneoffs(ungated)
+    print_calibration(ungated, reference(data))
     print_sweeps(data, rows, shortlist, base_pos)
+    print_adjustment_sweep(data, base_pos, ungated_pos)
+    print_record_boundary(data, base_pos, ungated_pos)
+    print_recency(data, ungated, base_pos, ungated_pos)
+    print_entry_conditions(ungated, base_pos)
+    print_count_ablation(data, ungated)
 
 
 if __name__ == "__main__":

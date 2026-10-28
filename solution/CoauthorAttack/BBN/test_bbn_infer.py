@@ -6,6 +6,8 @@ Tests for bbn_infer.py, on a synthetic corpus. No data file needed.
 
 from __future__ import annotations
 
+import math
+
 import bbn_infer as infer
 
 _failures = 0
@@ -34,18 +36,15 @@ JOURNALS = {"J1": {"publisher": "acm", "baseline_counts": {
 }}}
 ALPHA = 0.20
 MANIP = {"outside": 0.0, "repeated": 0.15, "single": 0.85}
-MANIP_FIT = {"single": {"peripheral": 0.60, "typical": 0.30, "core": 0.10},
-             "outside": {"peripheral": 1 / 3, "typical": 1 / 3, "core": 1 / 3},
-             "repeated": {"peripheral": 1 / 3, "typical": 1 / 3, "core": 1 / 3}}
 
 
-def corpus(journals=JOURNALS, fit_base=None, **extra):
+def corpus(journals=JOURNALS, **extra):
     return {"config": {"states": STATES, "repeated_min": 2, "junior_max_pubs": 10},
-            "journals": journals, "fit_baseline": fit_base, **extra}
+            "journals": journals, **extra}
 
 
-def ref(journals=JOURNALS, fit_base=None):
-    return infer.reference(corpus(journals, fit_base))
+def ref(journals=JOURNALS):
+    return infer.reference(corpus(journals))
 
 
 REF = ref()
@@ -61,8 +60,7 @@ def node(state, load, record="established", coauthor="c", inside=1, outside=0,
 
 
 def posterior(nodes, alpha=ALPHA, prior=infer.PRIOR, r=REF):
-    return infer.score_editor(nodes, r, alpha, prior, manip=MANIP,
-                              manip_fit=MANIP_FIT)[0]
+    return infer.score_editor(nodes, r, alpha, prior, manip=MANIP)[0]
 
 
 def ranking_corpus():
@@ -79,9 +77,10 @@ def ranking_corpus():
         editor_labels={"E1": "Ed One", "E2": "Ed Two", "E3": "Ed Three"},
         editors={
             "E1": {"n_suspect_papers": 3, "is_pid": False,
-                   "inout_points": [{"journal": "J1", "x": 1, "y": 5}]},
+                   "inout_points": [{"year": 2010, "x": 1, "y": 5}]},
             "E2": {"n_suspect_papers": 3, "is_pid": True,
-                   "inout_points": [{"journal": "J1", "x": 4, "y": 2}]},
+                   "inout_points": [{"year": 2010, "x": 0, "y": 3},
+                                    {"year": 2011, "x": 4, "y": 2}]},
             "E3": {"n_suspect_papers": 1, "is_pid": False},
         })
 
@@ -104,54 +103,169 @@ def test_likelihood_ratios():
           approx(sum(gdist.values()), 1.0))
 
 
-def test_fit_factor():
-    print("\n-- the fit factor, the child of the state --")
-    fit_base = {"acm": {
-        "single": {"0": {"peripheral": 40.0, "typical": 40.0, "core": 40.0},
-                   "1": {"peripheral": 5.0, "typical": 5.0, "core": 5.0}},
-        "outside": {"0": {"peripheral": 40.0, "typical": 40.0, "core": 40.0}}}}
-    r = ref(fit_base=fit_base)
-    gdist, _ = infer.genuine_dist(r, "J1", "established", [])
-    fdist, flevel = infer.fit_dist(r, "J1", "single", 0, [])
-    check("a well-populated (state, band) level is used first",
-          flevel == "state:band")
-    check("the fit baseline smooths to a distribution", approx(sum(fdist.values()), 1.0))
-    check("a thin band falls back to the state, pooled over bands",
-          infer.fit_dist(r, "J1", "single", 1, [])[1] == "state")
-    check("a state with no fit data at all falls back to uniform",
-          infer.fit_dist(r, "J1", "repeated", 0, [])[1] == "uniform")
-    r_ieee = ref({**JOURNALS, "I1": {"publisher": "ieee", "baseline_counts": {}}}, fit_base)
-    check("another publisher's journal does not use this publisher's fit baseline",
-          infer.fit_dist(r_ieee, "I1", "single", 0, [])[1] == "uniform")
+# --- the personal one-off baseline ---------------------------------------------
 
-    lr_per = infer.node_lr("single", gdist, ALPHA, MANIP, "peripheral", fdist, MANIP_FIT)
-    lr_typ = infer.node_lr("single", gdist, ALPHA, MANIP, "typical", fdist, MANIP_FIT)
-    lr_core = infer.node_lr("single", gdist, ALPHA, MANIP, "core", fdist, MANIP_FIT)
-    check("a one-off with someone who rarely one-offs is the most incriminating",
-          lr_per < lr_typ < lr_core)
-    check("an unknown fit leaves the node on its state alone",
-          approx(infer.node_lr("single", gdist, ALPHA, MANIP, "", fdist, MANIP_FIT),
-                 infer.node_lr("single", gdist, ALPHA, MANIP)))
-    check("m(state)=0 keeps LR at 1/(1-alpha) for EVERY fit value",
-          all(approx(infer.node_lr("outside", gdist, ALPHA, MANIP, f, fdist, MANIP_FIT),
-                     1 / (1 - ALPHA), 1e-9) for f in infer.FIT_STATES))
+N_MIN = int(infer.FALLBACK_MIN_N)
 
-    own = [node("single", 30.0, fit="peripheral", network_band=0)]
-    check("an editor is removed from their own fit baseline",
-          infer.fit_dist(r, "J1", "single", 0, own)[0]["peripheral"]
-          < infer.fit_dist(r, "J1", "single", 0, [])[0]["peripheral"])
 
-    fit_nodes = [node("single", 1.0, fit="peripheral", network_band=0)]
-    with_fit = posterior(fit_nodes, r=r)
-    without = posterior(fit_nodes)
-    check(f"a corpus with a fit baseline scores a peripheral one-off lower "
-          f"({with_fit:.4f} vs {without:.4f} without one)", with_fit < without)
-    check("a node without a fit is scored on its state even when the corpus has fits",
-          approx(posterior([node("single", 1.0)], r=r), without))
+def pooled_node(editor, journal, load, n, k, state="single"):
+    """A co-authorship whose co-author has n collaborators, k of them one-offs."""
+    return {**node(state, load, coauthor=f"{editor}{journal}{n}-{k}", journal=journal),
+            "editor_id": editor, "pool_n": n, "pool_oneoffs": k}
 
-    for state, shape in infer.MANIP_FIT.items():
-        check(f"m(f|{state}) sums to 1", approx(sum(shape.values()), 1.0)
-              and set(shape) == set(infer.FIT_STATES))
+
+def share(n, k):
+    return (k + 0.5) / (n + 1)
+
+
+def personal_corpus():
+    """ACM journals J1 (well populated) and J2 (thin), IEEE journal I1. E sits on
+    J1 and J2; O1..O4 are other editors. Two co-authors are below N_MIN."""
+    others = [pooled_node("O1", "J1", 20.0, 39, 19), pooled_node("O2", "J1", 20.0, 39, 29),
+              pooled_node("O3", "J2", 10.0, 39, 14), pooled_node("O4", "I1", 40.0, 39, 39),
+              pooled_node("O1", "J1", 5.0, N_MIN - 1, 0), pooled_node("O3", "J2", 5.0, 3, 3)]
+    mine = [pooled_node("E", "J1", 10.0, 39, 9), pooled_node("E", "J2", 4.0, 59, 50)]
+    nodes = {f"{n['editor_id']}||{n['journal']}||{n['coauthor_id']}": n
+             for n in others + mine}
+    journals = {**JOURNALS,
+                "J2": {"publisher": "acm", "baseline_counts": {"established": {
+                    "outside": 10.0, "repeated": 2.0, "single": 7.0}}},
+                "I1": {"publisher": "ieee", "baseline_counts": {"established": {
+                    "outside": 30.0, "repeated": 0.0, "single": 10.0}}}}
+    index = {}
+    for key, n in nodes.items():
+        index.setdefault(n["editor_id"], []).append(key)
+    return corpus(journals, coauthorships=nodes, editor_index=index,
+                  editors={e: {"n_suspect_papers": 1} for e in index}), mine
+
+
+def test_oneoff_habit():
+    print("\n-- the co-author's one-off habit --")
+    check("the habit is (k + 0.5) / (n + 1)",
+          approx(infer.oneoff_habit({"pool_n": 39, "pool_oneoffs": 9}), 9.5 / 40))
+    zero = infer.oneoff_habit({"pool_n": 40, "pool_oneoffs": 0})
+    check(f"the pseudo-count keeps the habit above 0 when k = 0 (got {zero:.4f})",
+          zero > 0 and approx(zero, 0.5 / 41))
+    check("...and below 1 when every collaborator is a one-off",
+          infer.oneoff_habit({"pool_n": 40, "pool_oneoffs": 40}) < 1)
+    check("N_min collaborators qualify, one fewer do not, no network never",
+          infer.qualifies({"pool_n": N_MIN}, N_MIN)
+          and not infer.qualifies({"pool_n": N_MIN - 1}, N_MIN)
+          and not infer.qualifies({"pool_n": None}, 0))
+
+
+def test_typical_habit():
+    print("\n-- the typical habit: leave-one-editor-out and the publisher fallback --")
+    data, mine = personal_corpus()
+    r = infer.reference(data)
+    others_acm = 20 * share(39, 19) + 20 * share(39, 29) + 10 * share(39, 14)
+    with_mine = others_acm + 10 * share(39, 9) + 4 * share(59, 50)
+    whole, level = infer.typical_habit(r, "J1", [])
+    expected = (20 * share(39, 19) + 20 * share(39, 29) + 10 * share(39, 9)) / 50
+    check(f"J1's typical habit is the load-weighted mean habit of its qualifying "
+          f"co-authorships ({whole:.4f})", level == "journal" and approx(whole, expected))
+    loo, level = infer.typical_habit(r, "J1", mine)
+    check(f"leaving the editor out removes their own co-authorships ({loo:.4f})",
+          level == "journal"
+          and approx(loo, (20 * share(39, 19) + 20 * share(39, 29)) / 40))
+    pooled, level = infer.typical_habit(r, "J2", [])
+    thin, level_mine = infer.typical_habit(r, "J2", mine)
+    check(f"a journal below N_min falls back to its publisher (got {level}, "
+          f"{level_mine} with the editor left out)", level == level_mine == "pooled")
+    check("...whose pool is the ACM journals only, without the editor's own "
+          "co-authorships", approx(thin, others_acm / 50)
+          and approx(pooled, with_mine / 64))
+    check("a publisher with no qualifying load gives no typical habit",
+          infer.typical_habit(infer.reference(corpus()), "J1", []) == (None, ""))
+    off = infer.reference(data, pool_min=math.inf)
+    check("pool_min = inf leaves the sums empty",
+          off.oneoff_journal == {} and off.oneoff_pooled == {})
+
+
+def test_personal_column():
+    print("\n-- the personal genuine column --")
+    gdist, _ = infer.genuine_dist(REF, "J1", "established", [])
+    odds = gdist["single"] / (1 - gdist["single"])
+    for habit_ratio in (0.1, 0.8, 1.0, 1.7):
+        g = infer.personal_column(gdist, habit_ratio)
+        new_odds = g["single"] / (1 - g["single"])
+        check(f"habit ratio {habit_ratio}: the odds of g_i(single) are the journal's times "
+              f"the ratio and the column sums to 1",
+              approx(new_odds, odds * habit_ratio) and approx(sum(g.values()), 1.0))
+    g = infer.personal_column(gdist, 1.7)
+    check("the other ties are rescaled by one common factor",
+          approx(g["outside"] / gdist["outside"], g["repeated"] / gdist["repeated"]))
+    huge = infer.personal_column(gdist, 1e6)
+    check("a huge habit ratio keeps g_i(single) below 1 and the column summing to 1",
+          huge["single"] < 1 and approx(sum(huge.values()), 1.0))
+    check("for a rare `single` the odds scaling is close to scaling the probability",
+          abs(infer.odds_scaled(0.02, 1.5) - 0.03) < 0.001)
+    check("for a common `single` it leaves the other ties room (0.6 at ratio 1.5 gives 0.692)",
+          approx(infer.odds_scaled(0.6, 1.5), 2.25 / 3.25))
+
+    data, _ = personal_corpus()
+    r = infer.reference(data)
+    j1 = [n for n in data["coauthorships"].values()
+          if n["journal"] == "J1" and infer.qualifies(n, N_MIN)]
+    gj, _ = infer.genuine_dist(r, "J1", "established", [])
+    singles = [infer.personal_dist(r, n, gj, [])[0]["single"] for n in j1]
+    mean = sum(g * n["load"] for g, n in zip(singles, j1)) / sum(n["load"] for n in j1)
+    check(f"over the journal's own qualifying load, g_i(single) averages a little below "
+          f"g(single|j), as the odds scaling is concave ({mean:.5f} vs {gj['single']:.5f})",
+          0.95 * gj["single"] < mean <= gj["single"])
+
+    below = pooled_node("E", "J1", 1.0, N_MIN - 1, 0)
+    check("a co-author below N_min keeps the journal's column",
+          infer.personal_dist(r, below, gj, [below]) == (gj, None, ""))
+    low = pooled_node("E", "J1", 1.0, 99, 5)
+    high = pooled_node("E", "J1", 1.0, 99, 90)
+    lr_low = infer.node_lr("single", infer.personal_dist(r, low, gj, [])[0], ALPHA, MANIP)
+    lr_high = infer.node_lr("single", infer.personal_dist(r, high, gj, [])[0], ALPHA, MANIP)
+    check("a one-off with a co-author who rarely one-offs is more incriminating "
+          "than with one who often does", lr_low < lr_high)
+    check("an outside tie keeps LR = 1/(1-alpha) whatever the co-author's habit",
+          approx(infer.node_lr("outside", infer.personal_dist(r, low, gj, [])[0],
+                               ALPHA, MANIP), 1 / (1 - ALPHA)))
+
+
+def test_no_qualifying_node_is_the_tie_model():
+    print("\n-- with no co-author over the boundary, the plain tie model --")
+    data, _ = personal_corpus()
+    small = {k: {**n, "pool_n": min(n["pool_n"], N_MIN - 1)}
+             for k, n in data["coauthorships"].items()}
+    data = {**data, "coauthorships": small}
+    rows = infer.rank_corpus(data, ALPHA, manip=MANIP, inout_gate=False)
+    check("no node is adjusted", not any(d["adjusted"] for r in rows for d in r["detail"]))
+    plain = infer.rank_corpus(data, ALPHA, manip=MANIP, inout_gate=False,
+                              pool_min=math.inf)
+    check("every score equals the scoring with the adjustment switched off",
+          [(r["ident"], r["woe"]) for r in rows] == [(r["ident"], r["woe"]) for r in plain])
+    r = infer.reference(data)
+    by_hand = {}
+    for e, ids in data["editor_index"].items():
+        own = [small[i] for i in ids]
+        by_hand[e] = math.log(infer.PRIOR / (1 - infer.PRIOR)) + sum(
+            n["load"] * math.log(infer.node_lr(
+                n["state"], infer.genuine_dist(r, n["journal"], "established", own)[0],
+                ALPHA, MANIP)) for n in own)
+    check("...and the tie model by hand: log prior odds + SUM load * log LR(tie)",
+          all(approx(row["woe"] * math.log(10), by_hand[row["ident"]]) for row in rows))
+
+    full, _ = personal_corpus()
+    adjusted = {r["ident"]: r for r in infer.rank_corpus(full, ALPHA, manip=MANIP,
+                                                         inout_gate=False)}
+    off = {r["ident"]: r for r in infer.rank_corpus(full, ALPHA, manip=MANIP,
+                                                    inout_gate=False, pool_min=math.inf)}
+    check("with qualifying co-authors the score does move",
+          not approx(adjusted["E"]["woe"], off["E"]["woe"]))
+    d = {x["journal"]: x for x in adjusted["E"]["detail"]}
+    check("the detail records the habit ratio, the journal's and the adjusted g, and the "
+          "typical habit's level",
+          d["J1"]["adjusted"] and d["J1"]["oneoff_level"] == "journal"
+          and d["J2"]["oneoff_level"] == "pooled"
+          and approx(d["J2"]["single_p"],
+                     infer.odds_scaled(d["J2"]["journal_single_p"], d["J2"]["habit_ratio"]),
+                     1e-5))
 
 
 def test_load_accumulation():
@@ -266,6 +380,44 @@ def test_career_stage_is_not_a_parent():
           level == "journal:career_stage")
 
 
+def test_recent_period():
+    """J1's 520 of load hold 40 of recent co-authorships, 30 of them `single`."""
+    print("\n-- recent and earlier co-authorships --")
+    recent = {"E1||J1||a": {**node("single", 30.0, coauthor="a", first_year=2025),
+                            "editor_id": "E1"},
+              "E1||J1||b": {**node("outside", 10.0, coauthor="b", first_year=2026),
+                            "editor_id": "E1"},
+              "E2||J1||c": {**node("single", 5.0, coauthor="c", first_year=2010),
+                            "editor_id": "E2"}}
+    r = infer.reference(corpus(coauthorships=recent), recent_from=2025)
+    check("a co-authorship from recent_from on is recent, one before it or undated is not",
+          infer.period(recent["E1||J1||a"], 2025) == "recent"
+          and infer.period(recent["E2||J1||c"], 2025) == "earlier"
+          and infer.period(node("single", 1.0), 2025) == "earlier"
+          and infer.period(recent["E1||J1||a"], None) is None)
+
+    new, level_new = infer.genuine_dist(r, "J1", "established", [], when="recent")
+    old, level_old = infer.genuine_dist(r, "J1", "established", [], when="earlier")
+    check(f"a recent co-authorship is judged against the journal's recent ones "
+          f"(got {level_new}, single={new['single']:.3f})",
+          level_new == "journal:recent" and approx(new["single"], 30.5 / 41.5))
+    check(f"an earlier one against the rest of the journal "
+          f"(got {level_old}, single={old['single']:.3f})",
+          level_old == "journal:earlier" and approx(old["single"], 70.5 / 481.5))
+    _, level = infer.genuine_dist(r, "J1", "established", [recent["E1||J1||a"]],
+                                  when="recent")
+    check(f"with the editor's own recent load left out, too little is recent and the "
+          f"whole journal is used (got {level})", level == "journal")
+
+    one_new = [{**node("single", 1.0), "first_year": 2025}]
+    one_old = [{**node("single", 1.0), "first_year": 2010}]
+    check("a recent one-off counts less against the editor than an earlier one",
+          posterior(one_new, r=r) > posterior(one_old, r=r))
+    off = infer.reference(corpus(coauthorships=recent), recent_from=None)
+    check("without a split, the year does not matter",
+          approx(posterior(one_new, r=off), posterior(one_old, r=off), 1e-12))
+
+
 # --- ranking, gates and output ------------------------------------------------
 
 def test_ranking():
@@ -286,9 +438,9 @@ def test_ranking():
           all(r["publishers"] == "acm" for r in rows))
 
     by_name = {r["name"]: r for r in rows}
-    check("the in/out gate flag follows the reddest board seat",
+    check("the in/out gate flag follows the reddest year on a board",
           by_name["Ed Two"]["passes_inout_gate"] and not by_name["Ed One"]["passes_inout_gate"]
-          and by_name["Ed Two"]["inout_x"] == 4)
+          and by_name["Ed Two"]["inout_x"] == 4 and by_name["Ed Two"]["inout_year"] == 2011)
     check("an editor without gate points does not pass",
           not by_name["Ed Three"]["passes_inout_gate"])
 
@@ -338,18 +490,20 @@ def test_records():
 
 def test_inout_gate():
     print("\n-- the in/out boundary (figure 8.7) --")
-    check("a seat exactly on the diagonal passes",
-          infer.passes_inout_gate([{"journal": "J", "x": 3, "y": 3}]))
-    check("one red seat carries an editor whose other seat is blameless",
-          infer.passes_inout_gate([{"journal": "A", "x": 1, "y": 9},
-                                   {"journal": "B", "x": 4, "y": 2}]))
-    check("more outside than inside on every seat fails",
-          not infer.passes_inout_gate([{"journal": "A", "x": 2, "y": 3}]))
+    check("a year exactly on the diagonal passes",
+          infer.passes_inout_gate([{"year": 2010, "x": 3, "y": 3}]))
+    check("one red year carries an editor whose other years are blameless",
+          infer.passes_inout_gate([{"year": 2010, "x": 1, "y": 9},
+                                   {"year": 2011, "x": 4, "y": 2}]))
+    check("more outside than inside in every year fails",
+          not infer.passes_inout_gate([{"year": 2010, "x": 2, "y": 3}]))
+    check("a year with no co-author at all (only solo papers) does not pass",
+          not infer.passes_inout_gate([{"year": 2010, "x": 0, "y": 0}]))
     check("an editor who was never plotted is never a pass",
           not infer.passes_inout_gate(None) and not infer.passes_inout_gate([]))
     check("the reddest point is the largest x - y, not the largest ratio",
-          infer.reddest_point([{"journal": "A", "x": 2, "y": 1},
-                               {"journal": "B", "x": 30, "y": 25}])["journal"] == "B")
+          infer.reddest_point([{"year": 2010, "x": 2, "y": 1},
+                               {"year": 2011, "x": 30, "y": 25}])["year"] == 2011)
     check("no points means no reddest point", infer.reddest_point([]) is None)
 
 
@@ -364,11 +518,15 @@ def test_formatting():
 
 def main():
     test_likelihood_ratios()
-    test_fit_factor()
+    test_oneoff_habit()
+    test_typical_habit()
+    test_personal_column()
+    test_no_qualifying_node_is_the_tie_model()
     test_load_accumulation()
     test_baseline_fallback()
     test_publishers_kept_apart()
     test_career_stage_is_not_a_parent()
+    test_recent_period()
     test_ranking()
     test_records()
     test_inout_gate()

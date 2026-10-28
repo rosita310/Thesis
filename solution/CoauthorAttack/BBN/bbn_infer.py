@@ -3,6 +3,13 @@ Scores every editor in the corpus from bbn_extract.py on P(genuine | evidence)
 and writes, beside the corpus, bbn_cs2_ranking.csv (one row per ranked editor)
 and bbn_cs2_scored.json (the same editors with the per-node evidence).
 
+Every co-authorship adds load * log LR of its tie to the editor's log-odds. The
+genuine column of a tie is the journal's, without the editor's own nodes.
+g(single) is scaled by the co-author's one-off habit over the journal's
+typical habit, and the journal's column is that of its recent co-authorships for a
+recent one and of its earlier ones for the rest. The network is
+G -> tie <- the co-author's one-off habit and the period (both observed).
+
     python bbn_infer.py [--in bbn/bbn_cs2_corpus.json]
 """
 
@@ -17,8 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cs2_config import (ALPHA, BBN_DIR, CONDITION_ON_CAREER_STAGE, FALLBACK_MIN_N,
-                        FIT_STATES, INOUT_GATE, MANIP_DIST, MANIP_FIT, PRIOR,
-                        PSEUDO_COUNT, SHORTLIST_THRESHOLD)
+                        INOUT_GATE, MANIP_DIST, PRIOR, PSEUDO_COUNT,
+                        RECENT_FROM, SHORTLIST_THRESHOLD)
 
 DEFAULT_IN = BBN_DIR / "bbn_cs2_corpus.json"
 
@@ -47,20 +54,40 @@ def load_corpus(in_path):
 class Reference:
     """The genuine reference distributions of one corpus, as the scoring needs them.
 
-    journals      journal -> {"publisher", "baseline_counts": {career_stage: {state: load}}}
-    pooled        publisher -> career_stage -> {state: load}, summed over its journals
-    states        the corpus states, in the corpus's order
-    fit_base      publisher -> state -> network band -> {fit: load}; None without fit
-    publisher_of  journal -> publisher
+    journals        journal -> {"publisher", "baseline_counts": {career_stage: {state: load}}}
+    pooled          publisher -> career_stage -> {state: load}, summed over its journals
+    states          the corpus states, in the corpus's order
+    publisher_of    journal -> publisher
+    pool_min        collaborators a co-author needs for the personal adjustment;
+                    math.inf switches the adjustment off
+    oneoff_journal  journal -> (sum of load * habit, sum of load) over the scored
+                    co-authorships that reach pool_min
+    oneoff_pooled   publisher -> the same, summed over its journals
+    recent_from     the first year of a recent co-authorship; None: no split
+    recent_journal  journal -> {state: load} of its recent co-authorships
+    recent_pooled   publisher -> the same, summed over its journals
     """
     journals: dict
     pooled: dict
     states: list
-    fit_base: dict | None
     publisher_of: dict
+    pool_min: float
+    oneoff_journal: dict
+    oneoff_pooled: dict
+    recent_from: int | None = None
+    recent_journal: dict | None = None
+    recent_pooled: dict | None = None
 
 
-def reference(data) -> Reference:
+def period(node, recent_from):
+    """"recent" if the co-authorship's first shared publication is from `recent_from`
+    on, else "earlier"; None when `recent_from` is None."""
+    if recent_from is None:
+        return None
+    return "recent" if (node.get("first_year") or 0) >= recent_from else "earlier"
+
+
+def reference(data, pool_min=FALLBACK_MIN_N, recent_from=RECENT_FROM) -> Reference:
     states = data["config"]["states"]
     journals = data["journals"]
     publisher_of = {j: info.get("publisher", "") for j, info in journals.items()}
@@ -69,7 +96,16 @@ def reference(data) -> Reference:
         for stage, counts in info["baseline_counts"].items():
             for s in states:
                 pooled[publisher_of[journal]][stage][s] += counts.get(s, 0.0)
-    return Reference(journals, pooled, states, data.get("fit_baseline"), publisher_of)
+    nodes = data.get("coauthorships", {}).values()
+    by_journal, by_publisher = oneoff_sums(nodes, publisher_of, pool_min)
+    recent_journal = defaultdict(lambda: defaultdict(float))
+    recent_pooled = defaultdict(lambda: defaultdict(float))
+    for node in nodes:
+        if period(node, recent_from) == "recent":
+            recent_journal[node["journal"]][node["state"]] += node["load"]
+            recent_pooled[publisher_of.get(node["journal"], "")][node["state"]] += node["load"]
+    return Reference(journals, pooled, states, publisher_of, pool_min,
+                     by_journal, by_publisher, recent_from, recent_journal, recent_pooled)
 
 
 # ---------------------------------------------------------------------------
@@ -91,27 +127,30 @@ def merge(count_dicts, keys):
     return total
 
 
-def subtract_own(counts, own, keys, field, match):
-    """counts minus the load of the editor's own matching nodes, binned by `field`.
-
-    `field` is "state" for the state baseline and "fit" for the fit baseline; a
-    node with no value there (no fit measured) contributes nothing either way.
-    """
-    out = {k: counts.get(k, 0.0) for k in keys}
+def subtract_own(counts, own, states, match):
+    """{state: load} minus the load of the editor's own matching nodes."""
+    out = {s: counts.get(s, 0.0) for s in states}
     for node in own:
-        value = node.get(field)
-        if value and match(node):
-            out[value] = out.get(value, 0.0) - node["load"]
+        if match(node):
+            out[node["state"]] = out.get(node["state"], 0.0) - node["load"]
     return out
 
 
+def in_period(counts, recent, when, states):
+    """The part of `counts` in period `when`: the recent counts, or the rest."""
+    if when == "recent":
+        return {s: recent.get(s, 0.0) for s in states}
+    return {s: counts.get(s, 0.0) - recent.get(s, 0.0) for s in states}
+
+
 def genuine_dist(ref: Reference, journal, stage, own,
-                 condition_on_career_stage=CONDITION_ON_CAREER_STAGE):
+                 condition_on_career_stage=CONDITION_ON_CAREER_STAGE, when=None):
     """g(s | journal) = P(state | genuine, journal), without the `own` nodes.
 
     Returns (smoothed_dist, fallback_level). A level is used when its load after
     removing `own` reaches FALLBACK_MIN_N; the pooled level, over the journals of
-    the same publisher, is used regardless.
+    the same publisher, is used regardless. With a period `when` ("recent" or
+    "earlier"), the journal and the pool are first tried on that period alone.
     """
     states = ref.states
     by_stage = ref.journals.get(journal, {}).get("baseline_counts", {})
@@ -122,7 +161,7 @@ def genuine_dist(ref: Reference, journal, stage, own,
         return ref.publisher_of.get(n["journal"], "") == publisher
 
     def level(counts, match, label):
-        counts = subtract_own(counts, own, states, "state", match)
+        counts = subtract_own(counts, own, states, match)
         return (smooth(counts, states), label) if sum(counts.values()) >= FALLBACK_MIN_N \
             else None
 
@@ -132,8 +171,15 @@ def genuine_dist(ref: Reference, journal, stage, own,
         if hit:
             return hit
 
-    hit = level(merge(by_stage.values(), states),
-                lambda n: n["journal"] == journal, "journal")
+    in_journal = merge(by_stage.values(), states)
+    if when:
+        hit = level(in_period(in_journal, ref.recent_journal.get(journal, {}), when, states),
+                    lambda n: n["journal"] == journal
+                    and period(n, ref.recent_from) == when, f"journal:{when}")
+        if hit:
+            return hit
+
+    hit = level(in_journal, lambda n: n["journal"] == journal, "journal")
     if hit:
         return hit
 
@@ -144,41 +190,111 @@ def genuine_dist(ref: Reference, journal, stage, own,
         if hit:
             return hit
 
-    everything = subtract_own(merge(pooled.values(), states), own, states,
-                              "state", same_publisher)
+    in_pool = merge(pooled.values(), states)
+    if when:
+        hit = level(in_period(in_pool, ref.recent_pooled.get(publisher, {}), when, states),
+                    lambda n: same_publisher(n) and period(n, ref.recent_from) == when,
+                    f"pooled:{when}")
+        if hit:
+            return hit
+
+    everything = subtract_own(in_pool, own, states, same_publisher)
     return smooth(everything, states), "pooled"
 
 
-def fit_dist(ref: Reference, journal, state, band, own):
-    """g(f | s, beta) = P(fit | genuine, state, network band), without the `own`
-    nodes, within the journal's publisher.
+# ---------------------------------------------------------------------------
+# The personal one-off baseline: g(single) scaled by the co-author's own habit
+# ---------------------------------------------------------------------------
 
-    Falls back from state and band, to state, to uniform, as genuine_dist does.
+def oneoff_habit(node):
+    """The co-author's one-off habit (k + lambda) / (n + 2 lambda): how often they
+    publish only once with a collaborator, from pool_oneoffs (k) of pool_n (n)."""
+    return ((node["pool_oneoffs"] + PSEUDO_COUNT)
+            / (node["pool_n"] + 2 * PSEUDO_COUNT))
+
+
+def qualifies(node, pool_min) -> bool:
+    """True if the co-author has the pool_min collaborators the adjustment needs."""
+    return node.get("pool_n") is not None and node["pool_n"] >= pool_min
+
+
+def oneoff_sums(nodes, publisher_of, pool_min) -> tuple[dict, dict]:
+    """(sum of load * habit, sum of load) over the qualifying nodes, per journal
+    and per publisher."""
+    by_journal = defaultdict(lambda: [0.0, 0.0])
+    by_publisher = defaultdict(lambda: [0.0, 0.0])
+    for node in nodes:
+        if not qualifies(node, pool_min):
+            continue
+        weighted = node["load"] * oneoff_habit(node)
+        for sums in (by_journal[node["journal"]],
+                     by_publisher[publisher_of.get(node["journal"], "")]):
+            sums[0] += weighted
+            sums[1] += node["load"]
+    return dict(by_journal), dict(by_publisher)
+
+
+def without_own(sums, own, match, pool_min) -> tuple[float, float]:
+    """(weighted, load) minus the editor's own qualifying nodes that `match`."""
+    weighted, load = sums
+    for node in own:
+        if match(node) and qualifies(node, pool_min):
+            weighted -= node["load"] * oneoff_habit(node)
+            load -= node["load"]
+    return weighted, load
+
+
+def typical_habit(ref: Reference, journal, own):
+    """The journal's typical one-off habit, and where it came from.
+
+    This is the load-weighted mean one-off habit over the journal's co-authors with
+    enough collaborators, leaving out the scored editor's own co-authorships
+    (`own`). If less than FALLBACK_MIN_N of load is left, all journals of the same
+    publisher are pooled instead.
+
+    Returns (typical_habit, "journal"), (typical_habit, "pooled"), or (None, "")
+    when even the pool has no load left.
     """
     publisher = ref.publisher_of.get(journal, "")
-    bands = (ref.fit_base or {}).get(publisher, {}).get(state, {})
-    key = str(band)
+    weighted, load = without_own(ref.oneoff_journal.get(journal, (0.0, 0.0)), own,
+                                 lambda n: n["journal"] == journal, ref.pool_min)
+    if load >= FALLBACK_MIN_N:
+        return weighted / load, "journal"
+    weighted, load = without_own(
+        ref.oneoff_pooled.get(publisher, (0.0, 0.0)), own,
+        lambda n: ref.publisher_of.get(n["journal"], "") == publisher, ref.pool_min)
+    if load > 1e-9:
+        return weighted / load, "pooled"
+    return None, ""
 
-    def same_publisher(n):
-        return ref.publisher_of.get(n["journal"], "") == publisher
 
-    def level(counts, match, label):
-        counts = subtract_own(counts, own, FIT_STATES, "fit", match)
-        return (smooth(counts, FIT_STATES), label) \
-            if sum(counts.values()) >= FALLBACK_MIN_N else None
+def odds_scaled(p, factor):
+    """The probability whose odds are `factor` times the odds of `p`."""
+    odds = p / (1 - p) * factor
+    return odds / (1 + odds)
 
-    hit = level(bands.get(key, {}),
-                lambda n: same_publisher(n) and n["state"] == state
-                and str(n.get("network_band")) == key, "state:band")
-    if hit:
-        return hit
 
-    hit = level(merge(bands.values(), FIT_STATES),
-                lambda n: same_publisher(n) and n["state"] == state, "state")
-    if hit:
-        return hit
+def personal_column(gdist, habit_ratio) -> dict:
+    """g_i: the journal's column with the odds of `single` multiplied by the habit
+    ratio and every other state rescaled by one common factor, so that it sums to 1."""
+    single = odds_scaled(gdist["single"], habit_ratio)
+    rest = (1 - single) / (1 - gdist["single"])
+    return {s: single if s == "single" else p * rest for s, p in gdist.items()}
 
-    return {f: 1.0 / len(FIT_STATES) for f in FIT_STATES}, "uniform"
+
+def personal_dist(ref: Reference, node, gdist, own):
+    """The genuine column of one co-authorship: (g_i, the habit ratio, the level of
+    the typical habit).
+
+    A co-author below ref.pool_min keeps the journal's column, with no habit ratio.
+    """
+    if not qualifies(node, ref.pool_min):
+        return gdist, None, ""
+    typical, level = typical_habit(ref, node["journal"], own)
+    if typical is None:
+        return gdist, None, ""
+    habit_ratio = oneoff_habit(node) / typical
+    return personal_column(gdist, habit_ratio), habit_ratio, level
 
 
 # ---------------------------------------------------------------------------
@@ -193,53 +309,63 @@ def log_odds_to_p(log_odds):
     return e / (1.0 + e)
 
 
-def node_lr(state, gdist, alpha, manip=MANIP_DIST, fit="", fdist=None,
-            manip_fit=MANIP_FIT):
-    """LR for one co-authorship, over the pair (state, fit); on the state alone without a fit."""
+def node_lr(state, gdist, alpha, manip=MANIP_DIST):
+    """LR = g(t) / (alpha m(t) + (1 - alpha) g(t)) for one co-authorship of tie t."""
     g = gdist[state]
-    m = manip[state]
-    if fit and fdist:
-        g *= fdist[fit]
-        m *= manip_fit[state][fit]
-    return g / (alpha * m + (1 - alpha) * g)
+    return g / (alpha * manip[state] + (1 - alpha) * g)
 
 
 def score_editor(nodes, ref: Reference, alpha=ALPHA, prior=PRIOR,
                  manip=MANIP_DIST, condition_on_career_stage=CONDITION_ON_CAREER_STAGE,
-                 manip_fit=MANIP_FIT):
+                 own=None):
     """log_odds = log prior_odds + SUM load * log LR over one editor's nodes.
 
+    `own` are the editor's nodes that the reference counts, and so the ones the
+    baselines (the journal column and the typical habit) leave out; by default all of `nodes`.
     Returns (P(genuine), log_odds, detail), with one detail record per node.
     """
+    own = nodes if own is None else own
     log_odds = math.log(prior / (1 - prior))
     detail = []
     for node in nodes:
-        gdist, level = genuine_dist(ref, node["journal"], node["career_stage"], nodes,
-                                    condition_on_career_stage=condition_on_career_stage)
-        fit = node.get("fit", "") if ref.fit_base else ""
-        fdist, flevel = (fit_dist(ref, node["journal"], node["state"],
-                                  node.get("network_band"), nodes)
-                         if fit else (None, ""))
-        lr = node_lr(node["state"], gdist, alpha, manip, fit, fdist, manip_fit)
+        gdist, level = genuine_dist(ref, node["journal"], node["career_stage"], own,
+                                    condition_on_career_stage=condition_on_career_stage,
+                                    when=period(node, ref.recent_from))
+        pdist, habit_ratio, oneoff_level = personal_dist(ref, node, gdist, own)
+        lr = node_lr(node["state"], pdist, alpha, manip)
         contribution = node["load"] * math.log(lr)
         log_odds += contribution
-        detail.append({
-            "coauthor": node.get("coauthor_name", node.get("coauthor_id")),
-            "journal": node["journal"], "state": node["state"],
-            "career_stage": node["career_stage"],
-            "coauthor_pubs": node.get("coauthor_pubs"),
-            "load": round(node["load"], 4),
-            "n_shared_suspect": node.get("n_shared_suspect"),
-            "n_shared_inside": node.get("n_shared_inside"),
-            "n_shared_outside": node.get("n_shared_outside"),
-            "fit": fit, "fit_pct": node.get("fit_pct"),
-            "network_band": node.get("network_band"),
-            "fit_fallback_level": flevel,
-            "fit_genuine_p": round(fdist[fit], 6) if fit and fdist else "",
-            "fallback_level": level, "genuine_p": round(gdist[node["state"]], 6),
-            "lr": round(lr, 6), "weighted_log_lr": round(contribution, 6),
-        })
+        detail.append(node_detail(node, gdist, level, pdist, habit_ratio, oneoff_level,
+                                  lr, contribution))
     return log_odds_to_p(log_odds), log_odds, detail
+
+
+def node_detail(node, gdist, level, pdist, habit_ratio, oneoff_level, lr,
+                contribution) -> dict:
+    """The record of one scored co-authorship: its tie, the journal's and its own
+    genuine column, and what it adds to the editor's log-odds."""
+    state = node["state"]
+    return {
+        "coauthor": node.get("coauthor_name", node.get("coauthor_id")),
+        "journal": node["journal"], "state": state,
+        "career_stage": node["career_stage"],
+        "first_year": node.get("first_year"),
+        "coauthor_pubs": node.get("coauthor_pubs"),
+        "load": round(node["load"], 4),
+        "n_shared_suspect": node.get("n_shared_suspect"),
+        "n_shared_inside": node.get("n_shared_inside"),
+        "n_shared_outside": node.get("n_shared_outside"),
+        "fallback_level": level,
+        "journal_genuine_p": round(gdist[state], 6),
+        "journal_single_p": round(gdist["single"], 6),
+        "pool_n": node.get("pool_n"), "pool_oneoffs": node.get("pool_oneoffs"),
+        "adjusted": habit_ratio is not None,
+        "habit_ratio": round(habit_ratio, 6) if habit_ratio is not None else None,
+        "oneoff_level": oneoff_level,
+        "single_p": round(pdist["single"], 6),
+        "genuine_p": round(pdist[state], 6),
+        "lr": round(lr, 6), "weighted_log_lr": round(contribution, 6),
+    }
 
 
 def state_shares(nodes):
@@ -256,12 +382,13 @@ def state_shares(nodes):
 # ---------------------------------------------------------------------------
 
 def passes_inout_gate(points) -> bool:
-    """At least one board seat with x >= y (in-journal vs. outside co-authors)."""
-    return bool(points) and any(p["x"] >= p["y"] for p in points)
+    """At least one year on a board with x >= y (co-authors in the journals the editor
+    edits that year vs. elsewhere), and x at least 1."""
+    return bool(points) and any(p["x"] >= max(p["y"], 1) for p in points)
 
 
 def reddest_point(points):
-    """The board seat with the largest x - y."""
+    """The year on a board with the largest x - y."""
     return max(points, key=lambda p: p["x"] - p["y"]) if points else None
 
 
@@ -271,12 +398,15 @@ def reddest_point(points):
 
 def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
                 condition_on_career_stage=CONDITION_ON_CAREER_STAGE,
-                inout_gate=INOUT_GATE) -> list[dict]:
+                inout_gate=INOUT_GATE, pool_min=FALLBACK_MIN_N,
+                recent_from=RECENT_FROM) -> list[dict]:
     """One row per ranked editor, lowest weight of evidence (`woe`) first.
 
-    Every editor is scored; `inout_gate` only decides who is ranked.
+    Every editor is scored; `inout_gate` only decides who is ranked. `pool_min` is
+    the boundary of the personal adjustment (math.inf: none), `recent_from` the first
+    year of a recent co-authorship (None: no split).
     """
-    ref = reference(data)
+    ref = reference(data, pool_min, recent_from)
     all_nodes = data["coauthorships"]
     editors = data.get("editors", {})
     labels = data.get("editor_labels", {})
@@ -307,7 +437,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
             "n_suspect_papers": info.get("n_suspect_papers", 0),
             "n_pubs_outside_journal": info.get("n_pubs_outside_journal", 0),
             "inout_points": info.get("inout_points"),
-            "inout_journal": (reddest or {}).get("journal", ""),
+            "inout_year": (reddest or {}).get("year", ""),
             "inout_x": (reddest or {}).get("x", ""),
             "inout_y": (reddest or {}).get("y", ""),
             "passes_inout_gate": passes_inout_gate(info.get("inout_points")),
@@ -339,7 +469,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
 RANKING_COLUMNS = ["name", "pid", "publishers", "p_genuine", "woe", "n_suspect_papers",
                    "n_nodes", "load", "share_single", "share_outside",
                    "share_outside_1", "n_pubs_outside_journal",
-                   "inout_journal", "inout_x", "inout_y",
+                   "inout_year", "inout_x", "inout_y",
                    "passes_inout_gate", "n_control_nodes",
                    "control_share_single", "journals"]
 
@@ -400,9 +530,11 @@ def print_shortlist(shortlist, records) -> None:
     print(f"\n=== EVIDENCE BREAKDOWN (lowest-scoring editor: {top['name']!r}) ===")
     print("  (LR<1 lowers genuineness; the contribution is load * log LR)")
     for d in top["coauthorships"][:BREAKDOWN_PRINT_CAP]:
+        habit_ratio = f"{d['habit_ratio']:.2f}" if d["adjusted"] else "-"
         print(f"     {d['state']:<9} load={d['load']:>5.2f} "
               f"{d['coauthor'][:26]:<26} pubs={str(d['coauthor_pubs']):>5} "
-              f"[{d['fallback_level']:<14}] genuine_p={d['genuine_p']:.4f} "
+              f"[{d['fallback_level']:<14}] journal g={d['journal_genuine_p']:.4f} "
+              f"habit ratio={habit_ratio:>5} g={d['genuine_p']:.4f} "
               f"LR={d['lr']:>6.3f} w.logLR={d['weighted_log_lr']:>+7.3f}")
     if len(top["coauthorships"]) > BREAKDOWN_PRINT_CAP:
         print(f"     ... (+{len(top['coauthorships']) - BREAKDOWN_PRINT_CAP} "
@@ -429,8 +561,14 @@ def main():
 
     print(f"Model: {data['model']} | alpha={ALPHA} | prior P(genuine)={PRIOR} | "
           f"MANIP_DIST={MANIP_DIST}")
+    print(f"Personal one-off baseline: co-authors with >= {FALLBACK_MIN_N:g} collaborators, "
+          "odds of g(single) times the habit ratio")
     print(f"Corpus: repeated_min={data['config']['repeated_min']}, "
-          f"junior_max_pubs={data['config']['junior_max_pubs']}")
+          f"junior_max_pubs={data['config']['junior_max_pubs']}, "
+          f"coauthor_min_pubs={data['config'].get('coauthor_min_pubs')}")
+    print(f"Recent co-authorships (first shared publication from {RECENT_FROM} on) "
+          "judged against recent ones" if RECENT_FROM is not None
+          else "No split into recent and earlier co-authorships")
     print(f"Ranked {len(rows)} editors"
           + (" (gate: in >= out)" if INOUT_GATE else "")
           + f"; {len(shortlist)} below threshold {SHORTLIST_THRESHOLD}.")
@@ -445,8 +583,11 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"alpha": ALPHA, "prior": PRIOR,
                    "manip_dist": MANIP_DIST, "inout_gate": INOUT_GATE,
+                   "pool_min": FALLBACK_MIN_N,
                    "shortlist_threshold": SHORTLIST_THRESHOLD,
                    "repeated_min": data["config"]["repeated_min"],
+                   "coauthor_min_pubs": data["config"].get("coauthor_min_pubs"),
+                   "recent_from": RECENT_FROM,
                    "n_ranked": len(records),
                    "n_shortlisted": sum(1 for e in records if e["shortlisted"]),
                    "editors": records},

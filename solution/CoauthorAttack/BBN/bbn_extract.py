@@ -4,15 +4,17 @@ of every publisher in PUBLISHERS, our journals' slice of the DBLP dump
 (dblp_extract.py) and further passes over the dump.
 
     python bbn_extract.py --stage pairs
-        Suspect papers, their co-authorships, board tenure, the pre-tenure
+        Suspect papers, their co-authorships, board terms, the pre-board
         control and the people whose full record is needed. The only stage that
         reads the database.
     python bbn_extract.py --stage coauthors
         Dump pass: every publication of those people.
     python bbn_extract.py --stage editor_authors
-        Dump pass: authors and year of every publication of the editors.
+        Dump pass: authors of every publication of the editors, and the year of
+        every publication the coauthors pass found.
     python bbn_extract.py --stage signer_authors
-        Dump pass: authors of every publication of the suspect papers' signers.
+        Dump pass: authors of every publication of the suspect papers' signers:
+        the co-authors' own networks.
     python bbn_extract.py --stage corpus
         Writes bbn/bbn_cs2_corpus.json.
     python bbn_extract.py --stage all
@@ -33,9 +35,9 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from cs2_config import (BBN_DIR, DUMP_PATH, ENV_PATH, FIT_MIN_COLLABS, FIT_STATES,
-                        JUNIOR_MAX_PUBS, MAX_AUTHORS, NETWORK_BANDS, OUTSIDE_BANDS,
-                        OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR, STATES)
+from cs2_config import (BBN_DIR, COAUTHOR_MIN_PUBS, DUMP_PATH, ENV_PATH, JUNIOR_MAX_PUBS,
+                        MAX_AUTHORS, OUTSIDE_BANDS, OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR,
+                        STATES)
 from dblp_extract import (
     PROGRESS_EVERY, P_SIG_CREATOR, P_SIG_NAME, P_SIG_ORDINAL,
     P_SIG_PUBLICATION, P_YEAR, SIG_PREDS, TABLE_BOARD, TABLE_ISSUES, as_bool, connect,
@@ -167,16 +169,6 @@ def classify(n_outside: int, n_inside: int, repeated_min: int = REPEATED_MIN) ->
     return "repeated" if n_inside >= repeated_min else "single"
 
 
-def midrank_pct(values, x) -> float:
-    """Midrank percentile of x within values, ties averaged. 0 = lowest."""
-    n = len(values)
-    if n < 2:
-        return 0.5
-    below = sum(1 for v in values if v < x)
-    equal = sum(1 for v in values if v == x)
-    return (below + (equal - 1) / 2) / (n - 1)
-
-
 def issue_year(articles: list[dict]) -> str:
     """The year of a matched DBLP issue: the earliest year its articles carry."""
     years = sorted(a["year"] for a in articles if a.get("year"))
@@ -201,26 +193,35 @@ def publications_of(path) -> dict[str, set[str]]:
 
 
 # ---------------------------------------------------------------------------
-# The fit: where the editor sits in the co-author's own network
+# The co-author's one-off habit, from their own collaboration network
 # ---------------------------------------------------------------------------
 
-def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, dict]:
+def read_authors(path) -> dict[str, list[str]]:
+    """publication -> its author ids, from an author-list CSV (rec_key, person_id)."""
+    authors_of = defaultdict(list)
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            authors_of[row["rec_key"]].append(row["person_id"])
+    return authors_of
+
+
+def counted_authors(ids) -> set:
+    """The distinct authors of a publication the networks count: empty when it has
+    fewer than two, or more than MAX_AUTHORS."""
+    ids = set(ids)
+    return ids if 2 <= len(ids) <= MAX_AUTHORS else set()
+
+
+def networks_from(authors_of: dict, wanted: set, with_venues=False) -> tuple[dict, dict]:
     """person -> collaborator -> publications shared, and -> the venues they were in.
 
     Only the `wanted` people get a network. Without `with_venues` the second dict
     is empty.
     """
-    authors_of = defaultdict(list)
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
-            authors_of[row["rec_key"]].append(row["person_id"])
-
     depth = defaultdict(lambda: defaultdict(int))
     spread = defaultdict(lambda: defaultdict(set))
     for rec_key, ids in authors_of.items():
-        ids = set(ids)
-        if len(ids) < 2 or len(ids) > MAX_AUTHORS:
-            continue
+        ids = counted_authors(ids)
         focal = ids & wanted
         if not focal:
             continue
@@ -238,100 +239,56 @@ def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, 
     return depth, spread
 
 
-def annotate_fit(nodes: dict, depth: dict) -> None:
-    """Add `fit_pct` and `network_band` to every node, None without enough collaborators."""
-    for node in nodes.values():
-        cols = depth.get(node["coauthor_id"])
-        if not cols or len(cols) < FIT_MIN_COLLABS:
-            node["fit_pct"] = None
-            node["network_band"] = None
-            continue
-        values = list(cols.values())
-        if node["editor_id"] in cols:
-            x = cols[node["editor_id"]]
-        else:
-            # The dump pass missed the signature; the pair shares at least one paper.
-            x = 1
-            values = values + [1]
-        node["fit_pct"] = round(midrank_pct(values, x), 6)
-        node["network_band"] = band_of(len(cols), NETWORK_BANDS)
+def collaboration_networks(path, wanted: set, with_venues=False) -> tuple[dict, dict]:
+    """networks_from over the author lists in `path`."""
+    return networks_from(read_authors(path), wanted, with_venues)
 
 
-def fit_cuts(nodes: dict) -> dict:
-    """Load-weighted terciles of `fit_pct` within each state: {state: [lo, hi] or None}."""
-    by_state = defaultdict(list)
-    for node in nodes.values():
-        if node.get("fit_pct") is not None:
-            by_state[node["state"]].append((node["fit_pct"], node["load"]))
-    cuts = {}
-    for state, pairs in by_state.items():
-        pairs.sort()
-        total = sum(w for _, w in pairs)
-        edges, run, i = [], 0.0, 0
-        for q in (1 / 3, 2 / 3):
-            target = q * total
-            while i < len(pairs) - 1 and run + pairs[i][1] < target:
-                run += pairs[i][1]
-                i += 1
-            edges.append(pairs[i][0])
-        cuts[state] = None if edges[0] >= edges[1] else [round(e, 6) for e in edges]
-    return cuts
+def node_key(editor_id: str, journal: str, coauthor_id: str) -> str:
+    """The id of the node of one (editor, journal, co-author)."""
+    return f"{editor_id}||{journal}||{coauthor_id}"
 
 
-def fit_label(pct, state, cuts) -> str:
-    """Discretize a percentile against its own state's cuts."""
-    if pct is None:
-        return ""
-    edge = cuts.get(state)
-    if not edge:
-        return "typical"
-    return ("peripheral" if pct < edge[0]
-            else "core" if pct >= edge[1] else "typical")
+def node_papers(rows) -> dict[str, set]:
+    """node id -> the papers of that node: its evidence."""
+    papers = defaultdict(set)
+    for row in rows:
+        papers[node_key(row["editor_id"], row["journal"], row["coauthor_id"])].add(
+            row["rec_key"])
+    return papers
 
 
-def fit_baseline(nodes: dict) -> dict:
-    """Load-weighted counts[state][network_band][fit], the genuine reference."""
-    counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-    for node in nodes.values():
-        if not node.get("fit"):
-            continue
-        counts[node["state"]][str(node["network_band"])][node["fit"]] += node["load"]
-    return {state: {band: {f: round(vals.get(f, 0.0), 6) for f in FIT_STATES}
-                    for band, vals in bands.items()}
-            for state, bands in counts.items()}
+def pool_stats(coauthor_id, editor_id, collaborators: dict, own_papers,
+               authors_of: dict) -> tuple[int, int]:
+    """(n, k) of the co-author's own network: n collaborators, k of them with whom
+    the co-author shares exactly one publication.
 
-
-def relabel_fit(nodes: dict, cuts=None) -> dict:
-    """Give every node its fit label, and return the fit baseline over them.
-
-    The cuts default to the nodes' own terciles.
+    The editor is left out, and so is what the node's own papers (`own_papers`, its
+    evidence) add to the network, so the habit is measured on the rest of the
+    co-author's record. `collaborators` is the co-author's network from networks_from.
     """
-    cuts = fit_cuts(nodes) if cuts is None else cuts
-    for node in nodes.values():
-        node["fit"] = fit_label(node.get("fit_pct"), node["state"], cuts)
-    return fit_baseline(nodes)
+    taken_out = Counter()
+    for rec in own_papers:
+        ids = counted_authors(authors_of.get(rec, ()))
+        if coauthor_id in ids:
+            taken_out.update(ids - {coauthor_id})
+    n = k = 0
+    for other, shared in collaborators.items():
+        left = shared - taken_out[other]
+        if other == editor_id or left <= 0:
+            continue
+        n += 1
+        k += left == 1
+    return n, k
 
 
-def by_publisher(nodes: dict) -> dict:
-    """publisher -> {node id: node}."""
-    groups = defaultdict(dict)
+def annotate_pools(nodes: dict, papers: dict, depth: dict, authors_of: dict) -> None:
+    """Add `pool_n` and `pool_oneoffs` (pool_stats) to every node; `papers` maps a
+    node id to its own papers (node_papers)."""
     for node_id, node in nodes.items():
-        groups[node.get("publisher", "")][node_id] = node
-    return groups
-
-
-def publisher_fit_cuts(nodes: dict) -> dict:
-    """fit_cuts within each publisher: {publisher: cuts}."""
-    return {p: fit_cuts(group) for p, group in by_publisher(nodes).items()}
-
-
-def relabel_fit_per_publisher(nodes: dict, cuts=None) -> dict:
-    """relabel_fit within each publisher, returning {publisher: fit baseline}.
-
-    `cuts` is {publisher: cuts}; by default each publisher's own nodes' terciles.
-    """
-    return {p: relabel_fit(group, None if cuts is None else cuts.get(p, {}))
-            for p, group in by_publisher(nodes).items()}
+        node["pool_n"], node["pool_oneoffs"] = pool_stats(
+            node["coauthor_id"], node["editor_id"], depth.get(node["coauthor_id"], {}),
+            papers.get(node_id, ()), authors_of)
 
 
 # ---------------------------------------------------------------------------
@@ -442,9 +399,9 @@ class PairsCollector:
                                  for j, names in board_of_journal.items()}
         self.papers: list[dict] = []          # one row per (suspect paper x editor)
         self.rows: list[dict] = []            # suspect co-authorship rows
-        self.tenure_years = defaultdict(list)      # (journal, editor id) -> issue years
-        self.tenure_names = defaultdict(Counter)   # (journal, editor id) -> DBLP names
-        self.tenure_keys = defaultdict(Counter)    # (journal, editor id) -> board name keys
+        self.term_years = defaultdict(list)        # (journal, editor id) -> issue years
+        self.term_names = defaultdict(Counter)     # (journal, editor id) -> DBLP names
+        self.term_keys = defaultdict(Counter)      # (journal, editor id) -> board name keys
         self.board_years = defaultdict(list)       # (journal, board name key) -> roster years
         self.identities_of_name = defaultdict(set)
         self.n_no_pid = 0
@@ -471,9 +428,9 @@ class PairsCollector:
         if not editor_sig["pid"]:
             self.n_no_pid += 1
         self.identities_of_name[ed_name].add(ed_id)
-        self.tenure_years[(journal, ed_id)].append(year)
-        self.tenure_names[(journal, ed_id)][ed_name] += 1
-        self.tenure_keys[(journal, ed_id)][board_key or name_key(ed_name)] += 1
+        self.term_years[(journal, ed_id)].append(year)
+        self.term_names[(journal, ed_id)][ed_name] += 1
+        self.term_keys[(journal, ed_id)][board_key or name_key(ed_name)] += 1
 
         front_matter = int(is_front_matter(article.get("title")))
         rows = coauthorship_rows(article, sigs, ed_id, ed_name, journal, "suspect",
@@ -490,16 +447,16 @@ class PairsCollector:
         })
 
 
-def board_tenure(tenure_years, tenure_names, tenure_keys, board_years) -> list[dict]:
-    """A tenure row per (journal, editor), with their window on that board.
+def board_terms(term_years, term_names, term_keys, board_years) -> list[dict]:
+    """A board term row per (journal, editor), with their window on that board.
 
     The window comes from the roster, or from the years the editor published
     when the name is on no dated issue.
     """
     rows = []
-    for (journal, ed_id), years in tenure_years.items():
-        name = tenure_names[(journal, ed_id)].most_common(1)[0][0]
-        key = tenure_keys[(journal, ed_id)].most_common(1)[0][0]
+    for (journal, ed_id), years in term_years.items():
+        name = term_names[(journal, ed_id)].most_common(1)[0][0]
+        key = term_keys[(journal, ed_id)].most_common(1)[0][0]
         published = sorted(y for y in years if y)
         roster = sorted(board_years.get((journal, key), []))
         known = roster or published
@@ -515,11 +472,11 @@ def board_tenure(tenure_years, tenure_names, tenure_keys, board_years) -> list[d
     return rows
 
 
-def control_coauthorships(tenure, articles_of_person, authors_of, mapping,
+def control_coauthorships(terms, articles_of_person, authors_of, mapping,
                           board_of_journal) -> tuple[list[dict], int]:
     """The within-editor control: same journal, before the editor joined its board."""
     rows, n_papers = [], 0
-    for t in tenure:
+    for t in terms:
         first = t["first_board_year"]
         if not first:
             continue
@@ -539,13 +496,13 @@ def control_coauthorships(tenure, articles_of_person, authors_of, mapping,
     return rows, n_papers
 
 
-def print_pairs_summary(pairs: PairsCollector, control_rows, tenure, wanted,
+def print_pairs_summary(pairs: PairsCollector, control_rows, terms, wanted,
                         n_control_papers, issue_stats) -> None:
     n_solo = sum(1 for p in pairs.papers if p["n_coauthors"] == 0)
     editors = {p["editor_id"] for p in pairs.papers}
     ambiguous = [n for n, ids in pairs.identities_of_name.items() if len(ids) > 1]
-    from_roster = sum(1 for t in tenure if t["roster_window"])
-    later = sum(1 for t in tenure if t["first_paper_year"] and t["first_board_year"]
+    from_roster = sum(1 for t in terms if t["roster_window"])
+    later = sum(1 for t in terms if t["first_paper_year"] and t["first_board_year"]
                 and t["first_paper_year"] > t["first_board_year"])
 
     for publisher in sorted({p for p, _ in issue_stats}):
@@ -561,11 +518,11 @@ def print_pairs_summary(pairs: PairsCollector, control_rows, tenure, wanted,
           f"(the homonyms DBLP does split)")
     print(f"  ...signatures with no DBLP PID      {pairs.n_no_pid:>7}  "
           f"(identity falls back to the name)")
-    print(f"  control papers (pre-tenure, same j) {n_control_papers:>7}")
+    print(f"  control papers (pre-board, same j)  {n_control_papers:>7}")
     print(f"  board windows taken from the roster   {from_roster:>7}  "
-          f"({pct(from_roster, len(tenure))})")
+          f"({pct(from_roster, len(terms))})")
     print(f"  ...where the editor first published later than joining "
-          f"{later} ({pct(later, len(tenure))})")
+          f"{later} ({pct(later, len(terms))})")
     print(f"  control co-authorship rows          {len(control_rows):>7}")
     print(f"  people whose full record is needed  {len(wanted):>7}")
     print("\nNext: --stage coauthors  (the first dump pass)")
@@ -597,8 +554,8 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
     for journal, year, board, arts in dated_issues(issues, mapping, issue_index,
                                                    board_of_issue, issue_stats):
         pairs.add_issue(journal, year, board, arts, authors_of)
-    tenure = board_tenure(pairs.tenure_years, pairs.tenure_names, pairs.tenure_keys,
-                          pairs.board_years)
+    terms = board_terms(pairs.term_years, pairs.term_names, pairs.term_keys,
+                        pairs.board_years)
 
     article_of = {a["rec_key"]: a for a in articles}
     articles_of_person = defaultdict(list)
@@ -607,7 +564,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
         if article:
             articles_of_person[person_id(sig["pid"], sig["name"])].append(article)
     control_rows, n_control_papers = control_coauthorships(
-        tenure, articles_of_person, authors_of, mapping, pairs.board_of_journal)
+        terms, articles_of_person, authors_of, mapping, pairs.board_of_journal)
 
     all_rows = pairs.rows + control_rows
     wanted = sorted({r["editor_id"] for r in all_rows}
@@ -616,7 +573,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
 
     write_csv(out_dir / "suspect_papers.csv", pairs.papers)
     write_csv(out_dir / "coauthorships.csv", all_rows)
-    write_csv(out_dir / "editor_tenure.csv", tenure)
+    write_csv(out_dir / "editor_board_terms.csv", terms)
     # Every name on every board, also those who never published there.
     write_csv(out_dir / "board_roster.csv",
               [{"journal": j, "name": n, "first_year": min(v),
@@ -624,7 +581,7 @@ def stage_pairs(db, reports_dir: Path, out_dir: Path, mapping_path: Path) -> Non
                for (j, n), v in sorted(pairs.board_years.items())])
     write_csv(out_dir / "wanted_pids.csv", [{"person_id": p} for p in wanted])
 
-    print_pairs_summary(pairs, control_rows, tenure, wanted, n_control_papers, issue_stats)
+    print_pairs_summary(pairs, control_rows, terms, wanted, n_control_papers, issue_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -635,11 +592,12 @@ KEEP_PREDS = (SIG_PREDS - {P_SIG_ORDINAL}) | {P_SIG_PUBLICATION, P_YEAR}
 
 
 def scan_signatures(dump: Path, looking_for: str, row_for,
-                    years_for: set = frozenset()) -> list[dict]:
-    """The dump's author signatures, as `row_for(person, publication)` shapes them.
+                    years_for: set = frozenset()) -> tuple[list[dict], dict[str, str]]:
+    """The dump's author signatures, as `row_for(person, publication)` shapes them,
+    and the year of every publication in `years_for` that the dump gives one.
 
-    `row_for` returns the CSV row to keep, or None to drop the signature. Rows of
-    the publications in `years_for` also get the publication year.
+    `row_for` returns the CSV row to keep, or None to drop the signature. With
+    `years_for`, every kept row also gets the year of its publication.
     """
     pending: dict[str, dict] = {}
     rows: list[dict] = []
@@ -681,7 +639,7 @@ def scan_signatures(dump: Path, looking_for: str, row_for,
     if years_for:
         for row in rows:
             row["year"] = years.get(row["rec_key"], "")
-    return rows
+    return rows, years
 
 
 def stage_coauthors(out_dir: Path, dump: Path, force: bool) -> None:
@@ -693,40 +651,53 @@ def stage_coauthors(out_dir: Path, dump: Path, force: bool) -> None:
     if not wanted:
         sys.exit("\nERROR: wanted_pids.csv is empty. Run --stage pairs first.\n")
     print(f"\n=== COAUTHORS: one pass over the dump for {len(wanted)} people ===")
-    write_csv(out_path, scan_signatures(
+    rows, _ = scan_signatures(
         dump, f"the signatures of {len(wanted)} people",
         lambda person, rec: {"person_id": person, "rec_key": rec}
-        if person in wanted else None))
+        if person in wanted else None)
+    write_csv(out_path, rows)
     print("\nNext: --stage editor_authors")
 
 
 def scan_authors_of(out_path: Path, out_dir: Path, dump: Path, people: set,
-                    banner: str, next_stage: str, with_year=False) -> None:
-    """The full author list of every publication of `people`, from one dump pass."""
-    pubs = {r["rec_key"] for r in read_csv(out_dir / "pid_publications.csv")
-            if r["person_id"] in people}
+                    banner: str, next_stage: str, years_path: Path | None = None) -> None:
+    """The full author list of every publication of `people`, from one dump pass.
+
+    With `years_path`, the same pass also writes there the year of every publication
+    in pid_publications.csv, and the author rows carry the year.
+    """
+    records = read_csv(out_dir / "pid_publications.csv")
+    pubs = {r["rec_key"] for r in records if r["person_id"] in people}
     if not pubs:
         sys.exit("\nERROR: no publications for any of them. Run --stage coauthors first.\n")
+    dated = {r["rec_key"] for r in records} if years_path else frozenset()
+    del records
     print(f"\n=== {banner}: one pass over the dump for the {len(pubs)} publications "
           f"of {len(people)} people ===")
-    write_csv(out_path, scan_signatures(
+    rows, years = scan_signatures(
         dump, f"the authors of {len(pubs)} publications",
         lambda person, rec: {"rec_key": rec, "person_id": person}
         if rec in pubs else None,
-        years_for=pubs if with_year else frozenset()))
+        years_for=dated)
+    write_csv(out_path, rows)
+    if years_path:
+        print(f"  {len(years)} of {len(dated)} publications have a year")
+        write_csv(years_path, [{"rec_key": rec, "year": year}
+                               for rec, year in sorted(years.items())])
     print(f"\nNext: --stage {next_stage}")
 
 
 def stage_editor_authors(out_dir: Path, dump: Path, force: bool) -> None:
-    """The full author list and the year of every publication an editor signed."""
+    """The full author list and the year of every publication an editor signed, and the year of every publication of the editors and co-authors."""
     out_path = out_dir / "editor_pub_authors.csv"
-    if is_cached(out_path, force):
+    years_path = out_dir / "publication_years.csv"
+    if is_cached(out_path, force) and is_cached(years_path, force):
         return
     editors = {r["editor_id"] for r in read_csv(out_dir / "suspect_papers.csv")}
     if not editors:
         sys.exit("\nERROR: suspect_papers.csv is empty. Run --stage pairs first.\n")
     scan_authors_of(out_path, out_dir, dump, editors, "EDITOR AUTHORS", "signer_authors",
-                    with_year=True)
+                    years_path=years_path)
 
 
 def stage_signer_authors(out_dir: Path, reports_dir: Path, dump: Path, force: bool) -> None:
@@ -748,51 +719,70 @@ def stage_signer_authors(out_dir: Path, reports_dir: Path, dump: Path, force: bo
 
 def inout_points(editor_id: str, seats: dict, pubs, mapping, authors_of_pub,
                  year_of: dict) -> list:
-    """The in/out gate: one (x, y) point per board seat the editor holds.
+    """The in/out gate: one (x, y) point per year the editor sits on a board.
 
-    `seats` maps each journal to the editor's (first, last) board year there; only
-    publications with a year inside that window count.
+    `seats` maps each journal to the editor's (first, last) board year there. In a
+    year, x counts the co-authors on the editor's publications in the journals whose
+    board they sit on that year, and y the co-authors on their other publications of
+    that year. A journal without a DBLP key is left out.
     """
-    points = []
-    for journal, (first, last) in seats.items():
-        keys = set(mapping.get(journal, []))
-        if not keys:
+    keys_of = {j: set(mapping.get(j, [])) for j in seats}
+    inside, outside = defaultdict(set), defaultdict(set)
+    for rec in pubs:
+        year = year_of.get(rec, "")
+        if not year:
             continue
-        inside, outside = set(), set()
-        for rec in pubs:
-            year = year_of.get(rec, "")
-            if not year or not first <= int(year) <= last:
-                continue
-            target = inside if is_inside(rec, keys) else outside
-            target.update(authors_of_pub.get(rec, ()))
-        inside.discard(editor_id)
-        outside.discard(editor_id)
-        points.append({"journal": journal, "x": len(inside), "y": len(outside)})
-    return points
+        year = int(year)
+        on_board = [j for j, (first, last) in seats.items()
+                    if first <= year <= last and keys_of[j]]
+        if not on_board:
+            continue
+        here = any(is_inside(rec, keys_of[j]) for j in on_board)
+        (inside if here else outside)[year].update(authors_of_pub.get(rec, ()))
+    return [{"year": year, "x": len(inside[year] - {editor_id}),
+             "y": len(outside[year] - {editor_id})}
+            for year in sorted(set(inside) | set(outside))]
 
 
-def benign_reason(entry, coauthor_pubs=None) -> str:
+def benign_reason(entry, coauthor_pubs, min_pubs=COAUTHOR_MIN_PUBS) -> str:
     """Why this co-authorship is excluded from the evidence, or "" if it is not.
 
-    board_member      the co-author sits on the same board.
-    front_matter      every paper the pair shares is front matter.
-    state_determined  the co-author's whole record is the shared paper.
+    board_member  the co-author sits on the same board.
+    front_matter  every paper the pair shares is front matter.
+    short_record  the co-author has fewer than `min_pubs` publications.
     """
     if entry["on_board"]:
         return "board_member"
     if entry["n_papers"] and entry["n_front_matter"] == entry["n_papers"]:
         return "front_matter"
-    if coauthor_pubs == 1:
-        return "state_determined"
+    if coauthor_pubs < min_pubs:
+        return "short_record"
     return ""
 
 
+def first_year(recs, year_of) -> int | None:
+    """The earliest year of `recs`, or None if none of them has one."""
+    return min((int(year_of[r]) for r in recs if year_of.get(r)), default=None)
+
+
+def pubs_before(pubs, shared, year_of) -> int:
+    """The co-author's publications from years before their first publication with
+    the editor. Without a dated shared publication, the whole record counts."""
+    first = first_year(shared, year_of)
+    if first is None:
+        return len(pubs)
+    return sum(1 for r in pubs if year_of.get(r) and int(year_of[r]) < first)
+
+
 def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN,
-                publisher_of=None):
-    """One node per (editor, journal, co-author), with its summed load, state and career stage."""
+                publisher_of=None, year_of=None):
+    """One node per (editor, journal, co-author), with its summed load, state, career
+    stage and first year. The career stage counts the co-author's publications before
+    the first one with the editor, the year of that one (`year_of`: publication -> year)."""
     publisher_of = publisher_of or {}
+    year_of = year_of or {}
     grouped = defaultdict(lambda: {"load": 0.0, "n_papers": 0, "rec_keys": [],
-                                   "n_front_matter": 0, "on_board": False})
+                                   "years": {}, "n_front_matter": 0, "on_board": False})
     labels: dict[str, str] = {}
     for row in rows:
         key = (row["editor_id"], row["journal"], row["coauthor_id"])
@@ -800,6 +790,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         entry["load"] += float(row["load"])
         entry["n_papers"] += 1
         entry["rec_keys"].append(row["rec_key"])
+        entry["years"][row["rec_key"]] = row.get("year", "")
         entry["n_front_matter"] += as_bool(row.get("front_matter"))
         entry["on_board"] = entry["on_board"] or as_bool(row.get("coauthor_on_board"))
         labels[row["coauthor_id"]] = row["coauthor_name"]
@@ -814,8 +805,10 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         # Strict reading: venues the editor also edits do not count as outside.
         controlled = controlled_of.get(ed_id, set()) - inside_keys
         outside_strict = {r for r in outside if not is_inside(r, controlled)}
-        node_id = f"{ed_id}||{journal}||{co_id}"
+        node_id = node_key(ed_id, journal, co_id)
         n_pubs = len(pubs_of.get(co_id, set()))
+        n_before = pubs_before(pubs_of.get(co_id, set()), shared, year_of)
+        first = first_year(shared, year_of) or first_year(entry["rec_keys"], entry["years"])
         nodes[node_id] = {
             "editor_id": ed_id, "journal": journal,
             "publisher": publisher_of.get(journal, ""), "coauthor_id": co_id,
@@ -823,13 +816,15 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
             "load": round(entry["load"], 6), "n_shared_suspect": entry["n_papers"],
             "n_shared_inside": len(inside), "n_shared_outside": len(outside),
             "n_shared_outside_strict": len(outside_strict),
-            "coauthor_pubs": n_pubs, "career_stage": career_stage(n_pubs),
+            "coauthor_pubs": n_pubs, "coauthor_pubs_before": n_before,
+            "career_stage": career_stage(n_before),
+            "first_year": first,
             "state": classify(len(outside), len(inside), repeated_min),
             "n_front_matter": entry["n_front_matter"],
             "coauthor_on_board": entry["on_board"],
             "benign_reason": benign_reason(entry, n_pubs),
-            # filled by annotate_fit / relabel_fit, which need the networks
-            "fit_pct": None, "network_band": None, "fit": "",
+            # filled by annotate_pools, which needs the networks; None without them
+            "pool_n": None, "pool_oneoffs": None,
         }
     return nodes
 
@@ -865,11 +860,15 @@ def editor_diagnostics(editor_index, labels, papers, pubs_of, mapping,
     """Per editor: what they published, where, and their in/out gate points.
 
     `inout_points` is None when --stage editor_authors has not been run.
-    `windows` maps (journal, editor) to the (first, last) board year.
+    `windows` maps (journal, editor) to the (first, last) board year, for the seats
+    in which the editor has a suspect paper.
     """
     papers_by_editor = defaultdict(list)
     for paper in papers:
         papers_by_editor[paper["editor_id"]].append(paper)
+    seats_of = defaultdict(dict)
+    for (journal, ed_id), window in windows.items():
+        seats_of[ed_id][journal] = window
 
     per_editor = {}
     for ed_id in sorted(set(editor_index) | set(papers_by_editor)):
@@ -877,8 +876,7 @@ def editor_diagnostics(editor_index, labels, papers, pubs_of, mapping,
         in_journals = {p["journal"] for p in own}
         in_keys = {k for j in in_journals for k in mapping.get(j, [])}
         pubs = pubs_of.get(ed_id, set())
-        seats = {j: windows[(j, ed_id)] for j in sorted(in_journals)
-                 if (j, ed_id) in windows}
+        seats = seats_of.get(ed_id, {})
         per_editor[ed_id] = {
             "name": labels.get(ed_id, ed_id),
             "is_pid": ed_id.startswith(PID_PREFIX),
@@ -910,7 +908,13 @@ def print_corpus_summary(nodes, control_nodes, benign, papers,
     for state in STATES:
         print(f"  {state:<12}{by_state[state]:>8}{pct(by_state[state], len(nodes)):>9}"
               f"{load_by_state[state]:>10.1f}{pct(load_by_state[state], total_load):>12}")
-    print(f"  control nodes (pre-tenure)  {len(control_nodes)} over "
+    junior = sum(n["load"] for n in nodes.values() if n["career_stage"] == "junior")
+    junior_today = sum(n["load"] for n in nodes.values()
+                       if career_stage(n["coauthor_pubs"]) == "junior")
+    print(f"  junior co-authors (at most {JUNIOR_MAX_PUBS} publications before the first "
+          f"with the editor) {pct(junior, total_load)} of the load, on their record "
+          f"today {pct(junior_today, total_load)}")
+    print(f"  control nodes (pre-board)   {len(control_nodes)} over "
           f"{n_control_editors} editors")
     print(f"  excluded before scoring     {len(benign)} nodes, load {benign_load:.1f} "
           f"({pct(benign_load, benign_load + total_load)} of what was extracted); "
@@ -927,8 +931,13 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
     publisher_of = load_publishers(mapping_path)
     rows = read_csv(out_dir / "coauthorships.csv")
     papers = read_csv(out_dir / "suspect_papers.csv")
-    tenure = read_csv(out_dir / "editor_tenure.csv")
+    terms = read_csv(out_dir / "editor_board_terms.csv")
     pubs_of = publications_of(out_dir / "pid_publications.csv")
+    years_path = out_dir / "publication_years.csv"
+    if not years_path.exists():
+        sys.exit(f"\nERROR: {years_path.name} not found. Run --stage editor_authors "
+                 "--force.\n")
+    pub_year = {row["rec_key"]: row["year"] for row in read_csv(years_path)}
 
     authors_path = out_dir / "editor_pub_authors.csv"
     authors_of_pub, year_of = defaultdict(set), {}
@@ -944,49 +953,49 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
 
     windows = {(row["journal"], row["editor_id"]):
                (int(row["first_board_year"]), int(row["last_board_year"]))
-               for row in tenure if row["first_board_year"] and row["last_board_year"]}
+               for row in terms if row["first_board_year"] and row["last_board_year"]}
 
     # The journals each editor sits on a board of.
     controlled_of = defaultdict(set)
-    for row in tenure:
+    for row in terms:
         controlled_of[row["editor_id"]].update(mapping.get(row["journal"], []))
 
-    nodes = build_nodes([r for r in rows if r["group"] == "suspect"],
-                        pubs_of, mapping, controlled_of, publisher_of=publisher_of)
-    control_nodes = build_nodes([r for r in rows if r["group"] == "control"],
-                                pubs_of, mapping, controlled_of, publisher_of=publisher_of)
+    suspect_rows = [r for r in rows if r["group"] == "suspect"]
+    control_rows = [r for r in rows if r["group"] == "control"]
+    nodes = build_nodes(suspect_rows, pubs_of, mapping, controlled_of,
+                        publisher_of=publisher_of, year_of=pub_year)
+    control_nodes = build_nodes(control_rows, pubs_of, mapping, controlled_of,
+                                publisher_of=publisher_of, year_of=pub_year)
+    del pub_year
 
     signer_path = out_dir / "signer_pub_authors.csv"
     if signer_path.exists():
+        authors_of = read_authors(signer_path)
         wanted = {n["coauthor_id"] for group in (nodes, control_nodes)
                   for n in group.values()}
-        depth, _ = collaboration_networks(signer_path, wanted)
-        annotate_fit(nodes, depth)
-        annotate_fit(control_nodes, depth)
+        depth, _ = networks_from(authors_of, wanted)
+        annotate_pools(nodes, node_papers(suspect_rows), depth, authors_of)
+        annotate_pools(control_nodes, node_papers(control_rows), depth, authors_of)
+        del authors_of, depth
     else:
-        warn_missing(signer_path, "the partner-pattern (fit) node", "signer_authors")
+        warn_missing(signer_path, "the personal one-off baseline", "signer_authors")
 
-    # Benign nodes leave the evidence and the baseline; the fit cuts come from
-    # the scored nodes only, per publisher.
+    # Benign nodes leave the evidence and the baseline.
     benign = {k: v for k, v in nodes.items() if v["benign_reason"]}
     nodes = {k: v for k, v in nodes.items() if not v["benign_reason"]}
     control_nodes = {k: v for k, v in control_nodes.items() if not v["benign_reason"]}
-    cuts = publisher_fit_cuts(nodes)
-    fit_base = relabel_fit_per_publisher(nodes, cuts)
-    relabel_fit_per_publisher(control_nodes, cuts)
-    relabel_fit_per_publisher(benign, cuts)
 
     editor_index = index_by_editor(nodes)
     control_index = index_by_editor(control_nodes)
 
     labels: dict[str, str] = {}
-    for row in tenure:
+    for row in terms:
         labels.setdefault(row["editor_id"], row["editor_name"])
     for paper in papers:
         labels.setdefault(paper["editor_id"], paper["editor_name"])
 
     corpus = {
-        "model": "cs2_v1_per_coauthorship_load_weighted",
+        "model": "cs2_v2_tie_with_personal_oneoff_baseline",
         "config": {
             "publishers": sorted(set(publisher_of.values())),
             "states": STATES,
@@ -994,14 +1003,12 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
             "split_outside": True,
             "outside_bands": OUTSIDE_BANDS,
             "junior_max_pubs": JUNIOR_MAX_PUBS,
+            "coauthor_min_pubs": COAUTHOR_MIN_PUBS,
             "career_stages": ["junior", "established"],
-            "fit_states": FIT_STATES,
-            "fit_min_collabs": FIT_MIN_COLLABS,
-            "network_bands": NETWORK_BANDS,
+            "max_authors": MAX_AUTHORS,
             "load_rule": "one suspect paper carries load 1, split over its co-authors",
         },
         "journals": baseline_counts(nodes),
-        "fit_baseline": fit_base,
         "coauthorships": nodes,
         "editor_index": {k: sorted(v) for k, v in editor_index.items()},
         "editor_labels": labels,

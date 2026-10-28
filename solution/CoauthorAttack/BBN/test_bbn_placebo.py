@@ -102,6 +102,28 @@ def test_permutation_null():
           and results[0]["n_papers"] == 4)
     check("observed and expected are summed over the editor's papers",
           approx(results[0]["observed"], 4.0) and approx(results[0]["expected"], 4 * 2 / 3))
+    one = placebo.exact_test([{"editor": "S", "observed": 1.0, "alternatives": [0.0]}],
+                             samples=2000)[0]
+    check("one paper with one stand-in cannot reach p <= 0.05, so its null never does",
+          one["min_p"] > 0.05 and one["null_share"][0.05] == 0.0)
+    check("the null share stays at or below the nominal level, up to Monte-Carlo noise",
+          all(r["null_share"][q] <= q + 0.02
+              for r in placebo.exact_test(extreme + flat, samples=4000)
+              for q in placebo.P_LEVELS))
+
+
+def test_midrank_pct():
+    print("\n-- midrank percentiles --")
+    check("the lowest value gets percentile 0",
+          placebo.midrank_pct([1, 2, 3, 4, 5], 1) == 0.0)
+    check("the highest gets 1", placebo.midrank_pct([1, 2, 3, 4, 5], 5) == 1.0)
+    check("an all-ties distribution puts everyone in the middle",
+          placebo.midrank_pct([1, 1, 1, 1], 1) == 0.5)
+    check("a tied block is averaged, not ordered arbitrarily",
+          placebo.midrank_pct([1, 1, 1, 1, 9], 1) == 1.5 / 4
+          and approx(placebo.midrank_pct([1, 1, 1, 4], 1), 1.0 / 3, 1e-12))
+    check("a one-element distribution is no distribution: percentile 0.5",
+          placebo.midrank_pct([3], 3) == 0.5)
 
 
 def test_partner_patterns():
@@ -142,6 +164,7 @@ def main():
     test_venue_locking()
     test_clustering()
     test_permutation_null()
+    test_midrank_pct()
     test_partner_patterns()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")
     raise SystemExit(1 if _failures else 0)

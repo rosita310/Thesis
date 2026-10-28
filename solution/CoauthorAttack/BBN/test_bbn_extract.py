@@ -142,98 +142,12 @@ def test_classify():
           extract.career_stage(extract.JUNIOR_MAX_PUBS + 1) == "established")
 
 
-def test_percentiles_and_bands():
-    print("\n-- percentiles and bands --")
-    check("the lowest value gets percentile 0",
-          extract.midrank_pct([1, 2, 3, 4, 5], 1) == 0.0)
-    check("the highest gets 1", extract.midrank_pct([1, 2, 3, 4, 5], 5) == 1.0)
-    check("an all-ties distribution puts everyone in the middle",
-          extract.midrank_pct([1, 1, 1, 1], 1) == 0.5)
-    check("a tied block is averaged, not ordered arbitrarily",
-          extract.midrank_pct([1, 1, 1, 1, 9], 1) == 1.5 / 4
-          and abs(extract.midrank_pct([1, 1, 1, 4], 1) - 1.0 / 3) < 1e-12)
-    check("a one-element distribution is no distribution: percentile 0.5",
-          extract.midrank_pct([3], 3) == 0.5)
+def test_bands():
+    print("\n-- bands --")
     check("a band edge is inclusive",
-          extract.band_of(20, extract.NETWORK_BANDS) == 0
-          and extract.band_of(21, extract.NETWORK_BANDS) == 1)
+          extract.band_of(20, [20, 60, 150]) == 0 and extract.band_of(21, [20, 60, 150]) == 1)
     check("past the last edge is the last band",
-          extract.band_of(10_000, extract.NETWORK_BANDS) == len(extract.NETWORK_BANDS))
-
-
-# --- the fit --------------------------------------------------------------------
-
-def fit_nodes(pcts, load=1.0, state="single"):
-    return {f"n{i}": {"state": state, "fit_pct": p, "load": load, "network_band": 0}
-            for i, p in enumerate(pcts)}
-
-
-def test_fit_cuts_and_labels():
-    print("\n-- the fit: cuts, labels and baseline --")
-    even = fit_nodes([i / 10 for i in range(9)])           # 0.0 .. 0.8, load 1 each
-    cuts = extract.fit_cuts(even)
-    check("equal loads give plain terciles: the 3rd and 6th of 9 percentiles",
-          cuts == {"single": [0.2, 0.5]})
-    heavy = fit_nodes([i / 10 for i in range(8)])
-    heavy["big"] = {"state": "single", "fit_pct": 0.9, "load": 100.0, "network_band": 0}
-    check("one node carrying nearly all the load leaves no spread: no cuts",
-          extract.fit_cuts(heavy) == {"single": None})
-    check("identical percentiles leave no spread either",
-          extract.fit_cuts(fit_nodes([0.5, 0.5, 0.5])) == {"single": None})
-    check("a state whose nodes have no percentile gets no entry",
-          extract.fit_cuts(fit_nodes([None, None], state="repeated")) == {})
-    check("cuts are per state",
-          set(extract.fit_cuts({**even, **fit_nodes([0.1, 0.5, 0.9], state="repeated")}))
-          == {"single", "repeated"})
-
-    check("below the low cut is peripheral",
-          extract.fit_label(0.10, "single", cuts) == "peripheral")
-    check("the low cut itself is typical",
-          extract.fit_label(0.2, "single", cuts) == "typical")
-    check("the high cut itself is core",
-          extract.fit_label(0.5, "single", cuts) == "core")
-    check("a state with no usable spread is uniformly typical",
-          extract.fit_label(0.99, "outside_5plus", {"outside_5plus": None}) == "typical")
-    check("a co-author with too small a network gets no fit at all",
-          extract.fit_label(None, "single", cuts) == "")
-
-    base = extract.relabel_fit(even)
-    check("relabel_fit labels every node against its own state's cuts",
-          Counter(n["fit"] for n in even.values())
-          == {"peripheral": 2, "typical": 3, "core": 4})
-    check("...and returns the load-weighted fit baseline per state and band",
-          base == {"single": {"0": {"peripheral": 2.0, "typical": 3.0, "core": 4.0}}})
-    extract.relabel_fit(even, cuts={"single": [0.45, 0.85]})
-    check("cuts passed in are used instead of the nodes' own",
-          Counter(n["fit"] for n in even.values())
-          == {"peripheral": 5, "typical": 4})
-    check("a node without a percentile stays out of the baseline",
-          extract.relabel_fit(fit_nodes([None])) == {})
-
-    acm = {k: {**n, "publisher": "acm"} for k, n in fit_nodes([i / 10 for i in range(9)]).items()}
-    ieee = {f"i{k}": {**n, "publisher": "ieee"} for k, n in fit_nodes([0.5] * 3).items()}
-    cuts = extract.publisher_fit_cuts({**acm, **ieee})
-    check("fit cuts are taken per publisher",
-          cuts == {"acm": {"single": [0.2, 0.5]}, "ieee": {"single": None}})
-    base = extract.relabel_fit_per_publisher({**acm, **ieee}, cuts)
-    check("...and so is the fit baseline",
-          set(base) == {"acm", "ieee"} and base["ieee"]["single"]["0"]["typical"] == 3.0)
-
-
-def test_annotate_fit():
-    print("\n-- annotate_fit --")
-    nodes = {"a": {"coauthor_id": "A", "editor_id": "E", "load": 1.0},
-             "b": {"coauthor_id": "B", "editor_id": "E", "load": 1.0},
-             "c": {"coauthor_id": "C", "editor_id": "E", "load": 1.0}}
-    extract.annotate_fit(nodes, {"A": {"E": 1, "x": 3, "y": 3, "z": 3, "w": 3},
-                                 "B": {"E": 1, "x": 3},
-                                 "C": {"x": 3, "y": 3, "z": 3, "w": 3, "v": 3}})
-    check("a big enough network is scored: E is A's one-off, percentile 0",
-          nodes["a"]["fit_pct"] == 0.0 and nodes["a"]["network_band"] == 0)
-    check("a network below the minimum is refused",
-          nodes["b"]["fit_pct"] is None and nodes["b"]["network_band"] is None)
-    check("an editor the dump pass missed enters the partner's network at depth 1",
-          nodes["c"]["fit_pct"] == 0.0 and nodes["c"]["network_band"] == 0)
+          extract.band_of(10_000, [20, 60, 150]) == 3)
 
 
 def test_networks_from_file():
@@ -254,6 +168,11 @@ def test_networks_from_file():
           "P0" not in depth["A"])
     depth, spread = extract.collaboration_networks(path, {"A"})
     check("without venues the second dict stays empty", spread == {})
+    authors_of = extract.read_authors(path)
+    check("read_authors lists every publication's authors",
+          sorted(authors_of[JKEY + "P1"]) == ["A", "B", "C"])
+    check("networks_from on those lists is the same network",
+          extract.networks_from(authors_of, {"A"})[0] == depth)
 
     pubs = extract.publications_of(tempfile_with("person_id,rec_key\nA,r1\nA,r2\nB,r1\n"))
     check("publications_of groups a person's records into a set",
@@ -350,24 +269,24 @@ def test_dated_issues_and_collector():
           and pairs.papers[0]["year"] == "2020" and pairs.papers[0]["dblp_key"] == "jkey")
     check("every board name of a dated issue gets that roster year, under its key",
           pairs.board_years == {("J", "ed x"): ["2020"]})
-    check("the editor's tenure and printed name are recorded per journal",
-          pairs.tenure_years == {("J", "https://dblp.org/pid/e"): ["2020"]}
-          and pairs.tenure_names[("J", "https://dblp.org/pid/e")] == Counter({"Ed X": 1}))
+    check("the editor's board term and printed name are recorded per journal",
+          pairs.term_years == {("J", "https://dblp.org/pid/e"): ["2020"]}
+          and pairs.term_names[("J", "https://dblp.org/pid/e")] == Counter({"Ed X": 1}))
 
     pairs.add_issue("J", "2021", {"Ed Y"}, [{**ARTICLE, "rec_key": JKEY + "P2"}],
                     {JKEY + "P2": [sig("", "Ed Y"), A]})
     check("an editor without a PID is identified by name and counted",
-          pairs.n_no_pid == 1 and ("J", "Ed Y") in pairs.tenure_years)
+          pairs.n_no_pid == 1 and ("J", "Ed Y") in pairs.term_years)
 
 
-def test_board_tenure_and_control():
-    print("\n-- board tenure and the pre-tenure control --")
-    tenure_years = {("J", "pE"): ["2019", "2020"], ("J", "pF"): ["2021"]}
-    tenure_names = {("J", "pE"): Counter({"Ed Xavier": 2}), ("J", "pF"): Counter({"Fay": 1})}
-    tenure_keys = {("J", "pE"): Counter({"e x": 2}), ("J", "pF"): Counter({"fay": 1})}
+def test_board_terms_and_control():
+    print("\n-- board terms and the pre-board control --")
+    term_years = {("J", "pE"): ["2019", "2020"], ("J", "pF"): ["2021"]}
+    term_names = {("J", "pE"): Counter({"Ed Xavier": 2}), ("J", "pF"): Counter({"Fay": 1})}
+    term_keys = {("J", "pE"): Counter({"e x": 2}), ("J", "pF"): Counter({"fay": 1})}
     board_years = {("J", "e x"): ["2018", "2019", "2020", "2021"]}
-    tenure = extract.board_tenure(tenure_years, tenure_names, tenure_keys, board_years)
-    e, f = tenure
+    terms = extract.board_terms(term_years, term_names, term_keys, board_years)
+    e, f = terms
     check("the window comes from the roster under the matched board name",
           (e["first_board_year"], e["last_board_year"], e["roster_window"])
           == ("2018", "2021", 1) and e["editor_name"] == "Ed Xavier")
@@ -378,10 +297,10 @@ def test_board_tenure_and_control():
           (f["first_board_year"], f["last_board_year"], f["roster_window"])
           == ("2021", "2021", 0))
 
-    tenure = [{"journal": "J", "editor_id": "pE", "editor_name": "Ed X",
-               "first_board_year": "2018"},
-              {"journal": "K", "editor_id": "pG", "editor_name": "G",
-               "first_board_year": ""}]
+    terms = [{"journal": "J", "editor_id": "pE", "editor_name": "Ed X",
+              "first_board_year": "2018"},
+             {"journal": "K", "editor_id": "pG", "editor_name": "G",
+              "first_board_year": ""}]
     art = lambda key, year, rec: {"rec_key": rec, "journal_key": key, "year": year,
                                   "title": "t"}
     before, during, elsewhere, undated = (art("jkey", "2016", "r1"), art("jkey", "2018", "r2"),
@@ -389,7 +308,7 @@ def test_board_tenure_and_control():
     authors_of = {a["rec_key"]: [sig("pE", "Ed X"), A] for a in
                   (before, during, elsewhere, undated)}
     rows, n_papers = extract.control_coauthorships(
-        tenure, {"pE": [before, during, elsewhere, undated], "pG": [before]},
+        terms, {"pE": [before, during, elsewhere, undated], "pG": [before]},
         authors_of, {"J": ["jkey"]}, {"J": extract.BoardIndex()})
     check("only the editor's earlier papers IN the edited journal are controls",
           n_papers == 1 and [r["rec_key"] for r in rows] == ["r1"])
@@ -413,20 +332,21 @@ def test_scan_signatures():
         f'<{JKEY}A1> <{ns}yearOfPublication> '
         f'"2019"^^<http://www.w3.org/2001/XMLSchema#gYear> .\n'
         f'_:Sig_3 <{ns}signaturePublication> <{CONF}Orphan> .\n', suffix=".nt")
-    rows = extract.scan_signatures(dump, "a test",
-                                   lambda person, rec: {"person_id": person, "rec_key": rec})
+    rows, years = extract.scan_signatures(
+        dump, "a test", lambda person, rec: {"person_id": person, "rec_key": rec})
     check("a signature is resolved when its publication line arrives",
           {"person_id": "https://dblp.org/pid/1/2", "rec_key": JKEY + "A1"} in rows)
     check("a signature without a creator falls back to the base name",
           {"person_id": "No Pid", "rec_key": CONF + "B1"} in rows)
     check("a publication line with no buffered signature is dropped", len(rows) == 2)
-    kept = extract.scan_signatures(dump, "a test",
-                                   lambda person, rec: {"rec_key": rec, "person_id": person}
-                                   if rec == JKEY + "A1" else None)
+    check("without years_for no years are collected", years == {})
+    kept, _ = extract.scan_signatures(dump, "a test",
+                                      lambda person, rec: {"rec_key": rec, "person_id": person}
+                                      if rec == JKEY + "A1" else None)
     check("row_for decides what is kept", len(kept) == 1)
-    dated = extract.scan_signatures(dump, "a test",
-                                    lambda person, rec: {"rec_key": rec, "person_id": person},
-                                    years_for={JKEY + "A1", CONF + "B1"})
+    dated, years = extract.scan_signatures(
+        dump, "a test", lambda person, rec: {"rec_key": rec, "person_id": person},
+        years_for={JKEY + "A1", CONF + "B1"})
     year = {r["rec_key"]: r["year"] for r in dated}
     check("years_for adds the year, even when it follows the signatures in the dump",
           year[JKEY + "A1"] == "2019")
@@ -434,6 +354,12 @@ def test_scan_signatures():
           year[CONF + "B1"] == "")
     check("without years_for the rows carry no year at all",
           all("year" not in r for r in rows))
+    check("the years are returned for the publications that have one",
+          years == {JKEY + "A1": "2019"})
+    _, only = extract.scan_signatures(dump, "a test", lambda person, rec: None,
+                                      years_for={JKEY + "A1"})
+    check("a year is collected even for a publication none of whose rows is kept",
+          only == {JKEY + "A1": "2019"})
 
 
 # --- stage corpus -----------------------------------------------------------------
@@ -477,8 +403,26 @@ def test_build_nodes():
           b_node["career_stage"] == "junior")
     check("A's long record makes A an established co-author",
           a_node["career_stage"] == "established")
-    check("B, whose whole record is the shared paper, is state-determined",
-          b_node["benign_reason"] == "state_determined" and a_node["benign_reason"] == "")
+    check(f"B, whose whole record is the shared paper, has a record shorter than "
+          f"{extract.COAUTHOR_MIN_PUBS} and leaves the evidence; A stays",
+          b_node["benign_reason"] == "short_record" and a_node["benign_reason"] == "")
+
+    # With years: A's first paper with E is X (2014), and A's other papers come later.
+    year_of = {JKEY + "P1": "2015", JKEY + "P2": "2016", CONF + "X": "2014"}
+    year_of.update({f"https://dblp.org/rec/conf/other/A{i}": "2020"
+                    for i in range(extract.JUNIOR_MAX_PUBS)})
+    dated = extract.build_nodes(rows, pubs, mapping, controlled_of={}, year_of=year_of)
+    check("A, established today, was junior at the first paper with E",
+          dated["E||J||A"]["career_stage"] == "junior"
+          and dated["E||J||A"]["coauthor_pubs_before"] == 0
+          and dated["E||J||A"]["coauthor_pubs"] == len(pubs["A"]))
+    check("A's first year is that of X, the earliest paper shared with E",
+          dated["E||J||A"]["first_year"] == 2014 and nodes["E||J||A"]["first_year"] is None)
+    check("pubs_before counts only earlier years, not the same year",
+          extract.pubs_before({"a", "b", "c", "d"}, {"c"},
+                              {"a": "2010", "b": "2014", "c": "2014"}) == 1)
+    check("pubs_before counts the whole record when no shared paper has a year",
+          extract.pubs_before({"a", "b"}, {"b"}, {"a": "2010"}) == 2)
 
     # A pair whose only outside tie is in ANOTHER journal E edits.
     strict_pubs = dict(pubs)
@@ -496,6 +440,9 @@ def test_build_nodes():
     check("suspect papers count as shared even if the dump pass missed them",
           thin["E||J||A"]["n_shared_inside"] == 2
           and thin["E||J||A"]["state"] == "repeated")
+    check("without a year in the dump, the first year is that of the suspect rows",
+          extract.build_nodes([{**r, "year": "2019"} for r in rows], pubs, mapping,
+                              {})["E||J||A"]["first_year"] == 2019)
 
     check("the baseline records the journal's publisher",
           extract.baseline_counts(nodes)["J"]["publisher"] == "acm")
@@ -510,28 +457,74 @@ def test_build_nodes():
           dict(extract.index_by_editor(nodes)) == {"E": ["E||J||A", "E||J||B"]})
 
 
+def test_pool_stats():
+    """A's record: the two suspect papers with E (P1 with B, P2), a conference paper
+    with B, two papers with C, one with D, one more with E elsewhere, and one paper
+    above MAX_AUTHORS with F. B's record: P1 and the conference paper."""
+    print("\n-- pool stats: the co-author's own network without E and the evidence --")
+    rows = suspect_rows()
+    big = [f"x{i}" for i in range(extract.MAX_AUTHORS)] + ["A", "F"]
+    authors_of = {JKEY + "P1": ["E", "A", "B"], JKEY + "P2": ["E", "A"],
+                  CONF + "X1": ["A", "B"], CONF + "X2": ["A", "C"], CONF + "X3": ["A", "C"],
+                  CONF + "X4": ["A", "D"], CONF + "X5": ["A", "E"], CONF + "Big": big}
+    depth, _ = extract.networks_from(authors_of, {"A", "B"})
+    check("A's network: E 3, B 2, C 2, D 1, and nobody from the oversized paper",
+          dict(depth["A"]) == {"E": 3, "B": 2, "C": 2, "D": 1})
+
+    papers = extract.node_papers(rows)
+    check("node_papers gives each node its own papers",
+          papers == {"E||J||A": {JKEY + "P1", JKEY + "P2"}, "E||J||B": {JKEY + "P1"}})
+    check("node_key is the id build_nodes gives the node",
+          extract.node_key("E", "J", "A") == "E||J||A")
+
+    n, k = extract.pool_stats("A", "E", depth["A"], papers["E||J||A"], authors_of)
+    check(f"E is left out and P1 no longer ties A to B twice: n=3 (B, C, D), k=2 (B, D) "
+          f"(got n={n}, k={k})", (n, k) == (3, 2))
+    check("without taking the evidence out, B would count as a repeat collaborator",
+          extract.pool_stats("A", "E", depth["A"], set(), authors_of) == (3, 1))
+    check("without leaving out the editor, E would count as a collaborator",
+          extract.pool_stats("A", "nobody", depth["A"], papers["E||J||A"], authors_of)
+          == (4, 3))
+    check("a collaborator met only on the evidence papers leaves the network",
+          extract.pool_stats("B", "E", depth["B"], papers["E||J||B"], authors_of) == (1, 1)
+          and extract.pool_stats("B", "E", {"E": 1, "A": 1}, papers["E||J||B"],
+                                 authors_of) == (0, 0))
+    missed = {**authors_of, JKEY + "P1": ["E", "B"]}
+    check("an evidence paper whose author list misses the co-author takes nothing out",
+          extract.pool_stats("A", "E", depth["A"], papers["E||J||A"], missed) == (3, 1))
+    check("an unknown co-author has an empty pool",
+          extract.pool_stats("Z", "E", {}, {JKEY + "P1"}, authors_of) == (0, 0))
+
+    nodes = extract.build_nodes(rows, {}, {"J": ["jkey"]}, {})
+    check("build_nodes leaves the pool stats empty until the networks are read",
+          all(n["pool_n"] is None and n["pool_oneoffs"] is None for n in nodes.values()))
+    extract.annotate_pools(nodes, papers, depth, authors_of)
+    check("annotate_pools fills them in per node",
+          (nodes["E||J||A"]["pool_n"], nodes["E||J||A"]["pool_oneoffs"]) == (3, 2)
+          and (nodes["E||J||B"]["pool_n"], nodes["E||J||B"]["pool_oneoffs"]) == (1, 1))
+
+
 def test_benign():
     print("\n-- benign-by-construction nodes --")
     check("a pair whose every shared paper is front matter is benign",
           extract.benign_reason({"on_board": False, "n_papers": 2,
-                                 "n_front_matter": 2}) == "front_matter")
+                                 "n_front_matter": 2}, 10) == "front_matter")
     check("one real paper alongside an editorial keeps the pair as evidence",
           extract.benign_reason({"on_board": False, "n_papers": 2,
-                                 "n_front_matter": 1}) == "")
+                                 "n_front_matter": 1}, 10) == "")
     check("a co-author on the same board is benign whatever they wrote",
           extract.benign_reason({"on_board": True, "n_papers": 3,
-                                 "n_front_matter": 0}) == "board_member")
+                                 "n_front_matter": 0}, 10) == "board_member")
     check("board membership is reported ahead of front matter",
           extract.benign_reason({"on_board": True, "n_papers": 1,
-                                 "n_front_matter": 1}) == "board_member")
+                                 "n_front_matter": 1}, 10) == "board_member")
     plain = {"on_board": False, "n_papers": 1, "n_front_matter": 0}
-    check("an ordinary pair is not benign", extract.benign_reason(plain, 12) == "")
-    check("a co-author with no record beyond the shared paper is state-determined",
-          extract.benign_reason(plain, 1) == "state_determined")
-    check("...but two publications leave room for an outside tie",
-          extract.benign_reason(plain, 2) == "")
-    check("an unknown record size is not a reason to exclude",
-          extract.benign_reason(plain) == "")
+    check("an ordinary pair is not benign", extract.benign_reason(plain, 10) == "")
+    check(f"a co-author with fewer than {extract.COAUTHOR_MIN_PUBS} publications is benign",
+          extract.benign_reason(plain, extract.COAUTHOR_MIN_PUBS - 1) == "short_record"
+          and extract.benign_reason(plain, extract.COAUTHOR_MIN_PUBS) == "")
+    check("board membership is reported ahead of a short record",
+          extract.benign_reason({**plain, "on_board": True}, 1) == "board_member")
 
 
 def test_editor_diagnostics_and_inout():
@@ -551,29 +544,38 @@ def test_editor_diagnostics_and_inout():
                CONF + "Old": "2005", CONF + "Undated": ""}
     mapping = {"J1": ["jkey"], "J2": ["jtwo"], "J3": []}
     seats = {"J1": (2010, 2015), "J2": (2010, 2015), "J3": (2010, 2015)}
-    pts = {p["journal"]: p for p in
+    pts = {p["year"]: p for p in
            extract.inout_points("E", seats, set(authors_of_pub), mapping,
                                 authors_of_pub, year_of)}
-    check("one point per mapped journal; an unmapped one is not plotted",
-          sorted(pts) == ["J1", "J2"])
-    check("x counts distinct in-journal co-authors, editor excluded",
-          pts["J1"]["x"] == 2)
-    check("a co-author seen both inside and outside is on both axes",
-          pts["J1"]["y"] == 2)
-    check("the same record read against another board seat moves to y",
-          pts["J2"] == {"journal": "J2", "x": 0, "y": 3})
+    check("one point per year on a board with a dated publication; 2005 is before "
+          "every seat and the undated one has no year",
+          sorted(pts) == [2010, 2012, 2015])
+    check("x counts distinct co-authors in the journals edited that year, editor excluded",
+          pts[2012] == {"year": 2012, "x": 2, "y": 0})
+    check("y counts the co-authors of that year's other publications",
+          pts[2010] == {"year": 2010, "x": 0, "y": 1} and pts[2015]["y"] == 1)
+    two = JKEY.replace("jkey", "jtwo")
+    authors_two = {**authors_of_pub, two + "Q": {"E", "C"}}
+    year_two = {**year_of, two + "Q": "2011"}
+    both = extract.inout_points("E", {"J1": (2010, 2015), "J2": (2010, 2015)},
+                                set(authors_two), mapping, authors_two, year_two)
+    check("a paper in another journal the editor edits that year counts inside",
+          {p["year"]: p for p in both}[2011] == {"year": 2011, "x": 1, "y": 0})
+    later = extract.inout_points("E", {"J1": (2010, 2015), "J2": (2013, 2015)},
+                                 set(authors_two), mapping, authors_two, year_two)
+    check("...but outside in a year before they joined that journal's board",
+          {p["year"]: p for p in later}[2011] == {"year": 2011, "x": 0, "y": 1})
+    check("a journal without a DBLP key gives no points",
+          extract.inout_points("E", {"J3": (2010, 2015)}, set(authors_of_pub), mapping,
+                               authors_of_pub, year_of) == [])
     check("a publication with no author list contributes nobody",
           extract.inout_points("E", {"J1": (2010, 2015)}, {CONF + "Q"}, mapping, {},
                                {CONF + "Q": "2012"})
-          == [{"journal": "J1", "x": 0, "y": 0}])
-    late = extract.inout_points("E", {"J1": (2013, 2015)}, set(authors_of_pub), mapping,
-                                authors_of_pub, year_of)
-    check("only the seat's own window counts, on both axes (P1 and X fall before it)",
-          late == [{"journal": "J1", "x": 0, "y": 1}])
+          == [{"year": 2012, "x": 0, "y": 0}])
     check("the window bounds are inclusive",
           extract.inout_points("E", {"J1": (2012, 2012)}, set(authors_of_pub), mapping,
                                authors_of_pub, year_of)
-          == [{"journal": "J1", "x": 2, "y": 0}])
+          == [{"year": 2012, "x": 2, "y": 0}])
 
     nodes = {"E||J1||A": {"editor_id": "E", "coauthor_id": "A"},
              "E||J1||B": {"editor_id": "E", "coauthor_id": "B"}}
@@ -588,8 +590,10 @@ def test_editor_diagnostics_and_inout():
     check("the editor's suspect papers and whole-career outside publications are counted",
           diag["E"]["n_pubs_outside_journal"] == 4
           and diag["E"]["n_suspect_papers"] == 1)
-    check("the gate point of a seat is read within that seat's window",
-          diag["E"]["inout_points"] == [{"journal": "J1", "x": 2, "y": 2}])
+    check("the gate points are the years within the editor's board windows",
+          diag["E"]["inout_points"] == [{"year": 2010, "x": 0, "y": 1},
+                                        {"year": 2012, "x": 2, "y": 0},
+                                        {"year": 2015, "x": 0, "y": 1}])
     check("a seat without a window gets no gate point",
           extract.editor_diagnostics({"E": list(nodes)}, {}, papers,
                                      {"E": set(authors_of_pub)}, mapping, authors_of_pub,
@@ -617,16 +621,15 @@ def main():
     test_identity_and_venue()
     test_load_rule()
     test_classify()
-    test_percentiles_and_bands()
-    test_fit_cuts_and_labels()
-    test_annotate_fit()
+    test_bands()
     test_networks_from_file()
     test_coauthorship_rows()
     test_front_matter()
     test_dated_issues_and_collector()
-    test_board_tenure_and_control()
+    test_board_terms_and_control()
     test_scan_signatures()
     test_build_nodes()
+    test_pool_stats()
     test_benign()
     test_editor_diagnostics_and_inout()
     test_issue_year()

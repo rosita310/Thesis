@@ -31,11 +31,9 @@ STATES = ["outside_5plus", "outside_2_4", "outside_1", "repeated", "single"]
 
 REPEATED_MIN = 2             # R_min: shared papers inside the journal for `repeated`
 JUNIOR_MAX_PUBS = 10         # career stage: `junior` up to this many publications
+COAUTHOR_MIN_PUBS = 4        # co-authors with fewer publications are left out, like board peers
 
-FIT_STATES = ["peripheral", "typical", "core"]
-FIT_MIN_COLLABS = 5          # a co-author with fewer collaborators gets no fit
 MAX_AUTHORS = 40             # papers with more authors are left out of the networks
-NETWORK_BANDS = [20, 60, 150]   # bands of collaborator count; fit compares within a band
 
 # ---------------------------------------------------------------------------
 # The model (bbn_infer.py)
@@ -45,20 +43,17 @@ PRIOR = 0.95                 # pi = P(G=1)
 ALPHA = 0.50                 # coerced fraction of a non-genuine editor's load
 
 # m(s): the state distribution of a coerced co-authorship. Keys match STATES; sums to 1.
-MANIP_DIST = {"outside_5plus": 0.0, "outside_2_4": 0.03, "outside_1": 0.10,
-              "repeated": 0.15, "single": 0.72}
-
-# m(f | s): the fit distribution of a coerced co-authorship, per state.
-MANIP_FIT = {
-    "outside_5plus": {"peripheral": 1 / 3, "typical": 1 / 3, "core": 1 / 3},
-    "outside_2_4":   {"peripheral": 0.45, "typical": 0.35, "core": 0.20},
-    "outside_1":     {"peripheral": 0.50, "typical": 0.35, "core": 0.15},
-    "repeated":      {"peripheral": 0.25, "typical": 0.40, "core": 0.35},
-    "single":        {"peripheral": 0.60, "typical": 0.30, "core": 0.10},
-}
+MANIP_DIST = {"outside_5plus": 0.0, "outside_2_4": 0.05, "outside_1": 0.10,
+              "repeated": 0.15, "single": 0.70}
 
 PSEUDO_COUNT = 0.5           # lambda: added to every bin of every baseline distribution
-FALLBACK_MIN_N = 30.0        # N_min: post-exclusion load a fallback level needs
+FALLBACK_MIN_N = 30.0        # N_min: post-exclusion load a fallback level needs; also the
+                             # collaborators a co-author needs for the personal adjustment
+
+# The dblp dump is of June 2026. A co-authorship whose first shared publication is from
+# RECENT_FROM on is judged against the journal's recent co-authorships, any other against
+# the earlier ones. None: no split.
+RECENT_FROM = 2025
 
 CONDITION_ON_CAREER_STAGE = False   # also condition the genuine baseline on career stage
 INOUT_GATE = True            # rank only editors who pass Westerbaan's in/out gate (fig. 8.7)
@@ -80,16 +75,27 @@ MANIP_SWEEP = {
                   "repeated": 0.05, "single": 0.85},
     "captive":   {"outside_5plus": 0.0, "outside_2_4": 0.05, "outside_1": 0.15,
                   "repeated": 0.40, "single": 0.40},
-    "soft-out":  {"outside_5plus": 0.0, "outside_2_4": 0.10, "outside_1": 0.20,
-                  "repeated": 0.15, "single": 0.55},
-    "eps-out":   {"outside_5plus": 0.05, "outside_2_4": 0.03, "outside_1": 0.10,
-                  "repeated": 0.15, "single": 0.67},
 }
 
 REPEATED_SWEEP = [2, 3, 4]
+COAUTHOR_MIN_PUBS_SWEEP = [1, 2, 4, 6]
+RECENT_FROM_SWEEP = [None, 2024, 2025, 2026]
 OUTSIDE_READINGS = ["any", "strict"]   # strict: a venue the editor also edits is not outside
 
-MIN_CONTROL_NODES = 3        # pre-tenure co-authorships needed for a per-editor comparison
+# The boundary of the personal adjustment (collaborators the co-author needs), swept for
+# the adjustment only; the model itself uses FALLBACK_MIN_N.
+POOL_MIN_SWEEP = [10, 30, 50]
+# Bins of the habit ratio (the co-author's one-off habit over the journal's typical habit)
+# for the calibration table.
+HABIT_RATIO_BINS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # upper edges, exclusive
+
+MIN_CONTROL_NODES = 3        # pre-board co-authorships needed for a per-editor comparison
+
+# Entry conditions: rank only editors with at least this many suspect papers (n_min).
+MIN_RECORD_SWEEP = [1, 2, 3, 5]
+
+# The head of the ranking: editors counted below these P(genuine), and below PRIOR.
+HEAD_P_LEVELS = [0.50, 0.90]
 
 # ---------------------------------------------------------------------------
 # The placebo (bbn_placebo.py)
@@ -98,3 +104,21 @@ MIN_CONTROL_NODES = 3        # pre-tenure co-authorships needed for a per-editor
 PLACEBO_SAMPLES = 50_000     # Monte-Carlo draws per editor
 PLACEBO_SEED = 3             # each editor's draws are seeded from this and their id
 PLACEBO_RECORD_BANDS = [2, 10, 50, 200]   # publication-count bands for matched stand-ins
+PATTERN_MIN_COLLABS = 5      # a partner with fewer collaborators has no pattern to rank into
+PATTERN_NETWORK_BANDS = [20, 60, 150]   # collaborator-count bands for similar-size stand-ins
+
+# ---------------------------------------------------------------------------
+# The injection test (bbn_inject.py)
+# ---------------------------------------------------------------------------
+
+# Fake editors who built a career on coercion, scored one at a time without the gate.
+INJECT_RECORDS = [15, 30]            # papers in the journal they edit
+INJECT_SHARES = [1 / 3, 1 / 2, 2 / 3]   # the coerced share of those papers
+INJECT_COAUTHORS = 3         # co-authors per coerced paper: the median of the suspect papers
+# one-off:   every coerced paper has new co-authors, so each co-authorship is `single`
+# standing:  the same co-authors on every coerced paper, so `repeated` from R_min papers on
+# both:      half of the coerced papers one-off, half standing
+INJECT_PROFILES = ["one-off", "standing", "both"]
+INJECT_BOARDS = [1, 2]       # boards the one-off profile is spread over
+INJECT_DRAWS = 20            # fake editors per journal and kind
+INJECT_SEED = 7
