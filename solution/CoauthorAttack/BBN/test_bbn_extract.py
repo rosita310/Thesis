@@ -403,8 +403,9 @@ def test_build_nodes():
           b_node["career_stage"] == "junior")
     check("A's long record makes A an established co-author",
           a_node["career_stage"] == "established")
-    check("B, whose whole record is the shared paper, stays in the evidence",
-          b_node["benign_reason"] == "" and a_node["benign_reason"] == "")
+    check(f"B, whose whole record is the shared paper, has a record shorter than "
+          f"{extract.COAUTHOR_MIN_PUBS} and leaves the evidence; A stays",
+          b_node["benign_reason"] == "short_record" and a_node["benign_reason"] == "")
 
     # With years: A's first paper with E is X (2014), and A's other papers come later.
     year_of = {JKEY + "P1": "2015", JKEY + "P2": "2016", CONF + "X": "2014"}
@@ -415,6 +416,8 @@ def test_build_nodes():
           dated["E||J||A"]["career_stage"] == "junior"
           and dated["E||J||A"]["coauthor_pubs_before"] == 0
           and dated["E||J||A"]["coauthor_pubs"] == len(pubs["A"]))
+    check("A's first year is that of X, the earliest paper shared with E",
+          dated["E||J||A"]["first_year"] == 2014 and nodes["E||J||A"]["first_year"] is None)
     check("pubs_before counts only earlier years, not the same year",
           extract.pubs_before({"a", "b", "c", "d"}, {"c"},
                               {"a": "2010", "b": "2014", "c": "2014"}) == 1)
@@ -437,6 +440,9 @@ def test_build_nodes():
     check("suspect papers count as shared even if the dump pass missed them",
           thin["E||J||A"]["n_shared_inside"] == 2
           and thin["E||J||A"]["state"] == "repeated")
+    check("without a year in the dump, the first year is that of the suspect rows",
+          extract.build_nodes([{**r, "year": "2019"} for r in rows], pubs, mapping,
+                              {})["E||J||A"]["first_year"] == 2019)
 
     check("the baseline records the journal's publisher",
           extract.baseline_counts(nodes)["J"]["publisher"] == "acm")
@@ -502,18 +508,23 @@ def test_benign():
     print("\n-- benign-by-construction nodes --")
     check("a pair whose every shared paper is front matter is benign",
           extract.benign_reason({"on_board": False, "n_papers": 2,
-                                 "n_front_matter": 2}) == "front_matter")
+                                 "n_front_matter": 2}, 10) == "front_matter")
     check("one real paper alongside an editorial keeps the pair as evidence",
           extract.benign_reason({"on_board": False, "n_papers": 2,
-                                 "n_front_matter": 1}) == "")
+                                 "n_front_matter": 1}, 10) == "")
     check("a co-author on the same board is benign whatever they wrote",
           extract.benign_reason({"on_board": True, "n_papers": 3,
-                                 "n_front_matter": 0}) == "board_member")
+                                 "n_front_matter": 0}, 10) == "board_member")
     check("board membership is reported ahead of front matter",
           extract.benign_reason({"on_board": True, "n_papers": 1,
-                                 "n_front_matter": 1}) == "board_member")
+                                 "n_front_matter": 1}, 10) == "board_member")
     plain = {"on_board": False, "n_papers": 1, "n_front_matter": 0}
-    check("an ordinary pair is not benign", extract.benign_reason(plain) == "")
+    check("an ordinary pair is not benign", extract.benign_reason(plain, 10) == "")
+    check(f"a co-author with fewer than {extract.COAUTHOR_MIN_PUBS} publications is benign",
+          extract.benign_reason(plain, extract.COAUTHOR_MIN_PUBS - 1) == "short_record"
+          and extract.benign_reason(plain, extract.COAUTHOR_MIN_PUBS) == "")
+    check("board membership is reported ahead of a short record",
+          extract.benign_reason({**plain, "on_board": True}, 1) == "board_member")
 
 
 def test_editor_diagnostics_and_inout():

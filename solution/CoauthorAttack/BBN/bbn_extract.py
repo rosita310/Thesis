@@ -35,8 +35,8 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from cs2_config import (BBN_DIR, DUMP_PATH, ENV_PATH, JUNIOR_MAX_PUBS, MAX_AUTHORS,
-                        OUTSIDE_BANDS, OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR,
+from cs2_config import (BBN_DIR, COAUTHOR_MIN_PUBS, DUMP_PATH, ENV_PATH, JUNIOR_MAX_PUBS,
+                        MAX_AUTHORS, OUTSIDE_BANDS, OUTSIDE_STATES, PUBLISHERS, REPEATED_MIN, REPORTS_DIR,
                         STATES)
 from dblp_extract import (
     PROGRESS_EVERY, P_SIG_CREATOR, P_SIG_NAME, P_SIG_ORDINAL,
@@ -744,23 +744,31 @@ def inout_points(editor_id: str, seats: dict, pubs, mapping, authors_of_pub,
             for year in sorted(set(inside) | set(outside))]
 
 
-def benign_reason(entry) -> str:
+def benign_reason(entry, coauthor_pubs, min_pubs=COAUTHOR_MIN_PUBS) -> str:
     """Why this co-authorship is excluded from the evidence, or "" if it is not.
 
     board_member  the co-author sits on the same board.
     front_matter  every paper the pair shares is front matter.
+    short_record  the co-author has fewer than `min_pubs` publications.
     """
     if entry["on_board"]:
         return "board_member"
     if entry["n_papers"] and entry["n_front_matter"] == entry["n_papers"]:
         return "front_matter"
+    if coauthor_pubs < min_pubs:
+        return "short_record"
     return ""
+
+
+def first_year(recs, year_of) -> int | None:
+    """The earliest year of `recs`, or None if none of them has one."""
+    return min((int(year_of[r]) for r in recs if year_of.get(r)), default=None)
 
 
 def pubs_before(pubs, shared, year_of) -> int:
     """The co-author's publications from years before their first publication with
     the editor. Without a dated shared publication, the whole record counts."""
-    first = min((int(year_of[r]) for r in shared if year_of.get(r)), default=None)
+    first = first_year(shared, year_of)
     if first is None:
         return len(pubs)
     return sum(1 for r in pubs if year_of.get(r) and int(year_of[r]) < first)
@@ -768,13 +776,13 @@ def pubs_before(pubs, shared, year_of) -> int:
 
 def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN,
                 publisher_of=None, year_of=None):
-    """One node per (editor, journal, co-author), with its summed load, state and career
-    stage. The career stage counts the co-author's publications before the first one
-    with the editor (`year_of`: publication -> year)."""
+    """One node per (editor, journal, co-author), with its summed load, state, career
+    stage and first year. The career stage counts the co-author's publications before
+    the first one with the editor, the year of that one (`year_of`: publication -> year)."""
     publisher_of = publisher_of or {}
     year_of = year_of or {}
     grouped = defaultdict(lambda: {"load": 0.0, "n_papers": 0, "rec_keys": [],
-                                   "n_front_matter": 0, "on_board": False})
+                                   "years": {}, "n_front_matter": 0, "on_board": False})
     labels: dict[str, str] = {}
     for row in rows:
         key = (row["editor_id"], row["journal"], row["coauthor_id"])
@@ -782,6 +790,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         entry["load"] += float(row["load"])
         entry["n_papers"] += 1
         entry["rec_keys"].append(row["rec_key"])
+        entry["years"][row["rec_key"]] = row.get("year", "")
         entry["n_front_matter"] += as_bool(row.get("front_matter"))
         entry["on_board"] = entry["on_board"] or as_bool(row.get("coauthor_on_board"))
         labels[row["coauthor_id"]] = row["coauthor_name"]
@@ -799,6 +808,7 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
         node_id = node_key(ed_id, journal, co_id)
         n_pubs = len(pubs_of.get(co_id, set()))
         n_before = pubs_before(pubs_of.get(co_id, set()), shared, year_of)
+        first = first_year(shared, year_of) or first_year(entry["rec_keys"], entry["years"])
         nodes[node_id] = {
             "editor_id": ed_id, "journal": journal,
             "publisher": publisher_of.get(journal, ""), "coauthor_id": co_id,
@@ -808,10 +818,11 @@ def build_nodes(rows, pubs_of, mapping, controlled_of, repeated_min=REPEATED_MIN
             "n_shared_outside_strict": len(outside_strict),
             "coauthor_pubs": n_pubs, "coauthor_pubs_before": n_before,
             "career_stage": career_stage(n_before),
+            "first_year": first,
             "state": classify(len(outside), len(inside), repeated_min),
             "n_front_matter": entry["n_front_matter"],
             "coauthor_on_board": entry["on_board"],
-            "benign_reason": benign_reason(entry),
+            "benign_reason": benign_reason(entry, n_pubs),
             # filled by annotate_pools, which needs the networks; None without them
             "pool_n": None, "pool_oneoffs": None,
         }
@@ -992,6 +1003,7 @@ def stage_corpus(out_dir: Path, mapping_path: Path) -> None:
             "split_outside": True,
             "outside_bands": OUTSIDE_BANDS,
             "junior_max_pubs": JUNIOR_MAX_PUBS,
+            "coauthor_min_pubs": COAUTHOR_MIN_PUBS,
             "career_stages": ["junior", "established"],
             "max_authors": MAX_AUTHORS,
             "load_rule": "one suspect paper carries load 1, split over its co-authors",

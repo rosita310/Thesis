@@ -31,6 +31,7 @@ STATES = ["outside_5plus", "outside_2_4", "outside_1", "repeated", "single"]
 
 REPEATED_MIN = 2             # R_min: shared papers inside the journal for `repeated`
 JUNIOR_MAX_PUBS = 10         # career stage: `junior` up to this many publications
+COAUTHOR_MIN_PUBS = 4        # co-authors with fewer publications are left out, like board peers
 
 MAX_AUTHORS = 40             # papers with more authors are left out of the networks
 
@@ -42,18 +43,17 @@ PRIOR = 0.95                 # pi = P(G=1)
 ALPHA = 0.50                 # coerced fraction of a non-genuine editor's load
 
 # m(s): the state distribution of a coerced co-authorship. Keys match STATES; sums to 1.
-MANIP_DIST = {"outside_5plus": 0.0, "outside_2_4": 0.03, "outside_1": 0.10,
-              "repeated": 0.15, "single": 0.72}
+MANIP_DIST = {"outside_5plus": 0.0, "outside_2_4": 0.05, "outside_1": 0.10,
+              "repeated": 0.15, "single": 0.70}
 
 PSEUDO_COUNT = 0.5           # lambda: added to every bin of every baseline distribution
 FALLBACK_MIN_N = 30.0        # N_min: post-exclusion load a fallback level needs; also the
                              # collaborators a co-author needs for the personal adjustment
 
-# The personal one-off baseline. For a co-author with at least FALLBACK_MIN_N
-# collaborators, g(single) is the journal's times the habit ratio, the co-author's one-off
-# habit over the journal's typical habit, at most this cap; the other states are rescaled
-# to make up the rest.
-PERSONAL_SINGLE_CAP = 0.95
+# The dblp dump is of June 2026. A co-authorship whose first shared publication is from
+# RECENT_FROM on is judged against the journal's recent co-authorships, any other against
+# the earlier ones. None: no split.
+RECENT_FROM = 2025
 
 CONDITION_ON_CAREER_STAGE = False   # also condition the genuine baseline on career stage
 INOUT_GATE = True            # rank only editors who pass Westerbaan's in/out gate (fig. 8.7)
@@ -75,13 +75,11 @@ MANIP_SWEEP = {
                   "repeated": 0.05, "single": 0.85},
     "captive":   {"outside_5plus": 0.0, "outside_2_4": 0.05, "outside_1": 0.15,
                   "repeated": 0.40, "single": 0.40},
-    "soft-out":  {"outside_5plus": 0.0, "outside_2_4": 0.10, "outside_1": 0.20,
-                  "repeated": 0.15, "single": 0.55},
-    "eps-out":   {"outside_5plus": 0.05, "outside_2_4": 0.03, "outside_1": 0.10,
-                  "repeated": 0.15, "single": 0.67},
 }
 
 REPEATED_SWEEP = [2, 3, 4]
+COAUTHOR_MIN_PUBS_SWEEP = [1, 2, 4, 6]
+RECENT_FROM_SWEEP = [None, 2024, 2025, 2026]
 OUTSIDE_READINGS = ["any", "strict"]   # strict: a venue the editor also edits is not outside
 
 # The boundary of the personal adjustment (collaborators the co-author needs), swept for

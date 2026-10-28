@@ -10,8 +10,8 @@ they edit, a share INJECT_SHARES of them coerced.
   with the load still needed). They keep their real ties and co-author habits and,
   like any editor's own co-authorships, are left out of the baselines.
 - The coerced papers have INJECT_COAUTHORS co-authors each, who share nothing with the
-  editor outside the journal. Each victim's one-off habit is that of a random real
-  co-author in the journal. In the one-off profile every coerced paper has new
+  editor outside the journal. Each victim's one-off habit and first year are those
+  of a random real co-author in the journal. In the one-off profile every coerced paper has new
   victims, in the standing profile the same victims sign every coerced paper, and in
   the both profile half of the coerced papers are one-off and half standing.
 
@@ -115,6 +115,7 @@ def coerced_nodes(journal, profile, papers, rng, journals, repeated_min):
         donor = journals.victim(journal, rng)
         nodes.append({"journal": journal, "state": state, "load": load,
                       "career_stage": donor["career_stage"],
+                      "first_year": donor.get("first_year"),
                       "pool_n": donor["pool_n"], "pool_oneoffs": donor["pool_oneoffs"]})
     return nodes
 

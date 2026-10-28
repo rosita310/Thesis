@@ -185,18 +185,23 @@ def test_typical_habit():
 def test_personal_column():
     print("\n-- the personal genuine column --")
     gdist, _ = infer.genuine_dist(REF, "J1", "established", [])
+    odds = gdist["single"] / (1 - gdist["single"])
     for habit_ratio in (0.1, 0.8, 1.0, 1.7):
         g = infer.personal_column(gdist, habit_ratio)
-        check(f"habit ratio {habit_ratio}: g_i(single) = g(single|j) * ratio and the "
-              f"column sums to 1",
-              approx(g["single"], gdist["single"] * habit_ratio) and approx(sum(g.values()), 1.0))
+        new_odds = g["single"] / (1 - g["single"])
+        check(f"habit ratio {habit_ratio}: the odds of g_i(single) are the journal's times "
+              f"the ratio and the column sums to 1",
+              approx(new_odds, odds * habit_ratio) and approx(sum(g.values()), 1.0))
     g = infer.personal_column(gdist, 1.7)
     check("the other ties are rescaled by one common factor",
           approx(g["outside"] / gdist["outside"], g["repeated"] / gdist["repeated"]))
-    capped = infer.personal_column(gdist, 1e6)
-    check(f"a huge habit ratio is capped at {infer.PERSONAL_SINGLE_CAP}, still summing to 1",
-          approx(capped["single"], infer.PERSONAL_SINGLE_CAP)
-          and approx(sum(capped.values()), 1.0))
+    huge = infer.personal_column(gdist, 1e6)
+    check("a huge habit ratio keeps g_i(single) below 1 and the column summing to 1",
+          huge["single"] < 1 and approx(sum(huge.values()), 1.0))
+    check("for a rare `single` the odds scaling is close to scaling the probability",
+          abs(infer.odds_scaled(0.02, 1.5) - 0.03) < 0.001)
+    check("for a common `single` it leaves the other ties room (0.6 at ratio 1.5 gives 0.692)",
+          approx(infer.odds_scaled(0.6, 1.5), 2.25 / 3.25))
 
     data, _ = personal_corpus()
     r = infer.reference(data)
@@ -205,8 +210,9 @@ def test_personal_column():
     gj, _ = infer.genuine_dist(r, "J1", "established", [])
     singles = [infer.personal_dist(r, n, gj, [])[0]["single"] for n in j1]
     mean = sum(g * n["load"] for g, n in zip(singles, j1)) / sum(n["load"] for n in j1)
-    check(f"over the journal's own qualifying load, g_i(single) averages back to "
-          f"g(single|j) ({mean:.5f} vs {gj['single']:.5f})", approx(mean, gj["single"]))
+    check(f"over the journal's own qualifying load, g_i(single) averages a little below "
+          f"g(single|j), as the odds scaling is concave ({mean:.5f} vs {gj['single']:.5f})",
+          0.95 * gj["single"] < mean <= gj["single"])
 
     below = pooled_node("E", "J1", 1.0, N_MIN - 1, 0)
     check("a co-author below N_min keeps the journal's column",
@@ -258,8 +264,8 @@ def test_no_qualifying_node_is_the_tie_model():
           d["J1"]["adjusted"] and d["J1"]["oneoff_level"] == "journal"
           and d["J2"]["oneoff_level"] == "pooled"
           and approx(d["J2"]["single_p"],
-                     min(d["J2"]["journal_single_p"] * d["J2"]["habit_ratio"],
-                         infer.PERSONAL_SINGLE_CAP), 1e-5))
+                     infer.odds_scaled(d["J2"]["journal_single_p"], d["J2"]["habit_ratio"]),
+                     1e-5))
 
 
 def test_load_accumulation():
@@ -374,6 +380,44 @@ def test_career_stage_is_not_a_parent():
           level == "journal:career_stage")
 
 
+def test_recent_period():
+    """J1's 520 of load hold 40 of recent co-authorships, 30 of them `single`."""
+    print("\n-- recent and earlier co-authorships --")
+    recent = {"E1||J1||a": {**node("single", 30.0, coauthor="a", first_year=2025),
+                            "editor_id": "E1"},
+              "E1||J1||b": {**node("outside", 10.0, coauthor="b", first_year=2026),
+                            "editor_id": "E1"},
+              "E2||J1||c": {**node("single", 5.0, coauthor="c", first_year=2010),
+                            "editor_id": "E2"}}
+    r = infer.reference(corpus(coauthorships=recent), recent_from=2025)
+    check("a co-authorship from recent_from on is recent, one before it or undated is not",
+          infer.period(recent["E1||J1||a"], 2025) == "recent"
+          and infer.period(recent["E2||J1||c"], 2025) == "earlier"
+          and infer.period(node("single", 1.0), 2025) == "earlier"
+          and infer.period(recent["E1||J1||a"], None) is None)
+
+    new, level_new = infer.genuine_dist(r, "J1", "established", [], when="recent")
+    old, level_old = infer.genuine_dist(r, "J1", "established", [], when="earlier")
+    check(f"a recent co-authorship is judged against the journal's recent ones "
+          f"(got {level_new}, single={new['single']:.3f})",
+          level_new == "journal:recent" and approx(new["single"], 30.5 / 41.5))
+    check(f"an earlier one against the rest of the journal "
+          f"(got {level_old}, single={old['single']:.3f})",
+          level_old == "journal:earlier" and approx(old["single"], 70.5 / 481.5))
+    _, level = infer.genuine_dist(r, "J1", "established", [recent["E1||J1||a"]],
+                                  when="recent")
+    check(f"with the editor's own recent load left out, too little is recent and the "
+          f"whole journal is used (got {level})", level == "journal")
+
+    one_new = [{**node("single", 1.0), "first_year": 2025}]
+    one_old = [{**node("single", 1.0), "first_year": 2010}]
+    check("a recent one-off counts less against the editor than an earlier one",
+          posterior(one_new, r=r) > posterior(one_old, r=r))
+    off = infer.reference(corpus(coauthorships=recent), recent_from=None)
+    check("without a split, the year does not matter",
+          approx(posterior(one_new, r=off), posterior(one_old, r=off), 1e-12))
+
+
 # --- ranking, gates and output ------------------------------------------------
 
 def test_ranking():
@@ -482,6 +526,7 @@ def main():
     test_baseline_fallback()
     test_publishers_kept_apart()
     test_career_stage_is_not_a_parent()
+    test_recent_period()
     test_ranking()
     test_records()
     test_inout_gate()

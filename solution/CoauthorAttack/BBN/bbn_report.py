@@ -6,8 +6,9 @@ journals of the shortlist, co-author career stage, the within-editor board-term
 control, the head of the ranking, and the personal one-off baseline (coverage,
 the spread of the typical habit, co-authors without a one-off, and a calibration table).
 Sweeps: alpha, the prior, m(s), the personal adjustment (off, and its boundary
-N_min), R_min and the `outside` reading, the entry conditions (gate and minimum
-record), and the network against a count.
+N_min), R_min and the `outside` reading, the co-author's record boundary, the split
+into recent and earlier co-authorships (and leaving recent ones out instead), the
+entry conditions (gate and minimum record), and the network against a count.
 
     python bbn_report.py [--in bbn/bbn_cs2_corpus.json]
 """
@@ -18,14 +19,14 @@ import math
 import statistics
 from collections import Counter, defaultdict
 
-from bbn_extract import baseline_counts, classify
+from bbn_extract import baseline_counts, classify, index_by_editor
 from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
                        passes_inout_gate, qualifies, rank_corpus, reference,
                        score_editor, smooth, state_shares, typical_habit)
-from cs2_config import (ALPHA, ALPHA_SWEEP, FALLBACK_MIN_N, HEAD_P_LEVELS, INOUT_GATE,
-                        MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES, MIN_RECORD_SWEEP,
-                        OUTSIDE_READINGS, PERSONAL_SINGLE_CAP, POOL_MIN_SWEEP, PRIOR,
-                        PRIOR_SWEEP, REPEATED_SWEEP, HABIT_RATIO_BINS, SHORTLIST_THRESHOLD)
+from cs2_config import (ALPHA, ALPHA_SWEEP, COAUTHOR_MIN_PUBS_SWEEP, FALLBACK_MIN_N,
+                        HEAD_P_LEVELS, INOUT_GATE, MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES,
+                        MIN_RECORD_SWEEP, OUTSIDE_READINGS, POOL_MIN_SWEEP, PRIOR, PRIOR_SWEEP, RECENT_FROM, RECENT_FROM_SWEEP,
+                        REPEATED_SWEEP, HABIT_RATIO_BINS, SHORTLIST_THRESHOLD)
 from dblp_extract import pct
 
 # Console layout only.
@@ -34,6 +35,7 @@ LOWEST_PRINT_CAP = 3        # ungated editors described without names
 JOURNAL_PRINT_CAP = 25
 MIN_SHORTLISTED_PER_JOURNAL = 5
 HEAD_SIZE = 10              # the head of the ranking: #1 and the next nine
+YEARS_PRINT_FROM = 2018     # first years before this one are printed together
 
 NO_ADJUSTMENT = math.inf    # a boundary no co-author reaches: the plain tie model
 
@@ -314,17 +316,14 @@ def print_calibration_table(details, label):
 
 
 def print_calibration(ungated, ref):
-    """Is the scaling g(single|j) * habit ratio monotone, roughly proportional, and
-    conservative? Observed against predicted, over every scored editor."""
+    """Does g(single|j) with its odds times the habit ratio follow the observed share,
+    and is it conservative? Observed against predicted, over every scored editor."""
     details = adjusted_details(ungated)
-    capped = [d for d in details
-              if d["journal_single_p"] * d["habit_ratio"] > PERSONAL_SINGLE_CAP]
     print("\n=== CALIBRATION OF THE PERSONAL ONE-OFF BASELINE (bins of the habit ratio) ===")
     print("  (obs single = the load share of `single` among the adjusted co-authorships;")
-    print("   g_i(single) = the model's g(single|j) * habit ratio, "
+    print("   g_i(single) = the model's g(single|j) with its odds times the habit ratio, "
           "journal g = g(single|j) unadjusted;")
     print("   both with the editor left out, as scored; the evidence is not genuine-only)")
-    print(f"  the cap {PERSONAL_SINGLE_CAP} binds for {len(capped)} co-authorships")
     print_calibration_table(details, "all publishers")
     for publisher in sorted(set(ref.publisher_of.values())):
         print_calibration_table([d for d in details
@@ -382,6 +381,82 @@ def reclassify_corpus(data, repeated_min, outside_reading="any"):
             "journals": baseline_counts(nodes)}
 
 
+def with_nodes(data, nodes):
+    """A copy of `data` scored on `nodes` alone, with the baselines and the editor
+    index rebuilt."""
+    return {**data, "coauthorships": nodes, "journals": baseline_counts(nodes),
+            "editor_index": dict(index_by_editor(nodes))}
+
+
+def print_record_boundary(data, base_pos, ungated_pos):
+    """The shortlists when co-authors with a shorter record are left out at other
+    boundaries, against the run's (gated and ungated)."""
+    short = {k: n for k, n in data.get("benign_coauthorships", {}).items()
+             if n["benign_reason"] == "short_record"}
+    pool = {**data["coauthorships"], **short}
+    print(f"\n=== CO-AUTHOR RECORD BOUNDARY (the run: at least "
+          f"{data['config'].get('coauthor_min_pubs')} publications) ===")
+    for min_pubs in COAUTHOR_MIN_PUBS_SWEEP:
+        nodes = {k: n for k, n in pool.items() if n["coauthor_pubs"] >= min_pubs}
+        ungated = rank_corpus(with_nodes(data, nodes), inout_gate=False)
+        shares, load = state_shares(list(nodes.values()))
+        report_stability(f">= {min_pubs} publications, gate",
+                         [r for r in ungated if r["passes_inout_gate"]], base_pos,
+                         extra=f"load {load:.0f} single={shares.get('single', 0):.1%}")
+        report_stability(f">= {min_pubs} publications, no gate", ungated, ungated_pos)
+
+
+def print_recency(data, ungated, base_pos, ungated_pos):
+    """The state mix by the year of the first shared publication, where the recent
+    co-authorships find their baseline, and the shortlists at other first years of a
+    recent co-authorship, without the split, and with recent co-authorships left out."""
+    nodes = data["coauthorships"]
+    by_year = defaultdict(list)
+    for n in nodes.values():
+        year = n.get("first_year")
+        by_year["undated" if year is None else
+                f"<{YEARS_PRINT_FROM}" if year < YEARS_PRINT_FROM else str(year)].append(n)
+    states = data["config"]["states"]
+    print(f"\n=== RECENT CO-AUTHORSHIPS (the run: recent from {RECENT_FROM}) ===")
+    print("  the state mix by the year of the first shared publication")
+    print(f"  {'first year':<12}{'load':>9}" + "".join(f"{s:>14}" for s in states))
+    for year in sorted(by_year):
+        shares, load = state_shares(by_year[year])
+        print(f"  {year:<12}{load:>9.1f}"
+              + "".join(f"{shares.get(s, 0.0):>13.1%} " for s in states))
+
+    recent = [d for r in ungated for d in r["detail"]
+              if RECENT_FROM is not None and (d["first_year"] or 0) >= RECENT_FROM]
+    levels = Counter()
+    for d in recent:
+        levels[d["fallback_level"]] += d["load"]
+    total = sum(levels.values())
+    print("  baseline of the recent co-authorships: "
+          + ", ".join(f"{level} {pct(load, total)}" for level, load in levels.most_common()))
+
+    for recent_from in RECENT_FROM_SWEEP:
+        label = f"recent from {recent_from}" if recent_from is not None else "no split"
+        rows = rank_corpus(data, inout_gate=False, recent_from=recent_from)
+        report_stability(f"{label}, gate", [r for r in rows if r["passes_inout_gate"]],
+                         base_pos)
+        report_stability(f"{label}, no gate", rows, ungated_pos)
+    if RECENT_FROM is None:
+        return
+
+    def is_recent(n):
+        return (n.get("first_year") or 0) >= RECENT_FROM
+
+    for label, keep in (("recent `single` left out", lambda n: not (
+                            is_recent(n) and n["state"] == "single")),
+                        ("all recent left out", lambda n: not is_recent(n))):
+        kept = {k: n for k, n in nodes.items() if keep(n)}
+        rows = rank_corpus(with_nodes(data, kept), inout_gate=False, recent_from=None)
+        report_stability(f"{label}, gate", [r for r in rows if r["passes_inout_gate"]],
+                         base_pos, extra=f"ranked {sum(r['passes_inout_gate'] for r in rows)}")
+        report_stability(f"{label}, no gate", rows, ungated_pos,
+                         extra=f"ranked {len(rows)}")
+
+
 def report_stability(label, rows, base_pos, extra=""):
     """One line: how a variant's shortlist compares with the baseline's {editor: rank}."""
     shortlist = [r for r in rows if r["p_genuine"] < SHORTLIST_THRESHOLD]
@@ -389,7 +464,7 @@ def report_stability(label, rows, base_pos, extra=""):
     common = set(base_pos) & set(pos)
     shifts = sorted(abs(base_pos[i] - pos[i]) for i in common)
     median = shifts[len(shifts) // 2] if shifts else 0
-    print(f"  {label:<34} size={len(shortlist):<5} "
+    print(f"  {label:<38} size={len(shortlist):<5} "
           f"in-common={len(common):>4}/{len(base_pos):<4} "
           f"median|Drank|={median:<4} max|Drank|={shifts[-1] if shifts else 0:<4} {extra}")
 
@@ -566,6 +641,8 @@ def main():
     print_calibration(ungated, reference(data))
     print_sweeps(data, rows, shortlist, base_pos)
     print_adjustment_sweep(data, base_pos, ungated_pos)
+    print_record_boundary(data, base_pos, ungated_pos)
+    print_recency(data, ungated, base_pos, ungated_pos)
     print_entry_conditions(ungated, base_pos)
     print_count_ablation(data, ungated)
 
