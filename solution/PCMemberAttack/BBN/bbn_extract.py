@@ -8,7 +8,15 @@ front matter, dblp and OpenCitations tables in the database.
         papers with their reference counts).
     python bbn_extract.py --stage seats
         Writes bbn/seats.csv: one row per pc or senior_pc seat of a matched
-        member, with its citations, the member's expected citations and the citation ratio.
+        member, with its citations, the member's expected citations and the surplus.
+    python bbn_extract.py --stage publications
+        Writes bbn/publications.csv from the dblp dump: the publications of every
+        member in bbn/seats.csv per year.
+    python bbn_extract.py --stage corpus
+        Writes bbn/bbn_cs3_corpus.json from bbn/seats.csv and bbn/publications.csv:
+        the seats per member, each with the member's publications before its year.
+
+The last two need no database.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import csv
+import json
 import logging
 import re
 import statistics
@@ -24,9 +33,9 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from cs3_config import (BBN_DIR, ENV_PATH, GATE_REFERENCES, MIN_OFF_PAPERS, MIN_PC_SHARE,
-                        MIN_PC_SIZE, PC_SIZE_WINDOW, RATE_PSEUDO_COUNT, RATE_WINDOW,
-                        RATIO_PSEUDO_COUNT, ROLES, SCHEMA)
+from cs3_config import (BBN_DIR, DUMP_PATH, ENV_PATH, GATE_REFERENCES, MAX_SPAN,
+                        MIN_OFF_PAPERS, MIN_PC_SHARE, MIN_PC_SIZE, PC_SIZE_WINDOW, PUB_TYPES,
+                        RATE_PSEUDO_COUNT, RATE_WINDOW, ROLES, SCHEMA)
 
 
 def edition(column: str) -> str:
@@ -259,8 +268,9 @@ class OffPower:
     member's own papers among the edition's n. Only complete main editions count.
     """
 
-    def __init__(self, editions, complete, on_power, cites, own, window=RATE_WINDOW):
-        self.editions, self.window = editions, window
+    def __init__(self, editions, complete, on_power, cites, own, window=RATE_WINDOW,
+                 max_span=MAX_SPAN):
+        self.editions, self.window, self.max_span = editions, window, max_span
         self.on_power, self.cites, self.own = on_power, cites, own
         self.by_stream = defaultdict(list)
         for e in complete:
@@ -269,9 +279,9 @@ class OffPower:
 
     def conference(self, pid, stream, year, min_papers=MIN_OFF_PAPERS) -> tuple[int, int, int]:
         """(citations, papers, span) over the stream's off-power editions within `window`
-        years, and beyond that nearest first while they hold fewer than `min_papers`
-        papers. Editions equally far are taken together; span is the distance in years of
-        the furthest one taken."""
+        years, and beyond that nearest first, up to `max_span` years, while they hold fewer
+        than `min_papers` papers. Editions equally far are taken together; span is the
+        distance in years of the furthest one taken."""
         cites, own = self.cites.get(pid, {}), self.own.get(pid, {})
         by_distance = defaultdict(list)
         for e in self.by_stream.get(stream, ()):
@@ -279,7 +289,7 @@ class OffPower:
                 by_distance[abs(self.editions[e]["year"] - year)].append(e)
         k = n = span = 0
         for distance in sorted(by_distance):
-            if distance > self.window and n >= min_papers:
+            if distance > self.max_span or (distance > self.window and n >= min_papers):
                 break
             for e in by_distance[distance]:
                 k += cites.get(e, 0)
@@ -297,16 +307,12 @@ def off_power_rate(levels, min_papers=MIN_OFF_PAPERS, pseudo=RATE_PSEUDO_COUNT):
     return "", 0, 0, None
 
 
-def citation_ratio(x, expected, pseudo=RATIO_PSEUDO_COUNT) -> float:
-    """Observed over expected citations, with `pseudo` of slack."""
-    return (x + pseudo) / (expected + pseudo)
-
-
 def seat_rows(seats, editions, cites, westerbaan, own, off: OffPower,
               min_peers=MIN_PC_SIZE - 1) -> list[dict]:
     """One row per seat. `westerbaan` maps (edition, pid) to the references to the member.
     Without enough off-power papers the rate is that of the other seats of the edition,
-    when there are at least `min_peers`."""
+    when there are at least `min_peers`. E takes the larger of the rate and that of the
+    other seats."""
     rows = []
     for (e, pid), seat in sorted(seats.items()):
         ed = editions[e]
@@ -327,12 +333,16 @@ def seat_rows(seats, editions, cites, westerbaan, own, off: OffPower,
         peers = (k_all - r["x"], n_all - r["n"]) if n_seats - 1 >= min_peers else (0, 0)
         src, k_off, n_off, rate = off_power_rate(
             [("conference", (k_conf, n_conf)), ("peers", peers)])
+        _, k_peers, n_peers, rate_peers = off_power_rate([("peers", peers)])
+        expected = None if rate is None else max(rate, rate_peers or 0) * r["n"]
         r.update({
             "src": src, "span": span if src == "conference" else "",
             "k_off": k_off, "n_off": n_off,
             "rate": "" if rate is None else round(rate, 6),
-            "E": "" if rate is None else round(rate * r["n"], 4),
-            "ratio": "" if rate is None else round(citation_ratio(r["x"], rate * r["n"]), 4),
+            "k_peers": k_peers, "n_peers": n_peers,
+            "rate_peers": "" if rate_peers is None else round(rate_peers, 6),
+            "E": "" if expected is None else round(expected, 4),
+            "surplus": "" if expected is None else round(r["x"] - expected, 4),
         })
     return rows
 
@@ -344,6 +354,100 @@ def gated_members(rows, gate=GATE_REFERENCES) -> dict[str, list[dict]]:
         if int(r["x_westerbaan"]) > gate:
             gated[r["dblp_pid"]].append(r)
     return dict(gated)
+
+
+# ---------------------------------------------------------------------------
+# Publications (dblp dump)
+# ---------------------------------------------------------------------------
+
+REC_PREFIX = "<https://dblp.org/rec/"
+PID_PREFIX = "<https://dblp.org/pid/"
+P_TYPE = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+P_AUTHORED_BY = "<https://dblp.org/rdf/schema#authoredBy>"
+P_YEAR = "<https://dblp.org/rdf/schema#yearOfPublication>"
+PROGRESS_EVERY = 100_000_000   # lines
+
+
+def credit(counts, is_pub, year, authors) -> None:
+    if is_pub and year:
+        for pid in authors:
+            counts[(pid, year)] += 1
+
+
+def publication_counts(lines, wanted, types=PUB_TYPES) -> Counter:
+    """(pid, year) -> the records of one of `types` that pid authored, for the pids in
+    `wanted`. The triples of a record are contiguous in the dump."""
+    types = {f"<https://dblp.org/rdf/schema#{t}>" for t in types}
+    counts = Counter()
+    subject, is_pub, year, authors = None, False, None, set()
+    for line in lines:
+        if not line.startswith(REC_PREFIX):
+            continue
+        s, p, o = line.split(" ", 2)
+        if s != subject:
+            credit(counts, is_pub, year, authors)
+            subject, is_pub, year, authors = s, False, None, set()
+        if p == P_TYPE:
+            is_pub = is_pub or o[:o.find(">") + 1] in types
+        elif p == P_AUTHORED_BY and o.startswith(PID_PREFIX):
+            pid = o[len(PID_PREFIX):o.find(">")]
+            if pid in wanted:
+                authors.add(pid)
+        elif p == P_YEAR:
+            year = int(o[1:5])
+    credit(counts, is_pub, year, authors)
+    return counts
+
+
+def with_progress(lines, every=PROGRESS_EVERY):
+    start = time.time()
+    for i, line in enumerate(lines, 1):
+        if i % every == 0:
+            logging.info(f"{i / 1e6:.0f}M lines, {time.time() - start:.0f}s")
+        yield line
+
+
+def pubs_before(pubs_by_year: dict, year: int) -> int:
+    return sum(n for y, n in pubs_by_year.items() if y < year)
+
+
+# ---------------------------------------------------------------------------
+# The corpus
+# ---------------------------------------------------------------------------
+
+SEAT_INTS = ["year", "x", "x_westerbaan", "n", "k_off", "n_off"]
+SEAT_FLOATS = ["rate", "E"]
+
+
+def build_corpus(rows, pubs=None) -> dict:
+    """The seats of seats.csv per member. Seats without a rate or with n = 0 are left out
+    of the evidence; the member's largest x_westerbaan is over all their seats. `pubs`
+    maps pid -> year -> dblp publications; a seat gets those before its year."""
+    pubs = pubs or {}
+    members, dropped = {}, Counter()
+    n_seats = 0
+    for r in rows:
+        n_seats += 1
+        m = members.setdefault(r["dblp_pid"], {"name": "", "x_westerbaan_max": 0, "seats": []})
+        m["name"] = m["name"] or r["name"]
+        m["x_westerbaan_max"] = max(m["x_westerbaan_max"], int(r["x_westerbaan"]))
+        if r["rate"] == "":
+            dropped["rate"] += 1
+            continue
+        if int(r["n"]) == 0:
+            dropped["n"] += 1
+            continue
+        seat = {k: r[k] for k in ("edition_key", "stream", "core_rank", "role", "src")}
+        seat.update({k: int(r[k]) for k in SEAT_INTS})
+        seat.update({k: float(r[k]) for k in SEAT_FLOATS})
+        seat["pubs"] = pubs_before(pubs.get(r["dblp_pid"], {}), seat["year"])
+        m["seats"].append(seat)
+    kept = {pid: m for pid, m in members.items() if m["seats"]}
+    funnel = {"seats": n_seats, "seats without a rate": dropped["rate"],
+              "seats with n = 0": dropped["n"],
+              "seats kept": sum(len(m["seats"]) for m in kept.values()),
+              "members": len(members), "members with a seat kept": len(kept)}
+    return {"model": "cs3-seat-surplus", "funnel": funnel, "members": kept}
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +497,10 @@ def print_seats_summary(rows, editions, pc_size, complete, n_unknown) -> None:
     print(f"  seats with n = 0                     {n_zero:>7}  ({pct(n_zero, len(rows))})")
     for src, label in (("conference", "same stream"), ("peers", "PC peers"), ("", "none")):
         print(f"  rate from {label:<27}{by_src[src]:>7}  ({pct(by_src[src], len(rows))})")
+    n_floor = sum(1 for r in rows if r["src"] == "conference" and r["rate_peers"] != ""
+                  and r["rate_peers"] > r["rate"])
+    print(f"  ...same stream, E from the PC peers  {n_floor:>7}  "
+          f"({pct(n_floor, by_src['conference'])})")
     spans = Counter(min(r["span"], 10) for r in rows if r["src"] == "conference")
     print("  same stream, furthest edition taken:  "
           + "  ".join(f"{s if s < 10 else '10+'}y {pct(c, by_src['conference']).strip()}"
@@ -430,18 +538,63 @@ def stage_seats(db, out_dir: Path) -> None:
     print_seats_summary(rows, editions, pc_size, complete, len(unknown))
 
 
+def read_rows(path: Path, stage: str) -> list[dict]:
+    if not path.exists():
+        sys.exit(f"Run bbn_extract.py --stage {stage} first; {path} not found.")
+    with open(path, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def stage_publications(out_dir: Path, dump: Path) -> None:
+    wanted = {r["dblp_pid"] for r in read_rows(out_dir / "seats.csv", "seats")}
+    if not dump.exists():
+        sys.exit(f"No dblp dump at {dump.resolve()}; pass --dump.")
+    start = time.time()
+    with open(dump, encoding="utf-8", errors="replace", buffering=1 << 22) as f:
+        counts = publication_counts(with_progress(f), wanted)
+    logging.info(f"dump read in {time.time() - start:.0f}s")
+    write_csv(out_dir / "publications.csv",
+              [{"dblp_pid": pid, "year": year, "n_pubs": n}
+               for (pid, year), n in sorted(counts.items())])
+    print(f"  {len({pid for pid, _ in counts})} of {len(wanted)} members have a publication "
+          f"of type {', '.join(PUB_TYPES)}")
+
+
+def stage_corpus(out_dir: Path) -> None:
+    pubs = defaultdict(dict)
+    for r in read_rows(out_dir / "publications.csv", "publications"):
+        pubs[r["dblp_pid"]][int(r["year"])] = int(r["n_pubs"])
+    corpus = build_corpus(read_rows(out_dir / "seats.csv", "seats"), pubs)
+    path = out_dir / "bbn_cs3_corpus.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(corpus, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"  wrote {path}")
+    print("\n=== CORPUS ===")
+    for label, count in corpus["funnel"].items():
+        print(f"  {label:<36}{count:>7}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the CS3 PC member citation BBN corpus.")
-    parser.add_argument("--stage", required=True, choices=["citations", "seats"])
+    parser.add_argument("--stage", required=True,
+                        choices=["citations", "seats", "publications", "corpus"])
     parser.add_argument("--out-dir", default=str(BBN_DIR), help="where the BBN files go")
     parser.add_argument("--env", default=None,
                         help=f"path to the .env with the POSTGRES_* values (default: {ENV_PATH})")
+    parser.add_argument("--dump", default=None,
+                        help=f"path to the unzipped dblp .nt (default: {DUMP_PATH})")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(levelname)s - %(message)s")
 
+    if args.stage == "publications":
+        stage_publications(Path(args.out_dir), Path(args.dump) if args.dump else DUMP_PATH)
+        return
+    if args.stage == "corpus":
+        stage_corpus(Path(args.out_dir))
+        return
     db = connect(Path(args.env) if args.env else ENV_PATH)
     if args.stage == "citations":
         stage_citations(db)

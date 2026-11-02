@@ -1,5 +1,5 @@
 """
-Tests for bbn_extract.py: the seat and off-power functions on hand-checked cases.
+Tests for bbn_extract.py: the seat, off-power and corpus functions on hand-checked cases.
 No DB; the file readers get a tempfile.
 
     python test_bbn_extract.py
@@ -161,6 +161,9 @@ def test_off_power_conference():
           off.conference("q", "A", 2011, min_papers=10) == (0, 30, 0))
     check("a member on every edition of the stream has no off-power papers",
           off.conference("r", "A", 2012) == (0, 0, 0))
+    off = extract.OffPower(EDITIONS, COMPLETE, ON_POWER, CITES, OWN, window=2, max_span=3)
+    check("never further out than max_span, also with too few papers",
+          off.conference("p", "A", 2012, min_papers=30) == (2, 19, 2))
 
 
 def test_off_power_rate():
@@ -180,16 +183,6 @@ def test_off_power_rate():
           == ("", 0, 0, None))
 
 
-def test_citation_ratio():
-    print("\n-- citation ratio --")
-    check("as expected is 1", approx(extract.citation_ratio(3, 3.0), 1.0))
-    check("one citation where 0.2 are expected is not much", approx(extract.citation_ratio(1, 0.2), 2 / 1.2))
-    check("the same ratio weighs more with more citations",
-          extract.citation_ratio(20, 4.0) > extract.citation_ratio(5, 1.0))
-    check("no citations stays below 1", extract.citation_ratio(0, 0.5) < 1)
-    check("the slack is a parameter", approx(extract.citation_ratio(1, 0.2, pseudo=0), 5.0))
-
-
 def test_seat_rows():
     print("\n-- seat rows --")
     seats = {("A/2012", "p"): {"role": "pc", "name": "Pat Quinn"},
@@ -207,7 +200,13 @@ def test_seat_rows():
     check("the rate comes from the same stream, four years out, and E = rate * n",
           (p["src"], p["span"], p["k_off"], p["n_off"]) == ("conference", 4, 6, 59)
           and approx(p["E"], round(6.5 / 59 * 24, 4)))
-    check("ratio = (x + 1) / (E + 1)", approx(p["ratio"], round(7 / (6.5 / 59 * 24 + 1), 4)))
+    check("surplus = x - E", approx(p["surplus"], round(6 - 6.5 / 59 * 24, 4)))
+    check("the other seats, with a lower rate, leave E alone",
+          (p["k_peers"], p["n_peers"]) == (0, 50) and p["rate_peers"] < p["rate"])
+    s = rows(2)[("A/2012", "s")]
+    check("with a higher rate of the other seats, E is theirs",
+          s["src"] == "conference" and approx(s["E"], round(6.5 / 49 * 25, 4))
+          and approx(s["surplus"], -s["E"]))
     q = rows(2)[("A/2010", "q")]
     check("a member nobody cites has x = 0 and x_westerbaan = 0",
           (q["x"], q["x_westerbaan"]) == (0, 0))
@@ -217,8 +216,8 @@ def test_seat_rows():
           (r["src"], r["span"], r["k_off"], r["n_off"]) == ("peers", "", 6 + 0, 24 + 25)
           and approx(r["E"], round(6.5 / 49 * 25, 4)))
     no_rate = rows(3)[("A/2012", "r")]
-    check("...but not with fewer peers than min_peers, and then no ratio either",
-          no_rate["E"] == "" and no_rate["ratio"] == "")
+    check("...but not with fewer peers than min_peers, and then no surplus either",
+          no_rate["E"] == "" and no_rate["surplus"] == "")
 
 
 def test_gate():
@@ -228,6 +227,71 @@ def test_gate():
     gated = extract.gated_members(rows, gate=10)
     check("more than 10 references passes, 10 does not", set(gated) == {"a"})
     check("only the seats over the gate are kept", len(gated["a"]) == 1)
+
+
+def test_build_corpus():
+    print("\n-- the corpus --")
+    path = tempfile_with(
+        "edition_key,stream,year,core_rank,dblp_pid,name,role,x,x_westerbaan,n,src,span,"
+        "k_off,n_off,rate,k_peers,n_peers,rate_peers,E,surplus\n"
+        "A/2010,A,2010,B,p,Pat Quinn,pc,3,4,20,conference,1,2,40,0.0625,0,0,,1.25,1.75\n"
+        "A/2011,A,2011,B,p,Pat Quinn,pc,0,15,0,conference,1,2,40,0.0625,0,0,,0.0,0.0\n"
+        "A/2012,A,2012,B,p,,senior_pc,0,0,30,,,0,0,,0,0,,,\n"
+        "B/2011,B,2011,A,q,Q,pc,0,12,30,,,0,0,,0,0,,,\n")
+    with open(path, encoding="utf-8", newline="") as f:
+        corpus = extract.build_corpus(csv.DictReader(f), {"p": {2008: 3, 2009: 4, 2010: 5}})
+    p = corpus["members"]["p"]
+    check("a seat carries the member's publications before its year", p["seats"][0]["pubs"] == 7)
+    check("seats without a rate and with n = 0 are left out", len(p["seats"]) == 1)
+    check("the gate count is over all seats", p["x_westerbaan_max"] == 15)
+    check("the name is the first one given", p["name"] == "Pat Quinn")
+    s = p["seats"][0]
+    check("counts are ints and E a float",
+          (s["x"], s["n"], s["year"], s["E"]) == (3, 20, 2010, 1.25) and isinstance(s["E"], float))
+    check("a member without a kept seat is left out", "q" not in corpus["members"])
+    check("the funnel counts every step",
+          corpus["funnel"] == {"seats": 4, "seats without a rate": 2, "seats with n = 0": 1,
+                               "seats kept": 1, "members": 2,
+                               "members with a seat kept": 1})
+
+
+# --- publications --------------------------------------------------------------
+
+def triple(s, p, o):
+    return f"<https://dblp.org/rec/{s}> {p} {o} .\n"
+
+
+def record(key, rdf_type, year, *pids):
+    lines = [triple(key, extract.P_TYPE, f"<https://dblp.org/rdf/schema#{rdf_type}>"),
+             triple(key, extract.P_TYPE, "<https://dblp.org/rdf/schema#Publication>")]
+    lines += [triple(key, extract.P_AUTHORED_BY, f"<https://dblp.org/pid/{p}>") for p in pids]
+    lines.append("_:Sig_1 <https://dblp.org/rdf/schema#signatureCreator> "
+                 f"<https://dblp.org/pid/{pids[0]}> .\n")
+    if year:
+        lines.append(triple(key, extract.P_YEAR,
+                            f'"{year}"^^<http://www.w3.org/2001/XMLSchema#gYear>'))
+    return lines + ["\n"]
+
+
+def test_publication_counts():
+    print("\n-- publications --")
+    lines = (record("conf/a/P1", "Inproceedings", 2010, "11/1", "n/GonzaloNavarro", "99/9")
+             + record("journals/b/P2", "Article", 2010, "11/1")
+             + record("journals/corr/P3", "Informal", 2010, "11/1")
+             + record("reference/x/P4", "Reference", 2011, "11/1")
+             + record("conf/a/P5", "Inproceedings", 2012, "11/1")
+             + record("conf/a/P6", "Inproceedings", None, "11/1")
+             + ["<https://dblp.org/pid/11/1> <https://dblp.org/rdf/schema#creatorOf> "
+                "<https://dblp.org/rec/conf/a/P1> .\n"])
+    counts = extract.publication_counts(lines, {"11/1", "n/GonzaloNavarro"},
+                                        types=["Article", "Inproceedings"])
+    check("one count per record per author and year",
+          counts[("11/1", 2010)] == 2 and counts[("n/GonzaloNavarro", 2010)] == 1)
+    check("informal and reference records do not count", ("11/1", 2011) not in counts)
+    check("the last record counts too", counts[("11/1", 2012)] == 1)
+    check("a record without a year does not count", sum(counts.values()) == 4)
+    check("only the wanted pids are counted", all(pid != "99/9" for pid, _ in counts))
+    check("publications before the year only", extract.pubs_before({2009: 2, 2010: 3}, 2010) == 2)
 
 
 # --- files ---------------------------------------------------------------------
@@ -254,9 +318,10 @@ def main():
     test_scored_seats()
     test_off_power_conference()
     test_off_power_rate()
-    test_citation_ratio()
     test_seat_rows()
     test_gate()
+    test_build_corpus()
+    test_publication_counts()
     test_files()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")
     raise SystemExit(1 if _failures else 0)
