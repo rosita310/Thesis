@@ -1,5 +1,6 @@
 """
-Tests for bbn_extract.py: the seat, off-power and corpus functions on hand-checked cases.
+Tests for bbn_extract.py: the well-known, seat, off-power and corpus functions on
+hand-checked cases.
 No DB; the file readers get a tempfile.
 
     python test_bbn_extract.py
@@ -40,8 +41,8 @@ def member(edition, role, pid=None, name_key="", dblp_name=None):
             "name_key": name_key, "dblp_name": dblp_name}
 
 
-def edition(stream, year, n, core_rank="B"):
-    return {"stream": stream, "year": year, "n": n, "core_rank": core_rank}
+def edition(stream, year, papers, core_rank="B"):
+    return {"stream": stream, "year": year, "papers": papers, "core_rank": core_rank}
 
 
 # Stream A has editions 2010-2013 and 2016, stream B one in 2011. A/2013 has an
@@ -56,6 +57,8 @@ ON_POWER = {"p": {"A/2011", "A/2012"},
             "r": {"A/2010", "A/2011", "A/2012", "A/2013", "A/2016"}}
 CITES = {"p": {"A/2010": 2, "A/2011": 5, "A/2012": 6, "A/2013": 3, "A/2016": 4,
                "B/2011": 1}}
+CITING = {"p": {"A/2010": 1, "A/2011": 3, "A/2012": 3, "A/2013": 2, "A/2016": 2,
+                "B/2011": 1}}
 OWN = {"p": {"A/2010": 1, "A/2012": 1, "B/2011": 2}}
 
 
@@ -148,7 +151,7 @@ def test_off_power_conference():
     off = off_power()
     check("A/2010 is off-power for p in 2012, A/2011-A/2013 are on-power or incomplete",
           off.conference("p", "A", 2012, min_papers=10) == (2, 19, 2))
-    check("the member's own papers are left out of n",
+    check("the member's own papers are left out of the papers",
           off.conference("p", "A", 2012, min_papers=10)[1] == 20 - 1)
     check("too few papers within the window reaches further out, to A/2016",
           off.conference("p", "A", 2012, min_papers=30) == (2 + 4, 19 + 40, 4))
@@ -164,14 +167,16 @@ def test_off_power_conference():
     off = extract.OffPower(EDITIONS, COMPLETE, ON_POWER, CITES, OWN, window=2, max_span=3)
     check("never further out than max_span, also with too few papers",
           off.conference("p", "A", 2012, min_papers=30) == (2, 19, 2))
+    check("another count sums over the same editions",
+          off_power().conference("p", "A", 2012, min_papers=30, counts=CITING) == (1 + 2, 59, 4))
 
 
 def test_off_power_rate():
     print("\n-- choosing the rate --")
     levels = [("conference", (2, 19)), ("peers", (3, 117))]
-    src, k, n, rate = extract.off_power_rate(levels, min_papers=30, pseudo=0.5)
+    src, cites, papers, rate = extract.off_power_rate(levels, min_papers=30, pseudo=0.5)
     check("too few off-power papers falls back to the peers",
-          (src, k, n) == ("peers", 3, 117))
+          (src, cites, papers) == ("peers", 3, 117))
     check("the rate carries the pseudo-count", approx(rate, 3.5 / 117))
     src, _, _, rate = extract.off_power_rate(levels, min_papers=10, pseudo=0.5)
     check("enough off-power papers keeps the same stream",
@@ -192,38 +197,45 @@ def test_seat_rows():
 
     def rows(min_peers):
         return {(r["edition_key"], r["dblp_pid"]): r for r in extract.seat_rows(
-            seats, EDITIONS, CITES, {("A/2012", "p"): 9}, OWN, off_power(), min_peers)}
+            seats, EDITIONS, CITES, CITING, {("A/2012", "p"): 9}, OWN, off_power(), min_peers)}
 
     p = rows(2)[("A/2012", "p")]
-    check("x and x_westerbaan come from the citations", (p["x"], p["x_westerbaan"]) == (6, 9))
-    check("n leaves out the member's own papers", p["n"] == 25 - 1)
-    check("the rate comes from the same stream, four years out, and E = rate * n",
-          (p["src"], p["span"], p["k_off"], p["n_off"]) == ("conference", 4, 6, 59)
-          and approx(p["E"], round(6.5 / 59 * 24, 4)))
-    check("surplus = x - E", approx(p["surplus"], round(6 - 6.5 / 59 * 24, 4)))
-    check("the other seats, with a lower rate, leave E alone",
-          (p["k_peers"], p["n_peers"]) == (0, 50) and p["rate_peers"] < p["rate"])
+    check("cites and cites_gate come from the citations",
+          (p["cites"], p["cites_gate"]) == (6, 9))
+    check("papers leaves out the member's own papers", p["papers"] == 25 - 1)
+    check("the rate comes from the same stream, four years out, and expected = rate * papers",
+          (p["src"], p["span"], p["off_cites"], p["off_papers"]) == ("conference", 4, 6, 59)
+          and approx(p["expected"], round(6.5 / 59 * 24, 4)))
+    check("surplus = cites - expected", approx(p["surplus"], round(6 - 6.5 / 59 * 24, 4)))
+    check("the citing papers are expected from the same editions",
+          p["citing"] == 3 and approx(p["expected_citing"], round(3.5 / 59 * 24, 4)))
+    check("depth = (cites / citing) / (expected / expected_citing)",
+          approx(p["depth"], round((6 / 3) / (6.5 / 3.5), 4)))
+    check("the other seats, with a lower rate, leave expected alone",
+          (p["peer_cites"], p["peer_papers"]) == (0, 50) and p["peer_rate"] < p["rate"])
     s = rows(2)[("A/2012", "s")]
-    check("with a higher rate of the other seats, E is theirs",
-          s["src"] == "conference" and approx(s["E"], round(6.5 / 49 * 25, 4))
-          and approx(s["surplus"], -s["E"]))
+    check("with a higher rate of the other seats, expected is theirs",
+          s["src"] == "conference" and approx(s["expected"], round(6.5 / 49 * 25, 4))
+          and approx(s["surplus"], -s["expected"]))
+    check("...and so are the expected citing papers, while without a citing paper there is "
+          "no depth", approx(s["expected_citing"], round(3.5 / 49 * 25, 4)) and s["depth"] == "")
     q = rows(2)[("A/2010", "q")]
-    check("a member nobody cites has x = 0 and x_westerbaan = 0",
-          (q["x"], q["x_westerbaan"]) == (0, 0))
-    check("...and still a rate", q["rate"] != "" and q["E"] != "")
+    check("a member nobody cites has cites = 0 and cites_gate = 0",
+          (q["cites"], q["cites_gate"]) == (0, 0))
+    check("...and still a rate", q["rate"] != "" and q["expected"] != "")
     r = rows(2)[("A/2012", "r")]
     check("a member on every edition of the stream falls back to the other seats, p and s",
-          (r["src"], r["span"], r["k_off"], r["n_off"]) == ("peers", "", 6 + 0, 24 + 25)
-          and approx(r["E"], round(6.5 / 49 * 25, 4)))
+          (r["src"], r["span"], r["off_cites"], r["off_papers"]) == ("peers", "", 6 + 0, 24 + 25)
+          and approx(r["expected"], round(6.5 / 49 * 25, 4)))
     no_rate = rows(3)[("A/2012", "r")]
     check("...but not with fewer peers than min_peers, and then no surplus either",
-          no_rate["E"] == "" and no_rate["surplus"] == "")
+          no_rate["expected"] == "" and no_rate["surplus"] == "")
 
 
 def test_gate():
     print("\n-- the gate --")
-    rows = [{"dblp_pid": "a", "x_westerbaan": "11"}, {"dblp_pid": "a", "x_westerbaan": 3},
-            {"dblp_pid": "b", "x_westerbaan": 10}]
+    rows = [{"dblp_pid": "a", "cites_gate": "11"}, {"dblp_pid": "a", "cites_gate": 3},
+            {"dblp_pid": "b", "cites_gate": 10}]
     gated = extract.gated_members(rows, gate=10)
     check("more than 10 references passes, 10 does not", set(gated) == {"a"})
     check("only the seats over the gate are kept", len(gated["a"]) == 1)
@@ -232,25 +244,27 @@ def test_gate():
 def test_build_corpus():
     print("\n-- the corpus --")
     path = tempfile_with(
-        "edition_key,stream,year,core_rank,dblp_pid,name,role,x,x_westerbaan,n,src,span,"
-        "k_off,n_off,rate,k_peers,n_peers,rate_peers,E,surplus\n"
-        "A/2010,A,2010,B,p,Pat Quinn,pc,3,4,20,conference,1,2,40,0.0625,0,0,,1.25,1.75\n"
-        "A/2011,A,2011,B,p,Pat Quinn,pc,0,15,0,conference,1,2,40,0.0625,0,0,,0.0,0.0\n"
-        "A/2012,A,2012,B,p,,senior_pc,0,0,30,,,0,0,,0,0,,,\n"
-        "B/2011,B,2011,A,q,Q,pc,0,12,30,,,0,0,,0,0,,,\n")
+        "edition_key,stream,year,core_rank,dblp_pid,name,role,cites,citing,cites_gate,papers,"
+        "src,span,off_cites,off_papers,rate,peer_cites,peer_papers,peer_rate,expected,surplus,"
+        "expected_citing,depth\n"
+        "A/2010,A,2010,B,p,Pat Quinn,pc,3,2,4,20,conference,1,2,40,0.0625,0,0,,1.25,1.75,1.0,1.2\n"
+        "A/2011,A,2011,B,p,Pat Quinn,pc,0,0,15,0,conference,1,2,40,0.0625,0,0,,0.0,0.0,0.0,\n"
+        "A/2012,A,2012,B,p,,senior_pc,0,0,0,30,,,0,0,,0,0,,,,,\n"
+        "B/2011,B,2011,A,q,Q,pc,0,0,12,30,,,0,0,,0,0,,,,,\n")
     with open(path, encoding="utf-8", newline="") as f:
         corpus = extract.build_corpus(csv.DictReader(f), {"p": {2008: 3, 2009: 4, 2010: 5}})
     p = corpus["members"]["p"]
     check("a seat carries the member's publications before its year", p["seats"][0]["pubs"] == 7)
-    check("seats without a rate and with n = 0 are left out", len(p["seats"]) == 1)
-    check("the gate count is over all seats", p["x_westerbaan_max"] == 15)
+    check("seats without a rate and without papers are left out", len(p["seats"]) == 1)
+    check("the gate count is over all seats", p["cites_gate_max"] == 15)
     check("the name is the first one given", p["name"] == "Pat Quinn")
     s = p["seats"][0]
-    check("counts are ints and E a float",
-          (s["x"], s["n"], s["year"], s["E"]) == (3, 20, 2010, 1.25) and isinstance(s["E"], float))
+    check("counts are ints and the expected counts floats",
+          (s["cites"], s["citing"], s["papers"], s["year"], s["expected"], s["expected_citing"])
+          == (3, 2, 20, 2010, 1.25, 1.0) and isinstance(s["expected_citing"], float))
     check("a member without a kept seat is left out", "q" not in corpus["members"])
     check("the funnel counts every step",
-          corpus["funnel"] == {"seats": 4, "seats without a rate": 2, "seats with n = 0": 1,
+          corpus["funnel"] == {"seats": 4, "seats without a rate": 2, "seats without papers": 1,
                                "seats kept": 1, "members": 2,
                                "members with a seat kept": 1})
 
@@ -294,6 +308,66 @@ def test_publication_counts():
     check("publications before the year only", extract.pubs_before({2009: 2, 2010: 3}, 2010) == 2)
 
 
+# --- well-known works ----------------------------------------------------------
+
+def test_index_citations():
+    print("\n-- citations in the OpenCitations Index --")
+    lines = ["oci,citing,cited,creation,timespan,journal_sc,author_sc\n",
+             "1-2,omid:br/1,omid:br/9,2010-05-01,P1Y,no,no\n",
+             "1-3,omid:br/2,omid:br/9,2010,P1Y,yes,no\n",
+             "1-4,omid:br/3,omid:br/9,2012,P3Y,no,yes\n",
+             "1-5,omid:br/3,omid:br/8,,,no,no\n",
+             "1-6,omid:br/3,omid:br/7,2011,P2Y,no,no\n"]
+    counts = extract.index_citations(lines, {"br/9": 0, "br/8": 1})
+    check("one count per citation to a wanted work, by the year of the citing work",
+          counts == {(0, 2010): 2})
+    check("a citation by an author of the cited work does not count", (0, 2012) not in counts)
+
+    totals = extract.CitationCounts(2, 2010, 2012)
+    totals.add({(0, 2005): 1, (0, 2010): 2, (0, 2012): 1, (1, 2011): 3, (1, 2015): 9})
+    totals.accumulate()
+    check("citations up to and including the year",
+          (totals.up_to(0, 2010), totals.up_to(0, 2012)) == (3, 4))
+    check("citations after the last year do not count",
+          (totals.up_to(1, 2010), totals.up_to(1, 2012)) == (0, 3))
+
+    path = Path(tempfile.mkdtemp()) / "index_counts.pkl"
+    extract.save_counts(path, ["br/8", "br/9"], totals)
+    loaded = extract.load_counts(path, ["br/8", "br/9"], 2010, 2012)
+    check("saved counts read back", loaded is not None and loaded.totals == totals.totals
+          and loaded.up_to(1, 2012) == 3)
+    check("saved counts of other works or years are not used",
+          extract.load_counts(path, ["br/8", "br/7"], 2010, 2012) is None
+          and extract.load_counts(path, ["br/8", "br/9"], 2010, 2013) is None
+          and extract.load_counts(path.with_name("none.pkl"), ["br/8"], 2010, 2012) is None)
+
+
+def test_well_known_works():
+    print("\n-- well-known works --")
+    check("the threshold is the fewest citations in the top share",
+          (extract.top_threshold(list(range(1, 101)), 0.01),
+           extract.top_threshold([3, 1, 4, 2], 0.5), extract.top_threshold([5], 0.01))
+          == (100, 3, 5))
+    editions = {"S/2010": edition("S", 2010, 1), "S/2012": edition("S", 2012, 1),
+                "T/2012": edition("T", 2012, 1)}
+    counts = extract.CitationCounts(11, 2010, 2012)
+    counts.add({**{(work, 2010): work + 1 for work in range(10)}, (10, 2012): 50})
+    counts.accumulate()
+    cited = ([("S/2010", work) for work in range(10)]
+             + [("S/2010", 10), ("S/2012", 8), ("S/2012", 9), ("T/2012", 0), ("T/2012", 1)])
+    known = extract.well_known_works(cited, editions, counts, top=0.1, min_works=5)
+    check("the top of the works the stream cites is well known",
+          ("S/2010", 9) in known and ("S/2010", 8) not in known)
+    check("a work without citations by then never is", ("S/2010", 10) not in known)
+    check("the threshold is that of the edition's year",
+          ("S/2012", 9) in known and ("S/2012", 8) not in known)
+    check("a stream with too few cited works takes the works of all streams",
+          not {("T/2012", 0), ("T/2012", 1)} & known)
+    check("...which a lower min_works does not",
+          ("T/2012", 1) in extract.well_known_works(cited, editions, counts, top=0.1,
+                                                    min_works=2))
+
+
 # --- files ---------------------------------------------------------------------
 
 def test_files():
@@ -322,6 +396,8 @@ def main():
     test_gate()
     test_build_corpus()
     test_publication_counts()
+    test_index_citations()
+    test_well_known_works()
     test_files()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")
     raise SystemExit(1 if _failures else 0)

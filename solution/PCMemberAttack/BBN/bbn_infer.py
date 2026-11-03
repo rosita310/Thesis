@@ -4,8 +4,9 @@ and writes, beside the corpus, bbn_cs3_ranking.csv (the members who pass the
 gate), bbn_cs3_ranking_ungated.csv (every scored member) and bbn_cs3_scored.json
 (every scored member with the per-seat evidence).
 
-Every seat adds log LR of its surplus bin to the member's log-odds. The network
-is G -> bin <- src, band (both observed).
+Every seat adds log LR of its state, the bin of its surplus and whether it is deep,
+to the member's log-odds. The network is genuine -> state <- src, band (both
+observed).
 
     python bbn_infer.py [--in bbn/bbn_cs3_corpus.json]
 """
@@ -20,11 +21,12 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from cs3_config import (ALPHA, BBN_DIR, FALLBACK_MIN_N, GATE_REFERENCES, MANIP_DIST,
-                        MIN_SEATS, PRIOR, PROM_BANDS, PSEUDO_COUNT, PUBS_BANDS,
-                        SHORTLIST_THRESHOLD, STATES, SURPLUS_EDGES, WATCH_PIDS)
+from cs3_config import (ALPHA, BBN_DIR, DEPTH_EDGE, FALLBACK_MIN_N, GATE_REFERENCES,
+                        MANIP_DEEP, MANIP_DIST, MIN_SEATS, PRIOR, PROM_BANDS, PSEUDO_COUNT,
+                        PUBS_BANDS, SHORTLIST_THRESHOLD, STATES, SURPLUS_EDGES, WATCH_PIDS)
 
 DEFAULT_IN = BBN_DIR / "bbn_cs3_corpus.json"
+DEEP = " deep"
 
 # Console layout only.
 SHORTLIST_PRINT_CAP = 40    # the CSV always holds every member
@@ -42,11 +44,44 @@ def load_corpus(in_path):
 
 
 # ---------------------------------------------------------------------------
-# The evidence of a seat: the bin of its surplus, and its band
+# The evidence of a seat: the bin of its surplus, its depth, and its band
 # ---------------------------------------------------------------------------
+
+def evidence_states(states=STATES) -> list[str]:
+    """The first bin, then every other bin and its deep variant."""
+    return [states[0]] + [state + suffix for state in states[1:] for suffix in ("", DEEP)]
+
+
+EVIDENCE_STATES = evidence_states()
+
+
+def manip_dist(manip=MANIP_DIST, deep=MANIP_DEEP, states=STATES) -> dict:
+    """`manip` over the bins spread over the evidence states: a share `deep` of every bin
+    after the first is deep."""
+    dist = {states[0]: manip[states[0]]}
+    for state in states[1:]:
+        dist[state], dist[state + DEEP] = manip[state] * (1 - deep), manip[state] * deep
+    return dist
+
 
 def surplus_bin(surplus, edges=SURPLUS_EDGES, states=STATES) -> str:
     return states[bisect_right(edges, surplus)]
+
+
+def seat_depth(seat):
+    """Citations per citing paper over the expected citations per citing paper; None
+    without a citing paper."""
+    if not seat["citing"]:
+        return None
+    return (seat["cites"] / seat["citing"]) / (seat["expected"] / seat["expected_citing"])
+
+
+def seat_state(surplus, depth, edges=SURPLUS_EDGES, depth_edge=DEPTH_EDGE,
+               states=STATES) -> str:
+    """The bin of the surplus, deep after the first bin when depth >= depth_edge."""
+    state = surplus_bin(surplus, edges, states)
+    deep = state != states[0] and depth is not None and depth >= depth_edge
+    return state + DEEP if deep else state
 
 
 def band_label(value, bands) -> str:
@@ -60,20 +95,23 @@ def band_label(value, bands) -> str:
 
 
 def seat_band(seat, bands=PROM_BANDS, pubs_bands=PUBS_BANDS) -> str:
-    """prom, the band of E; with the peer rate, the band of the member's publications."""
+    """prom, the band of the expected citations; with the peer rate, the band of the
+    member's publications."""
     if seat["src"] == "peers":
         return "pubs " + band_label(seat["pubs"], pubs_bands)
-    return "E " + band_label(seat["E"], bands)
+    return "expected " + band_label(seat["expected"], bands)
 
 
-def classify(seat, edges=SURPLUS_EDGES, bands=PROM_BANDS, pubs_bands=PUBS_BANDS) -> dict:
-    surplus = seat["x"] - seat["E"]
-    return {**seat, "surplus": surplus, "state": surplus_bin(surplus, edges),
+def classify(seat, edges=SURPLUS_EDGES, bands=PROM_BANDS, pubs_bands=PUBS_BANDS,
+             depth_edge=DEPTH_EDGE) -> dict:
+    surplus, depth = seat["cites"] - seat["expected"], seat_depth(seat)
+    return {**seat, "surplus": surplus, "depth": depth, "bin": surplus_bin(surplus, edges),
+            "state": seat_state(surplus, depth, edges, depth_edge),
             "band": seat_band(seat, bands, pubs_bands)}
 
 
 # ---------------------------------------------------------------------------
-# Genuine column g: leave-one-member-out baseline, smoothing and fallback
+# Genuine column: leave-one-member-out baseline, smoothing and fallback
 # ---------------------------------------------------------------------------
 
 def cells(seat) -> list[tuple]:
@@ -84,7 +122,7 @@ def cells(seat) -> list[tuple]:
              ("pooled", ""))]
 
 
-def bin_counts(seats) -> dict:
+def state_counts(seats) -> dict:
     """cell -> {state: seats}."""
     counts = defaultdict(Counter)
     for seat in seats:
@@ -93,16 +131,16 @@ def bin_counts(seats) -> dict:
     return counts
 
 
-def smooth(counts, states=STATES):
-    """Every bin gets the pseudo-count lambda (PSEUDO_COUNT), then normalise."""
+def smooth(counts, states=EVIDENCE_STATES):
+    """Every state gets PSEUDO_COUNT, then normalise."""
     total = sum(counts.get(s, 0) for s in states) + PSEUDO_COUNT * len(states)
     return {s: (counts.get(s, 0) + PSEUDO_COUNT) / total for s in states}
 
 
-def genuine_dist(counts, seat, own_counts, min_n=FALLBACK_MIN_N, states=STATES):
-    """g(b | src, band) at the narrowest level that keeps `min_n` seats once the
-    member's own (`own_counts`) are left out; the pooled level regardless.
-    Returns (smoothed_dist, level)."""
+def genuine_dist(counts, seat, own_counts, min_n=FALLBACK_MIN_N, states=EVIDENCE_STATES):
+    """The genuine distribution over the states, given src and band, at the narrowest level
+    that keeps `min_n` seats once the member's own (`own_counts`) are left out; the pooled
+    level regardless. Returns (smoothed_dist, level)."""
     for cell in cells(seat):
         left = {s: counts[cell].get(s, 0) - own_counts.get(cell, {}).get(s, 0)
                 for s in states}
@@ -118,60 +156,67 @@ def log_odds_to_p(log_odds):
     """P(genuine) from log-odds, overflow-safe."""
     if log_odds >= 0:
         return 1.0 / (1.0 + math.exp(-log_odds))
-    e = math.exp(log_odds)
-    return e / (1.0 + e)
+    odds = math.exp(log_odds)
+    return odds / (1.0 + odds)
 
 
-def seat_lr(state, gdist, alpha, manip=MANIP_DIST):
-    """LR = g(b) / (alpha m(b) + (1 - alpha) g(b)) for one seat in bin b."""
-    g = gdist[state]
-    return g / (alpha * manip[state] + (1 - alpha) * g)
+def seat_lr(state, baseline, alpha, manip):
+    """LR = genuine / (alpha manip + (1 - alpha) genuine) for one seat in `state`."""
+    genuine = baseline[state]
+    return genuine / (alpha * manip[state] + (1 - alpha) * genuine)
 
 
-def score_member(seats, counts, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
+def score_member(seats, counts, alpha=ALPHA, prior=PRIOR, manip=manip_dist(),
                  min_n=FALLBACK_MIN_N):
-    """log_odds = log prior_odds + SUM log LR over one member's seats.
-    Returns (P(genuine), log_odds, detail), with one detail record per seat."""
-    own_counts = bin_counts(seats)
+    """log_odds = log prior_odds + SUM log LR over one member's seats; `manip` is over the
+    evidence states. Returns (P(genuine), log_odds, detail), with one detail record per
+    seat."""
+    own_counts = state_counts(seats)
     log_odds = math.log(prior / (1 - prior))
     detail = []
     for seat in seats:
-        gdist, level = genuine_dist(counts, seat, own_counts, min_n)
-        lr = seat_lr(seat["state"], gdist, alpha, manip)
+        baseline, level = genuine_dist(counts, seat, own_counts, min_n)
+        lr = seat_lr(seat["state"], baseline, alpha, manip)
         log_odds += math.log(lr)
-        detail.append(seat_detail(seat, gdist, level, lr))
+        detail.append(seat_detail(seat, baseline, level, lr))
     return log_odds_to_p(log_odds), log_odds, detail
 
 
-def seat_detail(seat, gdist, level, lr) -> dict:
+def seat_detail(seat, baseline, level, lr) -> dict:
     return {
         "edition_key": seat["edition_key"], "role": seat["role"],
-        "x": seat["x"], "x_westerbaan": seat["x_westerbaan"], "n": seat["n"],
-        "E": seat["E"], "pubs": seat.get("pubs"), "surplus": round(seat["surplus"], 4),
-        "state": seat["state"], "src": seat["src"], "band": seat["band"],
+        "cites": seat["cites"], "cites_gate": seat["cites_gate"], "citing": seat["citing"],
+        "papers": seat["papers"], "expected": seat["expected"],
+        "expected_citing": seat["expected_citing"], "pubs": seat.get("pubs"),
+        "surplus": round(seat["surplus"], 4),
+        "depth": None if seat["depth"] is None else round(seat["depth"], 4),
+        "bin": seat["bin"], "state": seat["state"], "src": seat["src"], "band": seat["band"],
         "fallback_level": level,
-        "genuine_p": round(gdist[seat["state"]], 6),
+        "genuine_p": round(baseline[seat["state"]], 6),
         "lr": round(lr, 6), "woe": round(math.log10(lr), 6),
     }
 
 
 def passes_gate(member, gate=GATE_REFERENCES) -> bool:
     """Westerbaan's gate: a seat with more than `gate` references to the member."""
-    return member["x_westerbaan_max"] > gate
+    return member["cites_gate_max"] > gate
 
 
 # ---------------------------------------------------------------------------
 # Ranking
 # ---------------------------------------------------------------------------
 
-def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, edges=SURPLUS_EDGES,
-                bands=PROM_BANDS, pubs_bands=PUBS_BANDS, min_seats=MIN_SEATS,
-                min_n=FALLBACK_MIN_N, gate=GATE_REFERENCES) -> list[dict]:
+def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, manip_deep=MANIP_DEEP,
+                edges=SURPLUS_EDGES, depth_edge=DEPTH_EDGE, bands=PROM_BANDS,
+                pubs_bands=PUBS_BANDS, min_seats=MIN_SEATS, min_n=FALLBACK_MIN_N,
+                gate=GATE_REFERENCES) -> list[dict]:
     """One row per member with at least `min_seats` seats, lowest weight of evidence
-    (`woe`) first. Every seat in the corpus counts in the baseline."""
-    seats_of = {pid: [classify(s, edges, bands, pubs_bands) for s in m["seats"]]
-                for pid, m in data["members"].items()}
-    counts = bin_counts(s for seats in seats_of.values() for s in seats)
+    (`woe`) first; `manip` is over the bins. Every seat in the corpus counts in the
+    baseline."""
+    seats_of = {pid: [classify(s, edges, bands, pubs_bands, depth_edge) for s in member["seats"]]
+                for pid, member in data["members"].items()}
+    counts = state_counts(s for seats in seats_of.values() for s in seats)
+    manip = manip_dist(manip, manip_deep)
 
     rows = []
     for pid, seats in seats_of.items():
@@ -179,14 +224,15 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, edges=SURPLUS_
             continue
         member = data["members"][pid]
         post, log_odds, detail = score_member(seats, counts, alpha, prior, manip, min_n)
-        states = Counter(s["state"] for s in seats)
+        bins = Counter(s["bin"] for s in seats)
         rows.append({
             "name": member["name"], "pid": pid,
             "p_genuine": post, "woe": log_odds / math.log(10),
             "n_seats": len(seats),
-            **{f"n_{s}": states.get(s, 0) for s in STATES},
+            **{f"n_{s}": bins.get(s, 0) for s in STATES},
+            "n_deep": sum(s["state"].endswith(DEEP) for s in seats),
             "max_surplus": max(s["surplus"] for s in seats),
-            "x_westerbaan_max": member["x_westerbaan_max"],
+            "cites_gate_max": member["cites_gate_max"],
             "passes_gate": passes_gate(member, gate),
             "streams": "|".join(sorted({s["stream"] for s in seats})),
             "detail": detail,
@@ -200,8 +246,8 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, edges=SURPLUS_
 # ---------------------------------------------------------------------------
 
 RANKING_COLUMNS = (["rank", "name", "pid", "p_genuine", "woe", "n_seats"]
-                   + [f"n_{s}" for s in STATES]
-                   + ["max_surplus", "x_westerbaan_max", "passes_gate", "streams"])
+                   + [f"n_{s}" for s in STATES] + ["n_deep"]
+                   + ["max_surplus", "cites_gate_max", "passes_gate", "streams"])
 
 
 def write_ranking_csv(path, rows) -> None:
@@ -220,7 +266,7 @@ def member_records(rows, threshold=SHORTLIST_THRESHOLD) -> list[dict]:
         "name": r["name"], "pid": r["pid"], "p_genuine": r["p_genuine"],
         "woe": round(r["woe"], 3), "shortlisted": r["p_genuine"] < threshold,
         "passes_gate": r["passes_gate"], "n_seats": r["n_seats"],
-        "x_westerbaan_max": r["x_westerbaan_max"], "streams": r["streams"],
+        "cites_gate_max": r["cites_gate_max"], "streams": r["streams"],
         "seats": sorted(r["detail"], key=lambda d: d["woe"]),
     } for r in rows]
 
@@ -238,7 +284,7 @@ def print_shortlist(shortlist) -> None:
         print(f"  P(genuine)={fmt_p(r['p_genuine']):>9}  WoE={r['woe']:>7.2f}  "
               f"{r['name'][:28]:<28} seats={r['n_seats']:<3} "
               + " ".join(f"{s}={r[f'n_{s}']:<2}" for s in STATES[1:])
-              + f" max surplus={r['max_surplus']:>6.1f}")
+              + f" deep={r['n_deep']:<2} max surplus={r['max_surplus']:>6.1f}")
     if len(shortlist) > SHORTLIST_PRINT_CAP:
         print(f"  ... (+{len(shortlist) - SHORTLIST_PRINT_CAP} more shortlisted; see the CSV)")
     if shortlist:
@@ -250,10 +296,11 @@ def print_breakdown(row, label) -> None:
     print("  (LR<1 lowers genuineness)")
     seats = sorted(row["detail"], key=lambda d: d["woe"])
     for d in seats[:BREAKDOWN_PRINT_CAP]:
-        print(f"     {d['edition_key'][:24]:<24} {d['state']:<8} x={d['x']:<4} "
-              f"E={d['E']:>7.2f} surplus={d['surplus']:>7.2f} "
-              f"[{d['src']:<10} {d['band']:<12} {d['fallback_level']:<10}] "
-              f"g={d['genuine_p']:.4f} LR={d['lr']:>6.3f} woe={d['woe']:>+7.3f}")
+        depth = "-" if d["depth"] is None else f"{d['depth']:.2f}"
+        print(f"     {d['edition_key'][:24]:<24} {d['state']:<12} cites={d['cites']:<4} "
+              f"expected={d['expected']:>7.2f} surplus={d['surplus']:>7.2f} depth={depth:>5} "
+              f"[{d['src']:<10} {d['band']:<19} {d['fallback_level']:<10}] "
+              f"genuine={d['genuine_p']:.4f} LR={d['lr']:>6.3f} woe={d['woe']:>+7.3f}")
     if len(seats) > BREAKDOWN_PRINT_CAP:
         print(f"     ... (+{len(seats) - BREAKDOWN_PRINT_CAP} more seats)")
 
@@ -265,8 +312,8 @@ def print_watched(rows, gated, data) -> None:
     for pid in WATCH_PIDS:
         r = by_pid.get(pid)
         if r is None:
-            n = len(data["members"].get(pid, {}).get("seats", []))
-            print(f"\n{pid}: not scored ({n} seats in the corpus)")
+            n_seats = len(data["members"].get(pid, {}).get("seats", []))
+            print(f"\n{pid}: not scored ({n_seats} seats in the corpus)")
             continue
         where = (f"gated rank {rank_gated[pid]} of {len(gated)}" if pid in rank_gated
                  else "not gated")
@@ -296,9 +343,9 @@ def main():
     n_short_all = sum(1 for r in rows if r["p_genuine"] < SHORTLIST_THRESHOLD)
 
     print(f"Model: {data['model']} | alpha={ALPHA} | prior P(genuine)={PRIOR} | "
-          f"MANIP_DIST={MANIP_DIST}")
-    print(f"Surplus edges {SURPLUS_EDGES}, prom bands {PROM_BANDS}, publication bands "
-          f"{PUBS_BANDS} (peer rate), at least {MIN_SEATS} seats, N_min={FALLBACK_MIN_N}")
+          f"MANIP_DIST={MANIP_DIST} | MANIP_DEEP={MANIP_DEEP}")
+    print(f"Surplus edges {SURPLUS_EDGES}, depth edge {DEPTH_EDGE}, expected bands {PROM_BANDS}, publication bands "
+          f"{PUBS_BANDS} (peer rate), at least {MIN_SEATS} seats, FALLBACK_MIN_N={FALLBACK_MIN_N}")
     print(f"Ungated: {len(rows)} members; {n_short_all} below threshold {SHORTLIST_THRESHOLD}.")
     print(f"Gated (a seat with more than {GATE_REFERENCES} references): {len(gated)} members; "
           f"{len(shortlist)} below threshold {SHORTLIST_THRESHOLD}.")
@@ -313,7 +360,8 @@ def main():
     json_path = out_dir / "bbn_cs3_scored.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"alpha": ALPHA, "prior": PRIOR, "manip_dist": MANIP_DIST,
-                   "surplus_edges": SURPLUS_EDGES, "prom_bands": PROM_BANDS,
+                   "manip_deep": MANIP_DEEP, "surplus_edges": SURPLUS_EDGES,
+                   "depth_edge": DEPTH_EDGE, "prom_bands": PROM_BANDS,
                    "pubs_bands": PUBS_BANDS,
                    "min_seats": MIN_SEATS, "fallback_min_n": FALLBACK_MIN_N,
                    "gate_references": GATE_REFERENCES,

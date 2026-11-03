@@ -3,12 +3,16 @@ Builds the BBN corpus for the PC member citation case study from the LNCS
 front matter, dblp and OpenCitations tables in the database.
 
     python bbn_extract.py --stage citations
-        Materialises SCHEMA.citation (one row per citing LNCS paper, cited
-        reference and author of the cited work) and SCHEMA.paper (the LNCS
-        papers with their reference counts).
+        Counts the citations to every cited work in the OpenCitations Index, or reads
+        them from bbn/index_counts.pkl when saved for the same works (--rescan counts
+        anew), and materialises SCHEMA.well_known (the works well known at an edition),
+        SCHEMA.citation (one row per citing LNCS paper, cited reference and author
+        of the cited work) and SCHEMA.paper (the LNCS papers with their reference
+        counts).
     python bbn_extract.py --stage seats
         Writes bbn/seats.csv: one row per pc or senior_pc seat of a matched
-        member, with its citations, the member's expected citations and the surplus.
+        member, with its citations, the member's expected citations, the surplus and
+        the depth (citations per citing paper over those expected).
     python bbn_extract.py --stage publications
         Writes bbn/publications.csv from the dblp dump: the publications of every
         member in bbn/seats.csv per year.
@@ -24,18 +28,24 @@ from __future__ import annotations
 import argparse
 import configparser
 import csv
+import io
 import json
 import logging
+import pickle
 import re
 import statistics
 import sys
 import time
+import zipfile
+from array import array
 from collections import Counter, defaultdict
+from multiprocessing import Pool
 from pathlib import Path
 
 from cs3_config import (BBN_DIR, DUMP_PATH, ENV_PATH, GATE_REFERENCES, MAX_SPAN,
                         MIN_OFF_PAPERS, MIN_PC_SHARE, MIN_PC_SIZE, PC_SIZE_WINDOW, PUB_TYPES,
-                        RATE_PSEUDO_COUNT, RATE_WINDOW, ROLES, SCHEMA)
+                        RATE_PSEUDO_COUNT, RATE_WINDOW, ROLES, SCAN_PROCESSES, SCHEMA,
+                        WELL_KNOWN_MIN_WORKS, WELL_KNOWN_TOP)
 
 
 def edition(column: str) -> str:
@@ -43,26 +53,37 @@ def edition(column: str) -> str:
     return rf"regexp_replace({column}, '-\d+$', '')"
 
 
+# The works every LNCS edition cites.
+CITED_WORKS_SQL = rf"""
+SELECT DISTINCT {edition('a.volume_dblp_key')} AS edition_key, r.cited_omid
+FROM opencitations_dump.reference r
+JOIN dblp_dump.lncs_article a ON a.doi = r.citing
+"""
+
 # A cited work can have several DOIs; cited_dois holds all of them, cited only one.
 CITATION_SQL = rf"""
 CREATE TABLE "{SCHEMA}".citation AS
 WITH ref AS (
-    SELECT citing, cited, unnest(string_to_array(cited_dois, ' ')) AS doi
+    SELECT citing, cited, cited_omid, unnest(string_to_array(cited_dois, ' ')) AS doi
     FROM opencitations_dump.reference
     WHERE cited_dois IS NOT NULL
 )
-SELECT DISTINCT
+SELECT
     a.dblp_key AS article_dblp_key,
     {edition('a.volume_dblp_key')} AS edition_key,
     ref.cited,
     ca.dblp_pid AS cited_pid,
-    aa.dblp_pid IS NOT NULL AS is_self
+    bool_or(aa.dblp_pid IS NOT NULL) AS is_self,
+    bool_or(w.cited_omid IS NOT NULL) AS is_well_known
 FROM ref
 JOIN dblp_dump.lncs_article a ON a.doi = ref.citing
 JOIN dblp_dump.cited_publication p ON p.doi = ref.doi
 JOIN dblp_dump.cited_publication_author ca ON ca.publication_dblp_key = p.dblp_key
 LEFT JOIN dblp_dump.lncs_article_author aa
     ON aa.article_dblp_key = a.dblp_key AND aa.dblp_pid = ca.dblp_pid
+LEFT JOIN "{SCHEMA}".well_known w
+    ON w.edition_key = {edition('a.volume_dblp_key')} AND w.cited_omid = ref.cited_omid
+GROUP BY 1, 2, 3, 4
 """
 
 PAPER_SQL = rf"""
@@ -78,21 +99,24 @@ FROM dblp_dump.lncs_article a
 """
 
 INDEXES = {
+    "well_known": [("edition_key", "cited_omid")],
     "citation": [("edition_key", "cited_pid"), ("cited_pid",), ("article_dblp_key",)],
     "paper": [("edition_key",), ("article_dblp_key",)],
 }
 
-# n: the papers of an edition with at least one reference resolved to dblp.
+VOLUMES_SQL = rf"""
+SELECT {edition('dblp_key')} AS edition_key, min(stream) AS stream,
+       min(year)::int AS year, min(core_rank) AS core_rank
+FROM dblp_dump.lncs_volume
+GROUP BY 1
+"""
+
+# papers: the papers of an edition with at least one reference resolved to dblp.
 EDITIONS_SQL = rf"""
-SELECT v.edition_key, v.stream, v.year, v.core_rank, coalesce(p.n, 0) AS n
-FROM (
-    SELECT {edition('dblp_key')} AS edition_key, min(stream) AS stream,
-           min(year)::int AS year, min(core_rank) AS core_rank
-    FROM dblp_dump.lncs_volume
-    GROUP BY 1
-) v
+SELECT v.edition_key, v.stream, v.year, v.core_rank, coalesce(p.papers, 0) AS papers
+FROM ({VOLUMES_SQL}) v
 LEFT JOIN (
-    SELECT edition_key, count(*) AS n FROM "{SCHEMA}".paper
+    SELECT edition_key, count(*) AS papers FROM "{SCHEMA}".paper
     WHERE n_resolved > 0 GROUP BY 1
 ) p ON p.edition_key = v.edition_key
 """
@@ -108,21 +132,24 @@ member AS (
     WHERE role_category IN ({", ".join(f"'{r}'" for r in ROLES)}) AND dblp_pid IS NOT NULL
 )"""
 
-# x: references, self-citations left out; x_westerbaan: references, self included.
+# cites: references, self-citations and well-known works left out; citing: the papers they
+# come from; cites_gate: all references.
 CITES_SQL = f"""
 WITH {MEMBERS}
 SELECT c.edition_key, c.cited_pid AS dblp_pid,
-       count(*) FILTER (WHERE NOT c.is_self) AS x,
-       count(*) AS x_westerbaan
+       count(*) FILTER (WHERE NOT c.is_self AND NOT c.is_well_known) AS cites,
+       count(DISTINCT c.article_dblp_key)
+           FILTER (WHERE NOT c.is_self AND NOT c.is_well_known) AS citing,
+       count(*) AS cites_gate
 FROM "{SCHEMA}".citation c
 JOIN member m ON m.dblp_pid = c.cited_pid
 GROUP BY 1, 2
 """
 
-# The member's own papers among those counted in n.
+# The member's own papers among the edition's papers.
 OWN_SQL = f"""
 WITH {MEMBERS}
-SELECT p.edition_key, aa.dblp_pid, count(DISTINCT p.article_dblp_key) AS n_own
+SELECT p.edition_key, aa.dblp_pid, count(DISTINCT p.article_dblp_key) AS own_papers
 FROM "{SCHEMA}".paper p
 JOIN dblp_dump.lncs_article_author aa ON aa.article_dblp_key = p.article_dblp_key
 JOIN member m ON m.dblp_pid = aa.dblp_pid
@@ -167,6 +194,12 @@ def build_table(db, table: str, sql: str) -> None:
     logging.info(f"{SCHEMA}.{table} built in {time.time() - start:.0f}s")
 
 
+def read_editions(db, sql: str) -> dict[str, dict]:
+    """edition -> its row, with the conference's year from the key where it has one."""
+    return {r["edition_key"]: {**r, "year": conference_year(r["edition_key"]) or r["year"]}
+            for r in db.execute_query_result(sql)}
+
+
 def pct(part, whole) -> str:
     return f"{part / whole:6.1%}" if whole else "     -"
 
@@ -184,6 +217,157 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Well-known works (OpenCitations Index)
+# ---------------------------------------------------------------------------
+
+def index_citations(lines, works: dict[str, int]) -> Counter:
+    """(work, year) -> citations to the works in `works` (omid -> work), from lines of the
+    Index CSV: oci,citing,cited,creation,timespan,journal_sc,author_sc. Citations of an
+    author of the cited work and citations without a year are left out."""
+    counts = Counter()
+    for line in lines:
+        parts = line.rstrip("\n").split(",")
+        if len(parts) != 7 or parts[6] == "yes":
+            continue
+        work = works.get(parts[2][len("omid:"):])
+        if work is not None and parts[3][:4].isdigit():
+            counts[(work, int(parts[3][:4]))] += 1
+    return counts
+
+
+def zip_lines(zip_path: Path):
+    with zipfile.ZipFile(zip_path) as archive:
+        for name in archive.namelist():
+            if name.endswith(".csv"):
+                with archive.open(name) as f:
+                    yield from io.TextIOWrapper(f, encoding="utf-8")
+
+
+_works = None
+
+
+def _init_scan(works):
+    global _works
+    _works = works
+
+
+def _scan_file(zip_path: Path) -> Counter:
+    return index_citations(zip_lines(zip_path), _works)
+
+
+class CitationCounts:
+    """The citations of every work up to and including a year in [first_year, last_year].
+    Citations before first_year count in first_year, those after last_year not at all."""
+
+    def __init__(self, n_works: int, first_year: int, last_year: int, totals: bytes = None):
+        self.first_year, self.span = first_year, last_year - first_year + 1
+        self.n_works = n_works
+        self.totals = (array("I", totals) if totals is not None
+                       else array("I", [0]) * (n_works * self.span))
+
+    def add(self, counts: Counter) -> None:
+        """Adds (work, year) -> citations, as from index_citations."""
+        for (work, year), citations in counts.items():
+            offset = max(year - self.first_year, 0)
+            if offset < self.span:
+                self.totals[work * self.span + offset] += citations
+
+    def accumulate(self) -> None:
+        """Turns the counts per year into counts up to and including the year."""
+        for work in range(self.n_works):
+            start = work * self.span
+            for i in range(start + 1, start + self.span):
+                self.totals[i] += self.totals[i - 1]
+
+    def up_to(self, work: int, year: int) -> int:
+        return self.totals[work * self.span + year - self.first_year]
+
+
+def top_threshold(values: list[int], top: float) -> int:
+    """The fewest citations of a value in the top `top` share of `values`."""
+    values = sorted(values)
+    return values[min(int(len(values) * (1 - top)), len(values) - 1)]
+
+
+def well_known_works(cited, editions, counts: CitationCounts, top=WELL_KNOWN_TOP,
+                     min_works=WELL_KNOWN_MIN_WORKS) -> set[tuple[str, int]]:
+    """The (edition, work) pairs of `cited` whose work is well known at the edition: its
+    citations up to the edition's year are in the top `top` of the works the stream cites
+    that have a citation by then, or of the works of all streams when the stream has fewer
+    than `min_works` of those."""
+    works_of, years_of = defaultdict(set), defaultdict(set)
+    for edition_key, work in cited:
+        stream = editions[edition_key]["stream"]
+        works_of[stream].add(work)
+        years_of[stream].add(editions[edition_key]["year"])
+    all_works = set().union(*works_of.values())
+    pooled = {}
+
+    def threshold(works, year):
+        values = [citations for citations in (counts.up_to(work, year) for work in works)
+                  if citations]
+        return top_threshold(values, top) if values else None, len(values)
+
+    thresholds = {}
+    for stream, works in works_of.items():
+        for year in years_of[stream]:
+            value, n_cited = threshold(works, year)
+            if n_cited < min_works:
+                if year not in pooled:
+                    pooled[year] = threshold(all_works, year)[0]
+                value = pooled[year]
+            thresholds[(stream, year)] = value
+    known = set()
+    for edition_key, work in cited:
+        stream, year = editions[edition_key]["stream"], editions[edition_key]["year"]
+        citations = counts.up_to(work, year)
+        if citations and citations >= thresholds[(stream, year)]:
+            known.add((edition_key, work))
+    return known
+
+
+def scan_index(index_dir: Path, works: dict[str, int], counts: CitationCounts,
+               processes=SCAN_PROCESSES) -> None:
+    files = sorted(index_dir.glob("*.zip"))
+    if not files:
+        sys.exit(f"No OpenCitations Index zips in {index_dir.resolve()}; pass --index.")
+    start = time.time()
+    with Pool(processes, initializer=_init_scan, initargs=(works,)) as pool:
+        for i, file_counts in enumerate(pool.imap_unordered(_scan_file, files), 1):
+            counts.add(file_counts)
+            logging.info(f"{i}/{len(files)} index files, {time.time() - start:.0f}s")
+
+
+def save_counts(path: Path, omids: list[str], counts: CitationCounts) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump({"omids": omids, "first_year": counts.first_year,
+                     "last_year": counts.first_year + counts.span - 1,
+                     "totals": counts.totals.tobytes()}, f)
+
+
+def load_counts(path: Path, omids: list[str], first_year: int,
+                last_year: int) -> CitationCounts | None:
+    """The counts saved by save_counts, or None when saved for other works or years."""
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        saved = pickle.load(f)
+    if (saved["omids"], saved["first_year"], saved["last_year"]) != (omids, first_year, last_year):
+        return None
+    return CitationCounts(len(omids), first_year, last_year, saved["totals"])
+
+
+def build_well_known(db, known: set[tuple[str, str]]) -> None:
+    db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}".well_known')
+    db.execute_query(f'CREATE TABLE "{SCHEMA}".well_known (edition_key text, cited_omid text)')
+    db.execute_many(f'INSERT INTO "{SCHEMA}".well_known VALUES (?, ?)', sorted(known))
+    for columns in INDEXES["well_known"]:
+        db.execute_query(f'CREATE INDEX ON "{SCHEMA}".well_known ({", ".join(columns)})')
+    logging.info(f"{SCHEMA}.well_known built: {len(known)} rows")
+
+
+# ---------------------------------------------------------------------------
 # Seats and the off-power rate
 # ---------------------------------------------------------------------------
 
@@ -193,7 +377,7 @@ def pc_sizes(committee) -> dict[str, int]:
     for r in committee:
         if r["role_category"] in ROLES:
             members[r["edition_key"]].add(r["dblp_pid"] or r["name_key"])
-    return {e: len(m) for e, m in members.items()}
+    return {edition_key: len(people) for edition_key, people in members.items()}
 
 
 def complete_editions(editions, pc_size, min_size=MIN_PC_SIZE, min_share=MIN_PC_SHARE,
@@ -201,17 +385,19 @@ def complete_editions(editions, pc_size, min_size=MIN_PC_SIZE, min_share=MIN_PC_
     """The editions whose parsed PC is plausibly complete: at least `min_size`, and at
     least `min_share` of the median PC of the same stream within `window` years."""
     sizes_of = defaultdict(list)
-    for e, size in pc_size.items():
-        if e in editions and size:
-            sizes_of[editions[e]["stream"]].append((editions[e]["year"], size))
+    for edition_key, size in pc_size.items():
+        if edition_key in editions and size:
+            sizes_of[editions[edition_key]["stream"]].append(
+                (editions[edition_key]["year"], size))
     complete = set()
-    for e, size in pc_size.items():
-        if e not in editions or size < min_size:
+    for edition_key, size in pc_size.items():
+        if edition_key not in editions or size < min_size:
             continue
-        year = editions[e]["year"]
-        nearby = [s for y, s in sizes_of[editions[e]["stream"]] if abs(y - year) <= window]
+        year = editions[edition_key]["year"]
+        nearby = [other for other_year, other in sizes_of[editions[edition_key]["stream"]]
+                  if abs(other_year - year) <= window]
         if size >= min_share * statistics.median(nearby):
-            complete.add(e)
+            complete.add(edition_key)
     return complete
 
 
@@ -224,10 +410,10 @@ def is_main(edition_key: str) -> bool:
 def conference_year(edition_key: str) -> int | None:
     """The year in the key, not of publication: 'conf/caise/2006' (published 2007) -> 2006,
     'conf/sigir/82' -> 1982, 'conf/eccv/2024-w8' -> 2024."""
-    m = re.match(r"(\d{4}|\d{2})(?!\d)", edition_key.rsplit("/", 1)[-1])
-    if not m:
+    match = re.match(r"(\d{4}|\d{2})(?!\d)", edition_key.rsplit("/", 1)[-1])
+    if not match:
         return None
-    year = int(m.group(1))
+    year = int(match.group(1))
     return year + 1900 if year < 100 else year
 
 
@@ -264,8 +450,9 @@ def scored_seats(committee) -> dict[tuple[str, str], dict]:
 class OffPower:
     """Citations and papers over the editions of a stream in which a member has no role.
 
-    `cites` maps pid -> edition -> citations (self left out), `own` pid -> edition -> the
-    member's own papers among the edition's n. Only complete main editions count.
+    `cites` maps pid -> edition -> citations (self and well-known works left out), `own`
+    pid -> edition -> the member's own papers among the edition's papers. Only complete
+    main editions count.
     """
 
     def __init__(self, editions, complete, on_power, cites, own, window=RATE_WINDOW,
@@ -273,76 +460,101 @@ class OffPower:
         self.editions, self.window, self.max_span = editions, window, max_span
         self.on_power, self.cites, self.own = on_power, cites, own
         self.by_stream = defaultdict(list)
-        for e in complete:
-            if is_main(e):
-                self.by_stream[editions[e]["stream"]].append(e)
+        for edition_key in complete:
+            if is_main(edition_key):
+                self.by_stream[editions[edition_key]["stream"]].append(edition_key)
 
-    def conference(self, pid, stream, year, min_papers=MIN_OFF_PAPERS) -> tuple[int, int, int]:
+    def conference(self, pid, stream, year, min_papers=MIN_OFF_PAPERS,
+                   counts=None) -> tuple[int, int, int]:
         """(citations, papers, span) over the stream's off-power editions within `window`
         years, and beyond that nearest first, up to `max_span` years, while they hold fewer
         than `min_papers` papers. Editions equally far are taken together; span is the
-        distance in years of the furthest one taken."""
-        cites, own = self.cites.get(pid, {}), self.own.get(pid, {})
+        distance in years of the furthest one taken. `counts`, in the form of `cites`, sums
+        another count over the same editions."""
+        cites, own = (counts or self.cites).get(pid, {}), self.own.get(pid, {})
         by_distance = defaultdict(list)
-        for e in self.by_stream.get(stream, ()):
-            if e not in self.on_power.get(pid, ()):
-                by_distance[abs(self.editions[e]["year"] - year)].append(e)
-        k = n = span = 0
+        for edition_key in self.by_stream.get(stream, ()):
+            if edition_key not in self.on_power.get(pid, ()):
+                by_distance[abs(self.editions[edition_key]["year"] - year)].append(edition_key)
+        off_cites = off_papers = span = 0
         for distance in sorted(by_distance):
-            if distance > self.max_span or (distance > self.window and n >= min_papers):
+            if distance > self.max_span or (distance > self.window and off_papers >= min_papers):
                 break
-            for e in by_distance[distance]:
-                k += cites.get(e, 0)
-                n += self.editions[e]["n"] - own.get(e, 0)
+            for edition_key in by_distance[distance]:
+                off_cites += cites.get(edition_key, 0)
+                off_papers += self.editions[edition_key]["papers"] - own.get(edition_key, 0)
             span = distance
-        return k, n, span
+        return off_cites, off_papers, span
 
 
 def off_power_rate(levels, min_papers=MIN_OFF_PAPERS, pseudo=RATE_PSEUDO_COUNT):
-    """(src, k, n, rate) of the first (src, (k, n)) level with at least `min_papers`
-    papers; ("", 0, 0, None) when none has."""
-    for src, (k, n) in levels:
-        if n >= min_papers:
-            return src, k, n, (k + pseudo) / n
+    """(src, cites, papers, rate) of the first (src, (cites, papers)) level with at least
+    `min_papers` papers; ("", 0, 0, None) when none has."""
+    for src, (cites, papers) in levels:
+        if papers >= min_papers:
+            return src, cites, papers, (cites + pseudo) / papers
     return "", 0, 0, None
 
 
-def seat_rows(seats, editions, cites, westerbaan, own, off: OffPower,
+def expected_count(conference, peers, papers):
+    """(off-power level, peer level, expected) of one count of a seat, from (count, papers)
+    of its off-power editions and of its peers; expected is papers times the larger rate."""
+    off = off_power_rate([("conference", conference), ("peers", peers)])
+    peer = off_power_rate([("peers", peers)])
+    expected = None if off[3] is None else max(off[3], peer[3] or 0) * papers
+    return off, peer, expected
+
+
+def seat_rows(seats, editions, cites, citing, gate_cites, own, off: OffPower,
               min_peers=MIN_PC_SIZE - 1) -> list[dict]:
-    """One row per seat. `westerbaan` maps (edition, pid) to the references to the member.
-    Without enough off-power papers the rate is that of the other seats of the edition,
-    when there are at least `min_peers`. E takes the larger of the rate and that of the
-    other seats."""
+    """One row per seat. `citing` maps pid -> edition -> the papers citing the member,
+    `gate_cites` (edition, pid) -> the references to the member. Without enough off-power
+    papers the rate is that of the other seats of the edition, when there are at least
+    `min_peers`. The expected citations take the larger of the rate and that of the other
+    seats; the expected citing papers likewise."""
     rows = []
-    for (e, pid), seat in sorted(seats.items()):
-        ed = editions[e]
+    for (edition_key, pid), seat in sorted(seats.items()):
+        ed = editions[edition_key]
         rows.append({
-            "edition_key": e, "stream": ed["stream"], "year": ed["year"],
+            "edition_key": edition_key, "stream": ed["stream"], "year": ed["year"],
             "core_rank": ed["core_rank"] or "", "dblp_pid": pid, "name": seat["name"],
-            "role": seat["role"], "x": cites.get(pid, {}).get(e, 0),
-            "x_westerbaan": westerbaan.get((e, pid), 0),
-            "n": ed["n"] - own.get(pid, {}).get(e, 0),
+            "role": seat["role"], "cites": cites.get(pid, {}).get(edition_key, 0),
+            "citing": citing.get(pid, {}).get(edition_key, 0),
+            "cites_gate": gate_cites.get((edition_key, pid), 0),
+            "papers": ed["papers"] - own.get(pid, {}).get(edition_key, 0),
         })
-    totals = defaultdict(lambda: [0, 0, 0])
+    totals = defaultdict(lambda: [0, 0, 0, 0])
     for r in rows:
-        t = totals[r["edition_key"]]
-        t[0], t[1], t[2] = t[0] + r["x"], t[1] + r["n"], t[2] + 1
+        total = totals[r["edition_key"]]
+        total[0] += r["cites"]
+        total[1] += r["citing"]
+        total[2] += r["papers"]
+        total[3] += 1
     for r in rows:
-        k_conf, n_conf, span = off.conference(r["dblp_pid"], r["stream"], r["year"])
-        k_all, n_all, n_seats = totals[r["edition_key"]]
-        peers = (k_all - r["x"], n_all - r["n"]) if n_seats - 1 >= min_peers else (0, 0)
-        src, k_off, n_off, rate = off_power_rate(
-            [("conference", (k_conf, n_conf)), ("peers", peers)])
-        _, k_peers, n_peers, rate_peers = off_power_rate([("peers", peers)])
-        expected = None if rate is None else max(rate, rate_peers or 0) * r["n"]
+        conf_cites, conf_papers, span = off.conference(r["dblp_pid"], r["stream"], r["year"])
+        conf_citing = off.conference(r["dblp_pid"], r["stream"], r["year"], counts=citing)[0]
+        edition_cites, edition_citing, edition_papers, n_seats = totals[r["edition_key"]]
+        with_peers = n_seats - 1 >= min_peers
+        peers = (edition_cites - r["cites"], edition_papers - r["papers"]) if with_peers else (0, 0)
+        peers_citing = ((edition_citing - r["citing"], edition_papers - r["papers"])
+                        if with_peers else (0, 0))
+        off_level, peer_level, expected = expected_count((conf_cites, conf_papers), peers,
+                                                         r["papers"])
+        src, off_cites, off_papers, rate = off_level
+        _, peer_cites, peer_papers, peer_rate = peer_level
+        *_, expected_citing = expected_count((conf_citing, conf_papers), peers_citing, r["papers"])
+        depth = ((r["cites"] / r["citing"]) / (expected / expected_citing)
+                 if r["citing"] and expected else None)
         r.update({
             "src": src, "span": span if src == "conference" else "",
-            "k_off": k_off, "n_off": n_off,
+            "off_cites": off_cites, "off_papers": off_papers,
             "rate": "" if rate is None else round(rate, 6),
-            "k_peers": k_peers, "n_peers": n_peers,
-            "rate_peers": "" if rate_peers is None else round(rate_peers, 6),
-            "E": "" if expected is None else round(expected, 4),
-            "surplus": "" if expected is None else round(r["x"] - expected, 4),
+            "peer_cites": peer_cites, "peer_papers": peer_papers,
+            "peer_rate": "" if peer_rate is None else round(peer_rate, 6),
+            "expected": "" if expected is None else round(expected, 4),
+            "surplus": "" if expected is None else round(r["cites"] - expected, 4),
+            "expected_citing": "" if expected_citing is None else round(expected_citing, 4),
+            "depth": "" if depth is None else round(depth, 4),
         })
     return rows
 
@@ -351,7 +563,7 @@ def gated_members(rows, gate=GATE_REFERENCES) -> dict[str, list[dict]]:
     """pid -> their seats with more than `gate` references (Westerbaan's count)."""
     gated = defaultdict(list)
     for r in rows:
-        if int(r["x_westerbaan"]) > gate:
+        if int(r["cites_gate"]) > gate:
             gated[r["dblp_pid"]].append(r)
     return dict(gated)
 
@@ -377,24 +589,24 @@ def credit(counts, is_pub, year, authors) -> None:
 def publication_counts(lines, wanted, types=PUB_TYPES) -> Counter:
     """(pid, year) -> the records of one of `types` that pid authored, for the pids in
     `wanted`. The triples of a record are contiguous in the dump."""
-    types = {f"<https://dblp.org/rdf/schema#{t}>" for t in types}
+    types = {f"<https://dblp.org/rdf/schema#{rdf_type}>" for rdf_type in types}
     counts = Counter()
     subject, is_pub, year, authors = None, False, None, set()
     for line in lines:
         if not line.startswith(REC_PREFIX):
             continue
-        s, p, o = line.split(" ", 2)
-        if s != subject:
+        record, predicate, obj = line.split(" ", 2)
+        if record != subject:
             credit(counts, is_pub, year, authors)
-            subject, is_pub, year, authors = s, False, None, set()
-        if p == P_TYPE:
-            is_pub = is_pub or o[:o.find(">") + 1] in types
-        elif p == P_AUTHORED_BY and o.startswith(PID_PREFIX):
-            pid = o[len(PID_PREFIX):o.find(">")]
+            subject, is_pub, year, authors = record, False, None, set()
+        if predicate == P_TYPE:
+            is_pub = is_pub or obj[:obj.find(">") + 1] in types
+        elif predicate == P_AUTHORED_BY and obj.startswith(PID_PREFIX):
+            pid = obj[len(PID_PREFIX):obj.find(">")]
             if pid in wanted:
                 authors.add(pid)
-        elif p == P_YEAR:
-            year = int(o[1:5])
+        elif predicate == P_YEAR:
+            year = int(obj[1:5])
     credit(counts, is_pub, year, authors)
     return counts
 
@@ -408,44 +620,46 @@ def with_progress(lines, every=PROGRESS_EVERY):
 
 
 def pubs_before(pubs_by_year: dict, year: int) -> int:
-    return sum(n for y, n in pubs_by_year.items() if y < year)
+    return sum(pubs for pub_year, pubs in pubs_by_year.items() if pub_year < year)
 
 
 # ---------------------------------------------------------------------------
 # The corpus
 # ---------------------------------------------------------------------------
 
-SEAT_INTS = ["year", "x", "x_westerbaan", "n", "k_off", "n_off"]
-SEAT_FLOATS = ["rate", "E"]
+SEAT_INTS = ["year", "cites", "citing", "cites_gate", "papers", "off_cites", "off_papers"]
+SEAT_FLOATS = ["rate", "expected", "expected_citing"]
 
 
 def build_corpus(rows, pubs=None) -> dict:
-    """The seats of seats.csv per member. Seats without a rate or with n = 0 are left out
-    of the evidence; the member's largest x_westerbaan is over all their seats. `pubs`
-    maps pid -> year -> dblp publications; a seat gets those before its year."""
+    """The seats of seats.csv per member. Seats without a rate or without papers are left
+    out of the evidence; the member's largest cites_gate is over all their seats.
+    `pubs` maps pid -> year -> dblp publications; a seat gets those before its year."""
     pubs = pubs or {}
     members, dropped = {}, Counter()
     n_seats = 0
     for r in rows:
         n_seats += 1
-        m = members.setdefault(r["dblp_pid"], {"name": "", "x_westerbaan_max": 0, "seats": []})
-        m["name"] = m["name"] or r["name"]
-        m["x_westerbaan_max"] = max(m["x_westerbaan_max"], int(r["x_westerbaan"]))
+        member = members.setdefault(r["dblp_pid"],
+                                    {"name": "", "cites_gate_max": 0, "seats": []})
+        member["name"] = member["name"] or r["name"]
+        member["cites_gate_max"] = max(member["cites_gate_max"],
+                                             int(r["cites_gate"]))
         if r["rate"] == "":
             dropped["rate"] += 1
             continue
-        if int(r["n"]) == 0:
-            dropped["n"] += 1
+        if int(r["papers"]) == 0:
+            dropped["papers"] += 1
             continue
-        seat = {k: r[k] for k in ("edition_key", "stream", "core_rank", "role", "src")}
-        seat.update({k: int(r[k]) for k in SEAT_INTS})
-        seat.update({k: float(r[k]) for k in SEAT_FLOATS})
+        seat = {key: r[key] for key in ("edition_key", "stream", "core_rank", "role", "src")}
+        seat.update({key: int(r[key]) for key in SEAT_INTS})
+        seat.update({key: float(r[key]) for key in SEAT_FLOATS})
         seat["pubs"] = pubs_before(pubs.get(r["dblp_pid"], {}), seat["year"])
-        m["seats"].append(seat)
-    kept = {pid: m for pid, m in members.items() if m["seats"]}
+        member["seats"].append(seat)
+    kept = {pid: member for pid, member in members.items() if member["seats"]}
     funnel = {"seats": n_seats, "seats without a rate": dropped["rate"],
-              "seats with n = 0": dropped["n"],
-              "seats kept": sum(len(m["seats"]) for m in kept.values()),
+              "seats without papers": dropped["papers"],
+              "seats kept": sum(len(member["seats"]) for member in kept.values()),
               "members": len(members), "members with a seat kept": len(kept)}
     return {"model": "cs3-seat-surplus", "funnel": funnel, "members": kept}
 
@@ -454,28 +668,50 @@ def build_corpus(rows, pubs=None) -> dict:
 # Stages
 # ---------------------------------------------------------------------------
 
-def stage_citations(db) -> None:
+def stage_citations(db, index_dir: Path, counts_path: Path, rescan: bool) -> None:
     db.execute_query(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+    editions = read_editions(db, VOLUMES_SQL)
+    pairs = [(r["edition_key"], r["cited_omid"])
+             for r in db.execute_query_result(CITED_WORKS_SQL) if r["edition_key"] in editions]
+    omids = sorted({omid for _, omid in pairs})
+    works = {omid: work for work, omid in enumerate(omids)}
+    years = [ed["year"] for ed in editions.values()]
+    logging.info(f"{len(omids)} cited works, {len(pairs)} edition-work pairs")
+    counts = None if rescan else load_counts(counts_path, omids, min(years), max(years))
+    if counts:
+        logging.info(f"Index counts read from {counts_path}")
+    else:
+        counts = CitationCounts(len(omids), min(years), max(years))
+        scan_index(index_dir, works, counts)
+        counts.accumulate()
+        save_counts(counts_path, omids, counts)
+    known = well_known_works([(edition_key, works[omid]) for edition_key, omid in pairs],
+                             editions, counts)
+    build_well_known(db, {(edition_key, omids[work]) for edition_key, work in known})
     build_table(db, "citation", CITATION_SQL)
     build_table(db, "paper", PAPER_SQL)
 
-    c = db.execute_query_result(f"""
+    citations = db.execute_query_result(f"""
         SELECT count(*) AS rows, count(DISTINCT (article_dblp_key, cited)) AS refs,
                count(DISTINCT article_dblp_key) AS citing, count(DISTINCT cited_pid) AS pids,
-               avg(is_self::int) AS self_share
+               avg(is_self::int) AS self_share, avg(is_well_known::int) AS well_known_share
         FROM "{SCHEMA}".citation""")[0]
-    p = db.execute_query_result(f"""
+    papers = db.execute_query_result(f"""
         SELECT count(*) AS papers, count(*) FILTER (WHERE n_references > 0) AS in_oc,
                count(*) FILTER (WHERE n_resolved > 0) AS resolved
         FROM "{SCHEMA}".paper""")[0]
-    logging.info(f"citation: {c['rows']} rows, {c['refs']} references from {c['citing']} "
-                 f"papers to {c['pids']} authors, self share {float(c['self_share']):.3f}")
-    logging.info(f"paper: {p['papers']} papers, {p['in_oc']} with references in "
-                 f"OpenCitations, {p['resolved']} with a reference resolved to dblp")
+    logging.info(f"well_known: {len({work for _, work in known})} of {len(omids)} works "
+                 f"well known at an edition, {len(known)} of {len(pairs)} pairs")
+    logging.info(f"citation: {citations['rows']} rows, {citations['refs']} references from "
+                 f"{citations['citing']} papers to {citations['pids']} authors, self share "
+                 f"{float(citations['self_share']):.3f}, well-known share "
+                 f"{float(citations['well_known_share']):.3f}")
+    logging.info(f"paper: {papers['papers']} papers, {papers['in_oc']} with references in "
+                 f"OpenCitations, {papers['resolved']} with a reference resolved to dblp")
 
 
 def print_seats_summary(rows, editions, pc_size, complete, n_unknown) -> None:
-    with_committee = [e for e in pc_size if e in editions]
+    with_committee = [edition_key for edition_key in pc_size if edition_key in editions]
     members = {r["dblp_pid"] for r in rows}
     by_src = Counter(r["src"] for r in rows)
     gated = gated_members(rows)
@@ -486,25 +722,26 @@ def print_seats_summary(rows, editions, pc_size, complete, n_unknown) -> None:
     print(f"  editions with a PC                   {len(with_committee):>7}")
     print(f"  ...plausibly complete                {len(complete):>7}  "
           f"({pct(len(complete), len(with_committee))})")
-    n_main = sum(1 for e in complete if is_main(e))
+    n_main = sum(1 for edition_key in complete if is_main(edition_key))
     print(f"  ...of which main editions (off-power) {n_main:>6}  "
           f"({pct(n_main, len(with_committee))})")
     if n_unknown:
         print(f"  seats of an edition without volumes  {n_unknown:>7}  (left out)")
     for role, count in sorted(Counter(r["role"] for r in rows).items()):
         print(f"  role {role:<32}{count:>7}")
-    n_zero = sum(1 for r in rows if r["n"] == 0)
-    print(f"  seats with n = 0                     {n_zero:>7}  ({pct(n_zero, len(rows))})")
+    n_zero = sum(1 for r in rows if r["papers"] == 0)
+    print(f"  seats without papers                 {n_zero:>7}  ({pct(n_zero, len(rows))})")
     for src, label in (("conference", "same stream"), ("peers", "PC peers"), ("", "none")):
         print(f"  rate from {label:<27}{by_src[src]:>7}  ({pct(by_src[src], len(rows))})")
-    n_floor = sum(1 for r in rows if r["src"] == "conference" and r["rate_peers"] != ""
-                  and r["rate_peers"] > r["rate"])
-    print(f"  ...same stream, E from the PC peers  {n_floor:>7}  "
+    n_floor = sum(1 for r in rows if r["src"] == "conference" and r["peer_rate"] != ""
+                  and r["peer_rate"] > r["rate"])
+    print(f"  ...same stream, expected from peers  {n_floor:>7}  "
           f"({pct(n_floor, by_src['conference'])})")
     spans = Counter(min(r["span"], 10) for r in rows if r["src"] == "conference")
     print("  same stream, furthest edition taken:  "
-          + "  ".join(f"{s if s < 10 else '10+'}y {pct(c, by_src['conference']).strip()}"
-                      for s, c in sorted(spans.items())))
+          + "  ".join(f"{span if span < 10 else '10+'}y "
+                      f"{pct(count, by_src['conference']).strip()}"
+                      for span, count in sorted(spans.items())))
     print(f"\n  gate: seats with more than {GATE_REFERENCES} references  {n_gated_seats:>7}")
     print(f"  ...members                           {len(gated):>7}  "
           f"({pct(len(gated), len(members))})")
@@ -514,25 +751,25 @@ def print_seats_summary(rows, editions, pc_size, complete, n_unknown) -> None:
 
 def stage_seats(db, out_dir: Path) -> None:
     start = time.time()
-    editions = {r["edition_key"]: {**r, "year": conference_year(r["edition_key"]) or r["year"]}
-                for r in db.execute_query_result(EDITIONS_SQL)}
+    editions = read_editions(db, EDITIONS_SQL)
     committee = db.execute_query_result(COMMITTEE_SQL)
-    cites, westerbaan = defaultdict(dict), {}
+    cites, citing, gate_cites = defaultdict(dict), defaultdict(dict), {}
     for r in db.execute_query_result(CITES_SQL):
-        cites[r["dblp_pid"]][r["edition_key"]] = r["x"]
-        westerbaan[(r["edition_key"], r["dblp_pid"])] = r["x_westerbaan"]
+        cites[r["dblp_pid"]][r["edition_key"]] = r["cites"]
+        citing[r["dblp_pid"]][r["edition_key"]] = r["citing"]
+        gate_cites[(r["edition_key"], r["dblp_pid"])] = r["cites_gate"]
     own = defaultdict(dict)
     for r in db.execute_query_result(OWN_SQL):
-        own[r["dblp_pid"]][r["edition_key"]] = r["n_own"]
+        own[r["dblp_pid"]][r["edition_key"]] = r["own_papers"]
     logging.info(f"read in {time.time() - start:.0f}s")
 
     pc_size = pc_sizes(committee)
     complete = complete_editions(editions, pc_size)
     seats = scored_seats(committee)
-    unknown = {k for k in seats if k[0] not in editions}
-    seats = {k: v for k, v in seats.items() if k not in unknown}
+    unknown = {key for key in seats if key[0] not in editions}
+    seats = {key: seat for key, seat in seats.items() if key not in unknown}
     off = OffPower(editions, complete, on_power_editions(committee), cites, own)
-    rows = seat_rows(seats, editions, cites, westerbaan, own, off)
+    rows = seat_rows(seats, editions, cites, citing, gate_cites, own, off)
 
     write_csv(out_dir / "seats.csv", rows)
     print_seats_summary(rows, editions, pc_size, complete, len(unknown))
@@ -554,8 +791,8 @@ def stage_publications(out_dir: Path, dump: Path) -> None:
         counts = publication_counts(with_progress(f), wanted)
     logging.info(f"dump read in {time.time() - start:.0f}s")
     write_csv(out_dir / "publications.csv",
-              [{"dblp_pid": pid, "year": year, "n_pubs": n}
-               for (pid, year), n in sorted(counts.items())])
+              [{"dblp_pid": pid, "year": year, "pubs": pubs}
+               for (pid, year), pubs in sorted(counts.items())])
     print(f"  {len({pid for pid, _ in counts})} of {len(wanted)} members have a publication "
           f"of type {', '.join(PUB_TYPES)}")
 
@@ -563,7 +800,7 @@ def stage_publications(out_dir: Path, dump: Path) -> None:
 def stage_corpus(out_dir: Path) -> None:
     pubs = defaultdict(dict)
     for r in read_rows(out_dir / "publications.csv", "publications"):
-        pubs[r["dblp_pid"]][int(r["year"])] = int(r["n_pubs"])
+        pubs[r["dblp_pid"]][int(r["year"])] = int(r["pubs"])
     corpus = build_corpus(read_rows(out_dir / "seats.csv", "seats"), pubs)
     path = out_dir / "bbn_cs3_corpus.json"
     with open(path, "w", encoding="utf-8") as f:
@@ -584,6 +821,11 @@ def main() -> None:
                         help=f"path to the .env with the POSTGRES_* values (default: {ENV_PATH})")
     parser.add_argument("--dump", default=None,
                         help=f"path to the unzipped dblp .nt (default: {DUMP_PATH})")
+    parser.add_argument("--index", default=None,
+                        help="folder with the OpenCitations Index zips "
+                             "(default: RAW_DATA/opencitations/index from the .env)")
+    parser.add_argument("--rescan", action="store_true",
+                        help="count the Index anew instead of reading bbn/index_counts.pkl")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -595,9 +837,12 @@ def main() -> None:
     if args.stage == "corpus":
         stage_corpus(Path(args.out_dir))
         return
-    db = connect(Path(args.env) if args.env else ENV_PATH)
+    env_path = Path(args.env) if args.env else ENV_PATH
+    db = connect(env_path)
     if args.stage == "citations":
-        stage_citations(db)
+        index_dir = (Path(args.index) if args.index
+                     else Path(read_config(env_path)["RAW_DATA"]) / "opencitations" / "index")
+        stage_citations(db, index_dir, Path(args.out_dir) / "index_counts.pkl", args.rescan)
     if args.stage == "seats":
         stage_seats(db, Path(args.out_dir))
 
