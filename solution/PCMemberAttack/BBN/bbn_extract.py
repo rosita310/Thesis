@@ -505,10 +505,11 @@ def expected_count(conference, peers, papers):
     return off, peer, expected
 
 
-def seat_rows(seats, editions, cites, citing, gate_cites, own, off: OffPower,
+def seat_rows(seats, editions, cites, citing, gate_cites, own, pc_size, off: OffPower,
               min_peers=MIN_PC_SIZE - 1) -> list[dict]:
     """One row per seat. `citing` maps pid -> edition -> the papers citing the member,
-    `gate_cites` (edition, pid) -> the references to the member. Without enough off-power
+    `gate_cites` (edition, pid) -> the references to the member, `pc_size` edition -> its
+    pc + senior_pc rows. Without enough off-power
     papers the rate is that of the other seats of the edition, when there are at least
     `min_peers`. The expected citations take the larger of the rate and that of the other
     seats; the expected citing papers likewise."""
@@ -522,6 +523,7 @@ def seat_rows(seats, editions, cites, citing, gate_cites, own, off: OffPower,
             "citing": citing.get(pid, {}).get(edition_key, 0),
             "cites_gate": gate_cites.get((edition_key, pid), 0),
             "papers": ed["papers"] - own.get(pid, {}).get(edition_key, 0),
+            "pc_size": pc_size.get(edition_key, 0),
         })
     totals = defaultdict(lambda: [0, 0, 0, 0])
     for r in rows:
@@ -627,7 +629,8 @@ def pubs_before(pubs_by_year: dict, year: int) -> int:
 # The corpus
 # ---------------------------------------------------------------------------
 
-SEAT_INTS = ["year", "cites", "citing", "cites_gate", "papers", "off_cites", "off_papers"]
+SEAT_INTS = ["year", "cites", "citing", "cites_gate", "papers", "pc_size", "off_cites",
+             "off_papers"]
 SEAT_FLOATS = ["rate", "expected", "expected_citing"]
 
 
@@ -769,7 +772,7 @@ def stage_seats(db, out_dir: Path) -> None:
     unknown = {key for key in seats if key[0] not in editions}
     seats = {key: seat for key, seat in seats.items() if key not in unknown}
     off = OffPower(editions, complete, on_power_editions(committee), cites, own)
-    rows = seat_rows(seats, editions, cites, citing, gate_cites, own, off)
+    rows = seat_rows(seats, editions, cites, citing, gate_cites, own, pc_size, off)
 
     write_csv(out_dir / "seats.csv", rows)
     print_seats_summary(rows, editions, pc_size, complete, len(unknown))

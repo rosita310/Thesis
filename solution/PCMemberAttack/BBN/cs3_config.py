@@ -86,3 +86,15 @@ FALLBACK_MIN_N = 30          # seats a baseline level needs after leaving out th
 SHORTLIST_THRESHOLD = 0.50   # P(genuine) below this is shortlisted
 
 WATCH_PIDS = ["n/GonzaloNavarro"]   # always printed with their rank: Westerbaan's SPIRE member
+
+# ---------------------------------------------------------------------------
+# The injection test (bbn_inject.py)
+# ---------------------------------------------------------------------------
+
+# A coerced seat: the member reviews REVIEWS_PER_PAPER * papers / pc_size papers of the
+# edition, rounded up, and each of those cites `extra` more of the member's works.
+REVIEWS_PER_PAPER = 3
+INJECT_EXTRA = [1, 2, 3, 5]
+INJECT_SEATS = [1, 2, 3]     # coerced seats per member
+INJECT_MEMBERS = 500         # drawn from the scored members that no variant shortlists
+INJECT_SEED = 1

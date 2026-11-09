@@ -197,12 +197,15 @@ def test_seat_rows():
 
     def rows(min_peers):
         return {(r["edition_key"], r["dblp_pid"]): r for r in extract.seat_rows(
-            seats, EDITIONS, CITES, CITING, {("A/2012", "p"): 9}, OWN, off_power(), min_peers)}
+            seats, EDITIONS, CITES, CITING, {("A/2012", "p"): 9}, OWN, {"A/2012": 12},
+            off_power(), min_peers)}
 
     p = rows(2)[("A/2012", "p")]
     check("cites and cites_gate come from the citations",
           (p["cites"], p["cites_gate"]) == (6, 9))
     check("papers leaves out the member's own papers", p["papers"] == 25 - 1)
+    check("pc_size is the edition's, 0 without a committee",
+          (p["pc_size"], rows(2)[("A/2010", "q")]["pc_size"]) == (12, 0))
     check("the rate comes from the same stream, four years out, and expected = rate * papers",
           (p["src"], p["span"], p["off_cites"], p["off_papers"]) == ("conference", 4, 6, 59)
           and approx(p["expected"], round(6.5 / 59 * 24, 4)))
@@ -245,12 +248,12 @@ def test_build_corpus():
     print("\n-- the corpus --")
     path = tempfile_with(
         "edition_key,stream,year,core_rank,dblp_pid,name,role,cites,citing,cites_gate,papers,"
-        "src,span,off_cites,off_papers,rate,peer_cites,peer_papers,peer_rate,expected,surplus,"
+        "pc_size,src,span,off_cites,off_papers,rate,peer_cites,peer_papers,peer_rate,expected,surplus,"
         "expected_citing,depth\n"
-        "A/2010,A,2010,B,p,Pat Quinn,pc,3,2,4,20,conference,1,2,40,0.0625,0,0,,1.25,1.75,1.0,1.2\n"
-        "A/2011,A,2011,B,p,Pat Quinn,pc,0,0,15,0,conference,1,2,40,0.0625,0,0,,0.0,0.0,0.0,\n"
-        "A/2012,A,2012,B,p,,senior_pc,0,0,0,30,,,0,0,,0,0,,,,,\n"
-        "B/2011,B,2011,A,q,Q,pc,0,0,12,30,,,0,0,,0,0,,,,,\n")
+        "A/2010,A,2010,B,p,Pat Quinn,pc,3,2,4,20,12,conference,1,2,40,0.0625,0,0,,1.25,1.75,1.0,1.2\n"
+        "A/2011,A,2011,B,p,Pat Quinn,pc,0,0,15,0,12,conference,1,2,40,0.0625,0,0,,0.0,0.0,0.0,\n"
+        "A/2012,A,2012,B,p,,senior_pc,0,0,0,30,12,,,0,0,,0,0,,,,,\n"
+        "B/2011,B,2011,A,q,Q,pc,0,0,12,30,10,,,0,0,,0,0,,,,,\n")
     with open(path, encoding="utf-8", newline="") as f:
         corpus = extract.build_corpus(csv.DictReader(f), {"p": {2008: 3, 2009: 4, 2010: 5}})
     p = corpus["members"]["p"]
@@ -260,8 +263,8 @@ def test_build_corpus():
     check("the name is the first one given", p["name"] == "Pat Quinn")
     s = p["seats"][0]
     check("counts are ints and the expected counts floats",
-          (s["cites"], s["citing"], s["papers"], s["year"], s["expected"], s["expected_citing"])
-          == (3, 2, 20, 2010, 1.25, 1.0) and isinstance(s["expected_citing"], float))
+          (s["cites"], s["citing"], s["papers"], s["pc_size"], s["year"], s["expected"],
+           s["expected_citing"]) == (3, 2, 20, 12, 2010, 1.25, 1.0) and isinstance(s["expected_citing"], float))
     check("a member without a kept seat is left out", "q" not in corpus["members"])
     check("the funnel counts every step",
           corpus["funnel"] == {"seats": 4, "seats without a rate": 2, "seats without papers": 1,
