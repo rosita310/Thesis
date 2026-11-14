@@ -3,8 +3,8 @@ import datetime
 import logging
 from pathlib import Path
 
-from lncs_articles import author_rows, read_records
-from lncs_volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
+from articles import author_rows, read_records
+from volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
 
 PUBLICATION_TABLE = 'cited_publication'
 AUTHOR_TABLE = 'cited_publication_author'
@@ -13,8 +13,15 @@ BATCH = 100000
 
 
 def get_cited_dois() -> set:
-    query = 'SELECT DISTINCT cited_dois FROM opencitations_dump.reference WHERE cited_dois IS NOT NULL'
-    return {doi.lower() for r in db.execute_query_result(query) for doi in r['cited_dois'].split()}
+    """The DOIs cited in every reference table of opencitations_dump (LNCS and ACM)."""
+    dois = set()
+    for table in ('reference', 'acm_reference'):
+        if not db.table_exists('opencitations_dump', table):
+            logging.warning(f"opencitations_dump.{table} does not exist: its cited works are not loaded")
+            continue
+        query = f'SELECT DISTINCT cited_dois FROM opencitations_dump.{table} WHERE cited_dois IS NOT NULL'
+        dois.update(doi.lower() for r in db.execute_query_result(query) for doi in r['cited_dois'].split())
+    return dois
 
 
 def doi_of(record: dict) -> str:
@@ -28,7 +35,7 @@ def save(table: str, rows: list):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load the dblp records (with authors) of the DOIs cited in opencitations_dump.reference")
+    parser = argparse.ArgumentParser(description="Load the dblp records (with authors) of the DOIs cited in opencitations_dump.reference and acm_reference")
     parser.add_argument('--dump', type=Path, default=DEFAULT_DUMP, help="dblp.nt or dblp.nt.gz")
     args = parser.parse_args()
 

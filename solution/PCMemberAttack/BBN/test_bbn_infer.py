@@ -33,10 +33,10 @@ N_STATES = len(infer.EVIDENCE_STATES)
 
 
 def seat(cites, expected, stream="conf/a", core_rank="A", src="conference", edition=None,
-         cites_gate=None, pubs=30, citing=None, expected_citing=None):
+         cites_gate=None, pubs=30, citing=None, expected_citing=None, source="lncs"):
     """Without citing and expected_citing, depth is 1."""
     return {"edition_key": edition or f"{stream}/2010", "stream": stream,
-            "core_rank": core_rank, "role": "pc", "src": src, "year": 2010,
+            "core_rank": core_rank, "source": source, "role": "pc", "src": src, "year": 2010,
             "cites": cites, "citing": cites if citing is None else citing,
             "cites_gate": cites if cites_gate is None else cites_gate,
             "papers": 50, "off_cites": 0, "off_papers": 50, "rate": expected / 50,
@@ -201,7 +201,8 @@ def ranking_corpus():
     seats, never over the gate. d: two seats, below MIN_SEATS."""
     background = [seat(0, 1.0, edition=f"conf/a/{i}") for i in range(40)]
     return corpus({
-        "a": [seat(60, 1.0, edition=f"conf/a/a{i}") for i in range(3)],
+        "a": [seat(60, 1.0, edition=f"conf/a/a{i}", source="acm" if i else "lncs")
+              for i in range(3)],
         "b": [seat(1, 1.0, edition=f"conf/a/b{i}", cites_gate=12) for i in range(3)],
         "c": [seat(0, 1.0, edition=f"conf/a/c{i}") for i in range(3)],
         "d": [seat(60, 1.0, edition=f"conf/a/d{i}") for i in range(2)],
@@ -221,6 +222,8 @@ def test_rank_corpus():
     check("the gate is Westerbaan's: more than 10 references on one seat",
           by["a"]["passes_gate"] and by["b"]["passes_gate"] and not by["c"]["passes_gate"])
     check("the bin counts are per member", (by["a"]["n_extreme"], by["a"]["n_typical"]) == (3, 0))
+    check("the seats of both sources count, and the row names them",
+          by["a"]["n_seats"] == 3 and by["a"]["sources"] == "acm|lncs")
     check("woe is in log10: three typical seats add 3 log10 2 to the prior",
           approx(by["c"]["woe"], math.log10(0.95 / 0.05) + 3 * math.log10(2), 1e-6))
     unscored = infer.rank_corpus(ranking_corpus(), alpha=ALPHA, prior=0.95, manip=MANIP,

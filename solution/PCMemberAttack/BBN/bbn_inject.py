@@ -5,7 +5,8 @@ beside the corpus.
 
 A coerced seat: the member reviews k = ceil(REVIEWS_PER_PAPER * papers / pc_size) papers of
 the edition and each of those cites `extra` more of the member's works; the reviewed papers
-that did not cite the member yet, in proportion, become citing papers.
+that did not cite the member yet, in proportion, become citing papers. Also prints, per
+surplus bin, how often the surplus of a real seat fits in its k most citing papers.
 
     python bbn_inject.py [--in bbn/bbn_cs3_corpus.json]
 """
@@ -16,10 +17,11 @@ import csv
 import math
 import random
 import statistics
+from collections import defaultdict
 
-from bbn_infer import corpus_path_argument, load_corpus, rank_corpus
+from bbn_infer import corpus_path_argument, load_corpus, rank_corpus, surplus_bin
 from cs3_config import (INJECT_EXTRA, INJECT_MEMBERS, INJECT_SEATS, INJECT_SEED,
-                        REVIEWS_PER_PAPER, SHORTLIST_THRESHOLD)
+                        REVIEWS_PER_PAPER, SHORTLIST_THRESHOLD, STATES)
 
 VARIANTS = {"depth": {}, "no depth": {"depth_edge": math.inf, "manip_deep": 0.0}}
 
@@ -51,6 +53,18 @@ def inject(data, order, extra, n_seats, reviews=REVIEWS_PER_PAPER) -> dict:
         members[pid] = {**member, "seats": seats, "cites_gate_max": max(
             member["cites_gate_max"], *(s["cites_gate"] for s in seats))}
     return {**data, "members": members}
+
+
+def fits_review_load(data, reviews=REVIEWS_PER_PAPER) -> dict[str, tuple[int, float]]:
+    """surplus bin -> (seats, the share whose surplus the review_load papers that cite the
+    member most can hold)."""
+    fits = defaultdict(list)
+    for member in data["members"].values():
+        for seat in member["seats"]:
+            fits[surplus_bin(seat["cites"] - seat["expected"])].append(
+                seat["fit_papers"] <= review_load(seat, reviews))
+    return {state: (len(fits[state]), sum(fits[state]) / len(fits[state]))
+            for state in STATES[1:] if fits[state]}
 
 
 def shortlisted(rows, gated=True, threshold=SHORTLIST_THRESHOLD) -> set[str]:
@@ -114,6 +128,12 @@ def main():
     print(f"{INJECT_MEMBERS} members, seed {INJECT_SEED}, {REVIEWS_PER_PAPER} reviews per "
           f"paper; injected: the median citations planted in a coerced seat")
     print_results(base, results)
+    loads = [review_load(seat) for member in data["members"].values() for seat in member["seats"]]
+    print(f"\nreview load: median {statistics.median(loads):g}, "
+          f"{sum(k == 1 for k in loads) / len(loads):.1%} of the seats 1")
+    print("seats whose surplus fits in the review load (the papers that cite the member most):")
+    for state, (n, share) in fits_review_load(data).items():
+        print(f"  {state:<8} {n:>7} seats  {share:6.1%}")
     out_path = in_path.resolve().parent / "bbn_cs3_injection.csv"
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)

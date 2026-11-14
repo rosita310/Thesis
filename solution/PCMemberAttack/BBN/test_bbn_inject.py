@@ -19,7 +19,8 @@ def check(label, condition):
 
 
 def seat(cites, citing, papers=40, pc_size=20, stream="conf/a", edition="conf/a/2010"):
-    return {"edition_key": edition, "stream": stream, "core_rank": "A", "role": "pc",
+    return {"edition_key": edition, "stream": stream, "core_rank": "A", "source": "lncs",
+            "role": "pc",
             "src": "conference", "year": 2010, "cites": cites, "citing": citing,
             "cites_gate": cites + 1, "papers": papers, "pc_size": pc_size, "off_cites": 0,
             "off_papers": 50, "rate": 0.02, "expected": 1.0, "expected_citing": 1.0,
@@ -45,6 +46,15 @@ def test_coerce():
           s["citing"] == 10 + round(6 * (1 - 10 / 40)))
     full = inject.coerce(seat(40, 40, papers=40, pc_size=20), extra=1, reviews=3)
     check("no citing papers beyond the papers", full["citing"] == 40)
+
+
+def test_fits_review_load():
+    print("\n-- surplus within the review load --")
+    seats = [{**seat(16, 4), "fit_papers": 3}, {**seat(16, 4), "fit_papers": 7},
+             {**seat(31, 20), "fit_papers": 12}, {**seat(3, 3), "fit_papers": 1}]
+    fits = inject.fits_review_load(corpus({"p": seats}), reviews=3)
+    check("per bin: the share of seats whose fit_papers is within k = 6",
+          fits == {"mild": (2, 0.5), "high": (1, 0.0)})
 
 
 def test_inject():
@@ -94,6 +104,7 @@ def test_run():
 
 def main():
     test_coerce()
+    test_fits_review_load()
     test_inject()
     test_draw()
     test_run()

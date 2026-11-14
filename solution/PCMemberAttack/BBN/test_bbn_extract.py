@@ -41,8 +41,9 @@ def member(edition, role, pid=None, name_key="", dblp_name=None):
             "name_key": name_key, "dblp_name": dblp_name}
 
 
-def edition(stream, year, papers, core_rank="B"):
-    return {"stream": stream, "year": year, "papers": papers, "core_rank": core_rank}
+def edition(stream, year, papers, core_rank="B", source="lncs"):
+    return {"stream": stream, "year": year, "papers": papers, "core_rank": core_rank,
+            "source": source}
 
 
 # Stream A has editions 2010-2013 and 2016, stream B one in 2011. A/2013 has an
@@ -114,6 +115,30 @@ def test_is_main():
                            COMPLETE | {"A/2012w"}, ON_POWER, CITES, OWN)
     check("a satellite is never an off-power edition, also not in the same year",
           off.conference("p", "A", 2012) == off_power().conference("p", "A", 2012))
+
+
+def test_same_committee():
+    print("\n-- editions with the same committee --")
+    pc = [f"p{i}" for i in range(10)]
+    rows = ([{"edition_key": e, "dblp_pid": p} for e in ("conf/g/2010", "conf/g/2010c")
+             for p in pc]
+            + [{"edition_key": "conf/g/2010w", "dblp_pid": p} for p in pc[:5]]
+            + [{"edition_key": f"conf/e/2024-w{n}", "dblp_pid": p} for n in (1, 2, 10)
+               for p in pc]
+            + [{"edition_key": "conf/g/2011", "dblp_pid": p} for p in pc])
+    volume_editions = ["conf/g/2010", "conf/g/2010c", "conf/g/2010w", "conf/g/2011",
+                       "conf/e/2024-w1", "conf/e/2024-w2", "conf/e/2024-w10", "conf/g/2012"]
+    mapping = extract.same_committee_editions(volume_editions, rows, 0.8)
+    check("a companion with the main PC goes into the main edition",
+          mapping["conf/g/2010c"] == "conf/g/2010")
+    check("a committee that shares half keeps its own edition",
+          mapping["conf/g/2010w"] == "conf/g/2010w")
+    check("the same PC in another year keeps its own edition",
+          mapping["conf/g/2011"] == "conf/g/2011")
+    check("volumes without a main edition go under the shortest key",
+          {mapping[f"conf/e/2024-w{n}"] for n in (1, 2, 10)} == {"conf/e/2024-w1"})
+    check("an edition without a committee maps to itself",
+          mapping["conf/g/2012"] == "conf/g/2012")
 
 
 def test_on_power():
@@ -198,18 +223,20 @@ def test_seat_rows():
     def rows(min_peers):
         return {(r["edition_key"], r["dblp_pid"]): r for r in extract.seat_rows(
             seats, EDITIONS, CITES, CITING, {("A/2012", "p"): 9}, OWN, {"A/2012": 12},
-            off_power(), min_peers)}
+            off_power(), min_peers, per_paper={("A/2012", "p"): [4, 1, 1]})}
 
     p = rows(2)[("A/2012", "p")]
     check("cites and cites_gate come from the citations",
           (p["cites"], p["cites_gate"]) == (6, 9))
     check("papers leaves out the member's own papers", p["papers"] == 25 - 1)
+    check("the seat carries the source of its edition", p["source"] == "lncs")
     check("pc_size is the edition's, 0 without a committee",
           (p["pc_size"], rows(2)[("A/2010", "q")]["pc_size"]) == (12, 0))
     check("the rate comes from the same stream, four years out, and expected = rate * papers",
           (p["src"], p["span"], p["off_cites"], p["off_papers"]) == ("conference", 4, 6, 59)
           and approx(p["expected"], round(6.5 / 59 * 24, 4)))
     check("surplus = cites - expected", approx(p["surplus"], round(6 - 6.5 / 59 * 24, 4)))
+    check("the surplus of 3.4 needs the paper that cites the member most", p["fit_papers"] == 1)
     check("the citing papers are expected from the same editions",
           p["citing"] == 3 and approx(p["expected_citing"], round(3.5 / 59 * 24, 4)))
     check("depth = (cites / citing) / (expected / expected_citing)",
@@ -232,7 +259,11 @@ def test_seat_rows():
           and approx(r["expected"], round(6.5 / 49 * 25, 4)))
     no_rate = rows(3)[("A/2012", "r")]
     check("...but not with fewer peers than min_peers, and then no surplus either",
-          no_rate["expected"] == "" and no_rate["surplus"] == "")
+          no_rate["expected"] == "" and no_rate["surplus"] == "" and no_rate["fit_papers"] == "")
+    check("fit_papers: the fewest papers, most citing first, that hold the surplus",
+          (extract.fit_papers([4, 1, 1], 4), extract.fit_papers([4, 1, 1], 4.5),
+           extract.fit_papers([4, 1, 1], 6), extract.fit_papers([4, 1, 1], -1),
+           extract.fit_papers([], 0)) == (1, 2, 3, 0, 0))
 
 
 def test_gate():
@@ -247,13 +278,13 @@ def test_gate():
 def test_build_corpus():
     print("\n-- the corpus --")
     path = tempfile_with(
-        "edition_key,stream,year,core_rank,dblp_pid,name,role,cites,citing,cites_gate,papers,"
-        "pc_size,src,span,off_cites,off_papers,rate,peer_cites,peer_papers,peer_rate,expected,surplus,"
-        "expected_citing,depth\n"
-        "A/2010,A,2010,B,p,Pat Quinn,pc,3,2,4,20,12,conference,1,2,40,0.0625,0,0,,1.25,1.75,1.0,1.2\n"
-        "A/2011,A,2011,B,p,Pat Quinn,pc,0,0,15,0,12,conference,1,2,40,0.0625,0,0,,0.0,0.0,0.0,\n"
-        "A/2012,A,2012,B,p,,senior_pc,0,0,0,30,12,,,0,0,,0,0,,,,,\n"
-        "B/2011,B,2011,A,q,Q,pc,0,0,12,30,10,,,0,0,,0,0,,,,,\n")
+        "edition_key,stream,year,core_rank,source,dblp_pid,name,role,cites,citing,cites_gate,"
+        "papers,pc_size,src,span,off_cites,off_papers,rate,peer_cites,peer_papers,peer_rate,"
+        "expected,surplus,fit_papers,expected_citing,depth\n"
+        "A/2010,A,2010,B,acm,p,Pat Quinn,pc,3,2,4,20,12,conference,1,2,40,0.0625,0,0,,1.25,1.75,1,1.0,1.2\n"
+        "A/2011,A,2011,B,acm,p,Pat Quinn,pc,0,0,15,0,12,conference,1,2,40,0.0625,0,0,,0.0,0.0,0,0.0,\n"
+        "A/2012,A,2012,B,lncs,p,,senior_pc,0,0,0,30,12,,,0,0,,0,0,,,,,,\n"
+        "B/2011,B,2011,A,lncs,q,Q,pc,0,0,12,30,10,,,0,0,,0,0,,,,,,\n")
     with open(path, encoding="utf-8", newline="") as f:
         corpus = extract.build_corpus(csv.DictReader(f), {"p": {2008: 3, 2009: 4, 2010: 5}})
     p = corpus["members"]["p"]
@@ -265,6 +296,7 @@ def test_build_corpus():
     check("counts are ints and the expected counts floats",
           (s["cites"], s["citing"], s["papers"], s["pc_size"], s["year"], s["expected"],
            s["expected_citing"]) == (3, 2, 20, 12, 2010, 1.25, 1.0) and isinstance(s["expected_citing"], float))
+    check("a seat keeps its source", s["source"] == "acm")
     check("a member without a kept seat is left out", "q" not in corpus["members"])
     check("the funnel counts every step",
           corpus["funnel"] == {"seats": 4, "seats without a rate": 2, "seats without papers": 1,
@@ -391,6 +423,7 @@ def main():
     test_pc_sizes()
     test_complete_editions()
     test_is_main()
+    test_same_committee()
     test_on_power()
     test_scored_seats()
     test_off_power_conference()

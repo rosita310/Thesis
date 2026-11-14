@@ -235,6 +235,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, manip_deep=MAN
             "cites_gate_max": member["cites_gate_max"],
             "passes_gate": passes_gate(member, gate),
             "streams": "|".join(sorted({s["stream"] for s in seats})),
+            "sources": "|".join(sorted({s["source"] for s in seats})),
             "detail": detail,
         })
     rows.sort(key=lambda r: r["woe"])
@@ -247,7 +248,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST, manip_deep=MAN
 
 RANKING_COLUMNS = (["rank", "name", "pid", "p_genuine", "woe", "n_seats"]
                    + [f"n_{s}" for s in STATES] + ["n_deep"]
-                   + ["max_surplus", "cites_gate_max", "passes_gate", "streams"])
+                   + ["max_surplus", "cites_gate_max", "passes_gate", "streams", "sources"])
 
 
 def write_ranking_csv(path, rows) -> None:

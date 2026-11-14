@@ -19,9 +19,14 @@ BBN_DIR = BASE_DIR / "bbn"              # bbn_extract.py output, and everything 
 # Corpus construction (bbn_extract.py)
 # ---------------------------------------------------------------------------
 
-SCHEMA = "lncs_citation"     # the materialised citation and paper tables
+SOURCES = ["lncs", "acm"]    # the publishers whose editions are taken together
+SCHEMA = "cs3_citation"      # the materialised citation and paper tables
 
 ROLES = ["pc", "senior_pc"]  # the role categories whose seats are scored
+
+# Editions of one conference and year whose matched pc + senior_pc overlap by at least this
+# much (Jaccard) list the same committee in several volumes, and are taken as one edition.
+SAME_COMMITTEE = 0.8
 
 # The off-power rate: the stream's editions in which the member has no role at all, all
 # those within RATE_WINDOW years, and further out nearest first, up to MAX_SPAN years, while

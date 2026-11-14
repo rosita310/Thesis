@@ -1,7 +1,9 @@
 # Citations from OpenCitations
 
 Loads the citations made by the LNCS papers in `dblp_dump.lncs_article` into
-`opencitations_dump.reference` (`citing` and `cited` are DOIs, as in the original pipeline).
+`opencitations_dump.reference` (`citing` and `cited` are DOIs, as in the original pipeline), or
+with `--source acm` those of the ACM papers in `dblp_dump.acm_article` into
+`opencitations_dump.acm_reference`.
 A cited work can have several DOIs (e.g. publisher and repository); `cited` holds one of them and
 `cited_dois` all of them, space separated, so match on `cited_dois`.
 
@@ -19,7 +21,7 @@ The files are stored in `RAW_DATA/opencitations` (from `.env`); the zips are rea
 
 ```
 python download.py
-python references.py
+python references.py [--source acm]
 ```
 
 `download.py` resumes interrupted downloads and checks file sizes. `references.py` scans the index
