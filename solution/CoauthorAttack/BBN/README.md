@@ -43,7 +43,8 @@ existing `reports/journal_mapping.csv` are carried over as `verified`. Check eve
 The dump stages are cached; `--force` redoes them.
 
 `bbn_infer.py` scores the corpus and writes `bbn/bbn_cs2_ranking.csv` and
-`bbn/bbn_cs2_scored.json`, with the publishers of each editor. `bbn_report.py` prints the
+`bbn/bbn_cs2_scored.json`, with the publishers of each editor. Only editors who pass the in/out
+gate (`INOUT_GATE`) and have at least `MIN_SUSPECT_PAPERS` suspect papers are ranked. `bbn_report.py` prints the
 diagnostics and sensitivity sweeps, and `bbn_placebo.py` runs the within-paper placebo tests and
 writes `bbn/bbn_cs2_placebo.csv`. `bbn_inject.py` makes fake editors who built a career on
 coercion; how often they fall below 0.5 and their median rank go to `bbn/bbn_cs2_injection.csv`.

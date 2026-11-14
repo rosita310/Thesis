@@ -59,7 +59,7 @@ def corpus(real=REAL):
             "coauthorships": nodes,
             "editor_index": {"E": [f"E||J1||{n['coauthor_id']}" for n in real],
                              "O": list(OTHERS)},
-            "editors": {"E": {"n_suspect_papers": 2, "inout_points":
+            "editors": {"E": {"n_suspect_papers": infer.MIN_SUSPECT_PAPERS, "inout_points":
                               [{"journal": "J1", "x": 2, "y": 20}]},
                         "O": {"n_suspect_papers": 75, "inout_points":
                               [{"journal": "J1", "x": 75, "y": 300}]}}}
