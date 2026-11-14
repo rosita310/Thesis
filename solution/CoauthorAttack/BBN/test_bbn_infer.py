@@ -76,12 +76,12 @@ def ranking_corpus():
         editor_index={"E1": ["E1||J1||a"], "E2": ["E2||J1||b"], "E3": ["E3||J1||c"]},
         editor_labels={"E1": "Ed One", "E2": "Ed Two", "E3": "Ed Three"},
         editors={
-            "E1": {"n_suspect_papers": 3, "is_pid": False,
+            "E1": {"n_suspect_papers": infer.MIN_SUSPECT_PAPERS, "is_pid": False,
                    "inout_points": [{"year": 2010, "x": 1, "y": 5}]},
-            "E2": {"n_suspect_papers": 3, "is_pid": True,
+            "E2": {"n_suspect_papers": infer.MIN_SUSPECT_PAPERS, "is_pid": True,
                    "inout_points": [{"year": 2010, "x": 0, "y": 3},
                                     {"year": 2011, "x": 4, "y": 2}]},
-            "E3": {"n_suspect_papers": 1, "is_pid": False},
+            "E3": {"n_suspect_papers": infer.MIN_SUSPECT_PAPERS, "is_pid": False},
         })
 
 
@@ -136,7 +136,8 @@ def personal_corpus():
     for key, n in nodes.items():
         index.setdefault(n["editor_id"], []).append(key)
     return corpus(journals, coauthorships=nodes, editor_index=index,
-                  editors={e: {"n_suspect_papers": 1} for e in index}), mine
+                  editors={e: {"n_suspect_papers": infer.MIN_SUSPECT_PAPERS}
+                           for e in index}), mine
 
 
 def test_oneoff_habit():
@@ -450,6 +451,15 @@ def test_ranking():
           [r["name"] for r in gated] == ["Ed Two"])
     check("...without changing their posterior",
           approx(gated[0]["p_genuine"], by_name["Ed Two"]["p_genuine"], 1e-12))
+
+    few = ranking_corpus()
+    few["editors"]["E3"]["n_suspect_papers"] = infer.MIN_SUSPECT_PAPERS - 1
+    kept = infer.rank_corpus(few, ALPHA, infer.PRIOR, manip=MANIP, inout_gate=False)
+    check("an editor with fewer suspect papers than the minimum is not ranked",
+          [r["name"] for r in kept] == ["Ed One", "Ed Two"])
+    check("...and is ranked without the minimum",
+          len(infer.rank_corpus(few, ALPHA, infer.PRIOR, manip=MANIP, inout_gate=False,
+                                min_papers=0)) == 3)
 
     pointless = ranking_corpus()
     for info in pointless["editors"].values():
