@@ -2,7 +2,8 @@
 Injection test: would the model find an editor who built a career on coercion?
 
 Makes fake editors, one at a time, and scores each against the real corpus, without
-the in/out gate. A fake editor has a record of INJECT_RECORDS papers in the journal
+the in/out gate. They are ranked among the real editors with at least
+MIN_SUSPECT_PAPERS suspect papers. A fake editor has a record of INJECT_RECORDS papers in the journal
 they edit, a share INJECT_SHARES of them coerced.
 
 - The genuine papers are real co-authorships of other editors in that journal, drawn
@@ -36,7 +37,7 @@ from bbn_infer import (corpus_path_argument, load_corpus, rank_corpus, reference
                        score_editor)
 from cs2_config import (FALLBACK_MIN_N, INJECT_BOARDS, INJECT_COAUTHORS, INJECT_DRAWS,
                         INJECT_PROFILES, INJECT_RECORDS, INJECT_SEED, INJECT_SHARES,
-                        SHORTLIST_THRESHOLD)
+                        MIN_SUSPECT_PAPERS, SHORTLIST_THRESHOLD)
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +216,8 @@ def write_csv(path, rows):
 
 
 def print_table(rows, n_real, eligible):
-    print(f"\n=== INJECTION TEST: fake editors scored against {n_real} real editors, "
-          f"no gate ===")
+    print(f"\n=== INJECTION TEST: fake editors scored against {n_real} real editors "
+          f"(>= {MIN_SUSPECT_PAPERS} suspect papers), no gate ===")
     print(f"  {len(eligible)} journals, {INJECT_DRAWS} fake editors per journal and kind; "
           f"found = P < {SHORTLIST_THRESHOLD}; rank 1 = most suspect")
     print(f"  {'profile':<9}{'boards':>7}{'record':>7}{'coerced':>8}{'fakes':>7}"

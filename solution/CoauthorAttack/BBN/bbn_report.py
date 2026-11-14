@@ -25,7 +25,7 @@ from bbn_infer import (corpus_path_argument, fmt_p, load_corpus, merge, node_lr,
                        score_editor, smooth, state_shares, typical_habit)
 from cs2_config import (ALPHA, ALPHA_SWEEP, COAUTHOR_MIN_PUBS_SWEEP, FALLBACK_MIN_N,
                         HEAD_P_LEVELS, INOUT_GATE, MANIP_DIST, MANIP_SWEEP, MIN_CONTROL_NODES,
-                        MIN_RECORD_SWEEP, OUTSIDE_READINGS, POOL_MIN_SWEEP, PRIOR, PRIOR_SWEEP, RECENT_FROM, RECENT_FROM_SWEEP,
+                        MIN_RECORD_SWEEP, MIN_SUSPECT_PAPERS, OUTSIDE_READINGS, POOL_MIN_SWEEP, PRIOR, PRIOR_SWEEP, RECENT_FROM, RECENT_FROM_SWEEP,
                         REPEATED_SWEEP, HABIT_RATIO_BINS, SHORTLIST_THRESHOLD)
 from dblp_extract import pct
 
@@ -70,7 +70,8 @@ def print_journals(shortlist):
 
 
 def print_gate(rows):
-    """The in/out gate over every scored editor; `rows` must be the ungated ranking."""
+    """The in/out gate over every scored editor; `rows` must be the ranking with
+    neither the gate nor a minimum record."""
     print("\n=== IN/OUT CO-AUTHOR GATE (fig. 8.7: x = in-journal co-authors, y = outside) ===")
     plotted = [r for r in rows if r.get("inout_points")]
     if not plotted:
@@ -91,11 +92,12 @@ def print_gate(rows):
           f"points, {len(strict)} editors")
     print(f"  passing editors: median "
           f"{statistics.median(r['n_suspect_papers'] for r in passing)} suspect papers, "
-          f"{sum(r['n_suspect_papers'] >= 5 for r in passing)} with >= 5")
+          f"{sum(r['n_suspect_papers'] >= MIN_SUSPECT_PAPERS for r in passing)} "
+          f"with >= {MIN_SUSPECT_PAPERS}")
     quiet = [r for r in passing
              if all(p["y"] == 0 for p in r["inout_points"] if passes_inout_gate([p]))]
     print(f"  ...of which {len(quiet)} pass only in years with nothing published outside "
-          f"({sum(r['p_genuine'] < SHORTLIST_THRESHOLD for r in quiet)} shortlisted)")
+          f"({len(shortlisted(at_least(quiet, MIN_SUSPECT_PAPERS)))} shortlisted)")
     margins = sorted((p["x"] - p["y"] for p in points), reverse=True)
     n = len(margins)
     print("  x - y at the top of the distribution: "
@@ -532,29 +534,35 @@ def shortlisted(rows):
     return [r for r in rows if r["p_genuine"] < SHORTLIST_THRESHOLD]
 
 
-def print_entry_conditions(ungated, base_pos):
-    """Who is ranked, not how they are scored: the gate and a minimum record.
-    `ungated` is the ranking of every scored editor."""
-    gated = [r for r in ungated if r["passes_inout_gate"]]
-    strict = [r for r in ungated if any(p["x"] > p["y"] for p in r["inout_points"] or [])]
-    print("\n=== ENTRY CONDITIONS: who is ranked, not how they are scored ===")
-    report_stability("gate x >= y (the run)", gated, base_pos)
-    report_stability("gate x > y (Westerbaan)", strict, base_pos)
-    report_stability("no gate", ungated, base_pos)
-    for n_min in MIN_RECORD_SWEEP:
-        report_stability(f"gate, >= {n_min} suspect papers",
-                         [r for r in gated if r["n_suspect_papers"] >= n_min], base_pos)
-        report_stability(f"no gate, >= {n_min} suspect papers",
-                         [r for r in ungated if r["n_suspect_papers"] >= n_min], base_pos)
+def at_least(rows, n_min):
+    """The rows of editors with at least `n_min` suspect papers."""
+    return [r for r in rows if r["n_suspect_papers"] >= n_min]
 
-    short = shortlisted(ungated)
+
+def print_entry_conditions(everyone, base_pos):
+    """Who is ranked, not how they are scored: the gate and a minimum record.
+    `everyone` is the ranking with neither."""
+    gated = [r for r in everyone if r["passes_inout_gate"]]
+    strict = [r for r in everyone if any(p["x"] > p["y"] for p in r["inout_points"] or [])]
+    print(f"\n=== ENTRY CONDITIONS: who is ranked, not how they are scored "
+          f"(the run: gate x >= y, >= {MIN_SUSPECT_PAPERS} suspect papers) ===")
+    report_stability("gate x >= y (the run)", at_least(gated, MIN_SUSPECT_PAPERS), base_pos)
+    report_stability("gate x > y (Westerbaan)", at_least(strict, MIN_SUSPECT_PAPERS),
+                     base_pos)
+    report_stability("no gate", at_least(everyone, MIN_SUSPECT_PAPERS), base_pos)
+    for n_min in MIN_RECORD_SWEEP:
+        report_stability(f"gate, >= {n_min} suspect papers", at_least(gated, n_min),
+                         base_pos)
+        report_stability(f"no gate, >= {n_min} suspect papers", at_least(everyone, n_min),
+                         base_pos)
+
+    short = shortlisted(at_least(everyone, MIN_SUSPECT_PAPERS))
     if not short:
         return
     papers = [r["n_suspect_papers"] for r in short]
     publishers = Counter(p for r in short for p in r["publishers"].split("|") if p)
     print(f"\n  without the gate: {len(short)} below {SHORTLIST_THRESHOLD}, "
-          f"{dict(publishers)}; median {statistics.median(papers)} suspect papers, "
-          f"{sum(p >= 5 for p in papers)} with >= 5; "
+          f"{dict(publishers)}; median {statistics.median(papers)} suspect papers; "
           f"{sum(r['passes_inout_gate'] for r in short)} pass the gate; "
           f"the gated shortlist sits at "
           f"{[i + 1 for i, r in enumerate(short) if r['passes_inout_gate']]}")
@@ -626,24 +634,25 @@ def main():
     print(f"Ranked {len(rows)} editors; {len(shortlist)} below threshold "
           f"{SHORTLIST_THRESHOLD}.")
 
-    ungated = rank_corpus(data, inout_gate=False)
+    everyone = rank_corpus(data, inout_gate=False, min_papers=0)
+    ungated = at_least(everyone, MIN_SUSPECT_PAPERS)
     ungated_pos = {r["ident"]: i for i, r in enumerate(shortlisted(ungated))}
     print_publishers(rows, shortlist)
     print_benign(data)
-    print_gate(ungated)
+    print_gate(everyone)
     print_journals(shortlist)
     print_head(rows, ungated)
     print_record_diagnostic(rows, data, base_pos)
     print_board_terms(rows, data)
     print_coverage(data)
-    print_typical_habit(reference(data), ungated)
-    print_zero_oneoffs(ungated)
-    print_calibration(ungated, reference(data))
+    print_typical_habit(reference(data), everyone)
+    print_zero_oneoffs(everyone)
+    print_calibration(everyone, reference(data))
     print_sweeps(data, rows, shortlist, base_pos)
     print_adjustment_sweep(data, base_pos, ungated_pos)
     print_record_boundary(data, base_pos, ungated_pos)
-    print_recency(data, ungated, base_pos, ungated_pos)
-    print_entry_conditions(ungated, base_pos)
+    print_recency(data, everyone, base_pos, ungated_pos)
+    print_entry_conditions(everyone, base_pos)
     print_count_ablation(data, ungated)
 
 

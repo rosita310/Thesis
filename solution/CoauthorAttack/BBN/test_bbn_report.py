@@ -66,7 +66,7 @@ def corpus():
             "editor_index": {e: [k for k in nodes if k.startswith(e)] for e in
                              ("E1", "E2", "E3")},
             "editor_labels": {"E1": "Ed One", "E2": "Ed Two", "E3": "Ed Three"},
-            "editors": {e: {"n_suspect_papers": 2, "is_pid": False,
+            "editors": {e: {"n_suspect_papers": cfg.MIN_SUSPECT_PAPERS, "is_pid": False,
                             "inout_points": [{"year": 2010, "x": x, "y": y}]}
                         for e, (x, y) in seats.items()}}
 

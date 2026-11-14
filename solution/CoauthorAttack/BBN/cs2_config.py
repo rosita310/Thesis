@@ -57,6 +57,7 @@ RECENT_FROM = 2025
 
 CONDITION_ON_CAREER_STAGE = False   # also condition the genuine baseline on career stage
 INOUT_GATE = True            # rank only editors who pass Westerbaan's in/out gate (fig. 8.7)
+MIN_SUSPECT_PAPERS = 5       # rank only editors with at least this many suspect papers
 SHORTLIST_THRESHOLD = 0.50   # P(genuine) below this is shortlisted
 
 # ---------------------------------------------------------------------------
@@ -91,8 +92,8 @@ HABIT_RATIO_BINS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # upper edges, exclu
 
 MIN_CONTROL_NODES = 3        # pre-board co-authorships needed for a per-editor comparison
 
-# Entry conditions: rank only editors with at least this many suspect papers (n_min).
-MIN_RECORD_SWEEP = [1, 2, 3, 5]
+# Entry conditions: the minimum number of suspect papers (n_min), against MIN_SUSPECT_PAPERS.
+MIN_RECORD_SWEEP = [1, 3, 5, 10]
 
 # The head of the ranking: editors counted below these P(genuine), and below PRIOR.
 HEAD_P_LEVELS = [0.50, 0.90]

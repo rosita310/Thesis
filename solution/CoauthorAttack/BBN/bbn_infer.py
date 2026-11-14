@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cs2_config import (ALPHA, BBN_DIR, CONDITION_ON_CAREER_STAGE, FALLBACK_MIN_N,
-                        INOUT_GATE, MANIP_DIST, PRIOR, PSEUDO_COUNT,
+                        INOUT_GATE, MANIP_DIST, MIN_SUSPECT_PAPERS, PRIOR, PSEUDO_COUNT,
                         RECENT_FROM, SHORTLIST_THRESHOLD)
 
 DEFAULT_IN = BBN_DIR / "bbn_cs2_corpus.json"
@@ -399,10 +399,12 @@ def reddest_point(points):
 def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
                 condition_on_career_stage=CONDITION_ON_CAREER_STAGE,
                 inout_gate=INOUT_GATE, pool_min=FALLBACK_MIN_N,
-                recent_from=RECENT_FROM) -> list[dict]:
+                recent_from=RECENT_FROM,
+                min_papers=MIN_SUSPECT_PAPERS) -> list[dict]:
     """One row per ranked editor, lowest weight of evidence (`woe`) first.
 
-    Every editor is scored; `inout_gate` only decides who is ranked. `pool_min` is
+    Every editor is scored; `inout_gate` and `min_papers` (the suspect papers an
+    editor needs) only decide who is ranked. `pool_min` is
     the boundary of the personal adjustment (math.inf: none), `recent_from` the first
     year of a recent co-authorship (None: no split).
     """
@@ -458,6 +460,7 @@ def rank_corpus(data, alpha=ALPHA, prior=PRIOR, manip=MANIP_DIST,
                              "run `python bbn_extract.py --stage editor_authors`, "
                              "then rebuild the corpus with --stage corpus.")
         rows = [r for r in rows if r["passes_inout_gate"]]
+    rows = [r for r in rows if r["n_suspect_papers"] >= min_papers]
     rows.sort(key=lambda r: r["woe"])
     return rows
 
@@ -569,8 +572,9 @@ def main():
     print(f"Recent co-authorships (first shared publication from {RECENT_FROM} on) "
           "judged against recent ones" if RECENT_FROM is not None
           else "No split into recent and earlier co-authorships")
-    print(f"Ranked {len(rows)} editors"
-          + (" (gate: in >= out)" if INOUT_GATE else "")
+    print(f"Ranked {len(rows)} editors ("
+          + ("gate: in >= out, " if INOUT_GATE else "")
+          + f">= {MIN_SUSPECT_PAPERS} suspect papers)"
           + f"; {len(shortlist)} below threshold {SHORTLIST_THRESHOLD}.")
 
     out_dir = in_path.resolve().parent
@@ -583,6 +587,7 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"alpha": ALPHA, "prior": PRIOR,
                    "manip_dist": MANIP_DIST, "inout_gate": INOUT_GATE,
+                   "min_suspect_papers": MIN_SUSPECT_PAPERS,
                    "pool_min": FALLBACK_MIN_N,
                    "shortlist_threshold": SHORTLIST_THRESHOLD,
                    "repeated_min": data["config"]["repeated_min"],
