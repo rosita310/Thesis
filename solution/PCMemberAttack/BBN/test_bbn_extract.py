@@ -156,6 +156,22 @@ def test_on_power():
     check("another member's seat does not", "E7" not in on["p"])
 
 
+def test_career_starts():
+    print("\n-- the start of a career --")
+    editions = {"A/2012": edition("A", 2012, 1), "B/2009": edition("B", 2009, 1),
+                "B/2011": edition("B", 2011, 1)}
+    starts = extract.career_starts([
+        member("A/2012", "pc", "p"), member("B/2011", "pc_chair", "p"),
+        member("B/2009", "reviewer", "p"), member("B/2009", "pc", None, "pat q"),
+        member("A/2012", "senior_pc", "q"), member("conf/c/2008", "pc", "q"),
+        member("B/2009", "other", "r")], editions)
+    check("the first year with a pc, senior_pc or pc_chair role in any stream",
+          starts["p"] == 2011)
+    check("an edition without volumes takes the year in its key", starts["q"] == 2008)
+    check("reviewers, other roles and unmatched rows do not start a career",
+          "r" not in starts)
+
+
 def test_scored_seats():
     print("\n-- scored seats --")
     seats = extract.scored_seats([
@@ -194,6 +210,10 @@ def test_off_power_conference():
           off.conference("p", "A", 2012, min_papers=30) == (2, 19, 2))
     check("another count sums over the same editions",
           off_power().conference("p", "A", 2012, min_papers=30, counts=CITING) == (1 + 2, 59, 4))
+    off = extract.OffPower(EDITIONS, COMPLETE, ON_POWER, CITES, OWN, window=2,
+                           starts={"p": 2011})
+    check("editions before the start of the career are not off-power",
+          off.conference("p", "A", 2012, min_papers=30) == (4, 40, 4))
 
 
 def test_off_power_rate():
@@ -343,6 +363,114 @@ def test_publication_counts():
     check("publications before the year only", extract.pubs_before({2009: 2, 2010: 3}, 2010) == 2)
 
 
+# --- citing authors ------------------------------------------------------------
+
+def with_doi(lines, doi):
+    key = lines[0].split(" ")[0][len("<https://dblp.org/rec/"):-1]
+    return lines[:-1] + [triple(key, extract.P_DOI, f"<https://doi.org/{doi}>"), "\n"]
+
+
+def test_author_records():
+    print("\n-- publications of the citing authors --")
+    lines = (with_doi(record("conf/a/P1", "Inproceedings", 2010, "a", "m", "x"), "10.1/P1")
+             + with_doi(record("journals/b/P2", "Article", 2012, "a"), "10.1/p2")
+             + with_doi(record("journals/corr/P3", "Informal", 2011, "a", "m"), "10.1/P3")
+             + record("conf/a/P4", "Inproceedings", 2008, "b", "m")
+             + with_doi(record("conf/a/P5", "Inproceedings", 2011, "x"), "10.1/P5"))
+    records = list(extract.author_records(lines, {"a", "b", "m"},
+                                          types=["Article", "Inproceedings"]))
+    check("one record per publication with a wanted author, its DOIs in lower case",
+          records == [(2010, ["10.1/p1"], {"a", "m"}), (2012, ["10.1/p2"], {"a"}),
+                      (2008, [], {"b", "m"})])
+    by_doi, first = extract.author_papers(records, {"m": {"a", "b"}})
+    check("DOI -> its wanted authors; a record without a DOI has none",
+          by_doi == {"10.1/p1": ("a", "m"), "10.1/p2": ("a",)})
+    check("the first year a member has a record with a wanted co-author",
+          first == {("m", "a"): 2010, ("m", "b"): 2008})
+
+
+def test_index_references():
+    print("\n-- OMIDs and references of the citing authors' publications --")
+    lines = ["openalex:W1,omid:br/061\n", "doi:10.1/P1,omid:br/0611 omid:br/0612\n",
+             "doi:10.1/x,y,omid:br/0613\n", "doi:10.1/other,omid:br/0614\n"]
+    check("OMID -> DOI for the wanted DOIs, a DOI with a comma too",
+          extract.doi_omids(lines, {"10.1/p1", "10.1/x,y"})
+          == {"br/0611": "10.1/p1", "br/0612": "10.1/p1", "br/0613": "10.1/x,y"})
+    lines = ["oci,citing,cited,creation,timespan,journal_sc,author_sc\n",
+             "1,omid:br/0611,omid:br/09,2011,P1Y,no,no\n",
+             "2,omid:br/0611,omid:br/08,2011,P1Y,no,no\n",
+             "3,omid:br/0699,omid:br/09,2011,P1Y,no,no\n"]
+    citing, pairs = extract.index_references(lines, {"br/0611"}, {"br/09"})
+    check("the wanted publications that cite anything", citing == {"br/0611"})
+    check("their citations of the wanted works", pairs == [("br/0611", "br/09")])
+
+
+def test_checkable_papers():
+    print("\n-- checkable papers --")
+    by_doi = {"d/p": ("j", "s"), "d/1": ("s",), "d/2": ("s",), "d/3": ("s", "t"),
+              "d/q": ("j",), "d/r": ("t",), "d/4": ("t",), "d/5": ("t",)}
+    with_refs = {"d/p", "d/1", "d/2", "d/3", "d/q", "d/r", "d/4"}
+    checkable = extract.checkable_papers({"P": {"s", "j"}, "Q": {"j"}, "R": {"t"}},
+                                         {"P": "d/p", "Q": "d/q", "R": "d/r"},
+                                         by_doi, with_refs, min_papers=3)
+    check("a paper with one author with enough other publications with references",
+          "P" in checkable)
+    check("the paper itself does not count", "Q" not in checkable)
+    check("a publication without references does not count", "R" not in checkable)
+
+
+def test_explained_citations():
+    print("\n-- explained citations --")
+    citations = [("P", "10.9/w", "x", "br/w"), ("P", "10.9/v", "x", "br/v"),
+                 ("P", "10.9/u", "x", "br/u"), ("P", "10.9/t", "x", "br/t"),
+                 ("P", "10.9/s", "x", "br/s")]
+    explained = extract.explained_citations(
+        citations, {"P": {"a"}}, {"P": "d/p"},
+        {("a", "br/w"): {"d/q"}, ("a", "br/v"): {"d/p"}, ("a", "br/u"): {"d/on"},
+         ("a", "br/t"): {"d/off"}, ("a", "br/s"): {"d/with"}},
+        {"d/with": ("a", "x")},
+        {"d/p": "E/1", "d/on": "E/2", "d/off": "E/3"}, {"x": {"E/1", "E/2"}})
+    check("a publication the member wrote does not explain",
+          ("P", "10.9/s", "x") not in explained)
+    check("an author cites the work outside the corpus", ("P", "10.9/w", "x") in explained)
+    check("...or in an edition where the member holds no role",
+          ("P", "10.9/t", "x") in explained)
+    check("the paper itself does not explain", ("P", "10.9/v", "x") not in explained)
+    check("an edition where the member holds a role does not explain",
+          ("P", "10.9/u", "x") not in explained)
+    coauthor = extract.coauthor_citations(
+        [("P", "c1", "x", "w"), ("Q", "c2", "x", "w"), ("P", "c3", "y", "w")],
+        {"P": {"a"}, "Q": {"a"}}, {"P": 2010, "Q": 2008}, {("x", "a"): 2009})
+    check("a co-author of the member in or before the paper's year explains",
+          coauthor == {("P", "c1", "x"): "coauthor"})
+
+
+class FakeDB:
+    def __init__(self):
+        self.queries, self.many = [], []
+
+    def execute_query(self, query):
+        self.queries.append(query)
+
+    def execute_many(self, query, data):
+        self.many.append((query, data))
+
+
+def test_write_table():
+    print("\n-- writing a table --")
+    db = FakeDB()
+    extract.write_table(db, "explained", ["a", "b"], [(1, 2), (3, 4), (5, 6)], batch=2)
+    check("full batches in one call, the rest in another",
+          [data for _, data in db.many] == [[(1, 2, 3, 4)], [(5, 6)]]
+          and db.many[0][0].count("?") == 4 and db.many[1][0].count("?") == 2)
+    check("the table is made anew and indexed",
+          db.queries[0].startswith("DROP TABLE") and "CREATE INDEX" in db.queries[-1])
+    check("the seats queries use the check only when it is on",
+          ("checkable" in extract.CITES_SQL) == extract.CHECK_CITING_AUTHORS
+          and ("checkable" in extract.EDITIONS_SQL) == extract.CHECK_CITING_AUTHORS
+          and ("checkable" in extract.OWN_SQL) == extract.CHECK_CITING_AUTHORS)
+
+
 # --- well-known works ----------------------------------------------------------
 
 def test_index_citations():
@@ -402,6 +530,34 @@ def test_well_known_works():
           ("T/2012", 1) in extract.well_known_works(cited, editions, counts, top=0.1,
                                                     min_works=2))
 
+    counts = extract.CitationCounts(12, 2010, 2014)
+    counts.add({**{(work, 2010): work + 1 for work in range(10)},
+                (10, 2011): 1, (10, 2014): 50, (11, 2014): 60})
+    counts.accumulate()
+    cited = [("S/2012", work) for work in range(12)]
+    pub_year = {10: 2011, 11: 2012}
+    known = extract.well_known_works(cited, editions, counts, pub_year, top=0.1, min_works=5,
+                                     grace=3)
+    check("a young work is judged when it is grace years old", ("S/2012", 10) in known)
+    check("...without grace, at the edition's year",
+          ("S/2012", 10) not in extract.well_known_works(cited, editions, counts, pub_year,
+                                                         top=0.1, min_works=5, grace=0))
+    check("...at most in the last year of the counts", ("S/2012", 11) in known)
+    check("a work without a year is judged at the edition's year",
+          ("S/2012", 9) in known and ("S/2012", 7) not in known)
+
+
+def test_crossing_ages():
+    print("\n-- age at which works became well known --")
+    counts = extract.CitationCounts(11, 2010, 2022)
+    counts.add({**{(work, 2010): 1 for work in range(1, 10)}, (0, 2013): 100, (10, 2016): 100})
+    counts.accumulate()
+    check("the in_year column is every work's count up to the year",
+          list(counts.in_year(2013))[:2] == [100, 1] and counts.last_year == 2022)
+    ages = extract.crossing_ages(counts, {0: 2010, 1: 2010, 10: 2015}, top=0.1, age=10)
+    check("the age a work first reached the top, for works in the top at age 10",
+          ages == [3])
+
 
 # --- files ---------------------------------------------------------------------
 
@@ -425,6 +581,7 @@ def main():
     test_is_main()
     test_same_committee()
     test_on_power()
+    test_career_starts()
     test_scored_seats()
     test_off_power_conference()
     test_off_power_rate()
@@ -432,8 +589,14 @@ def main():
     test_gate()
     test_build_corpus()
     test_publication_counts()
+    test_author_records()
+    test_index_references()
+    test_checkable_papers()
+    test_explained_citations()
+    test_write_table()
     test_index_citations()
     test_well_known_works()
+    test_crossing_ages()
     test_files()
     print("\nRESULT:", "ALL PASS" if _failures == 0 else f"{_failures} FAILURE(S)")
     raise SystemExit(1 if _failures else 0)

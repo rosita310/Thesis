@@ -7,6 +7,7 @@ Tests for bbn_inject.py, on a synthetic corpus. No data file needed.
 from __future__ import annotations
 
 import bbn_inject as inject
+from cs3_config import MIN_SEATS
 
 _failures = 0
 
@@ -46,13 +47,21 @@ def test_coerce():
           s["citing"] == 10 + round(6 * (1 - 10 / 40)))
     full = inject.coerce(seat(40, 40, papers=40, pc_size=20), extra=1, reviews=3)
     check("no citing papers beyond the papers", full["citing"] == 40)
+    half = inject.coerce(seat(4, 10, papers=40, pc_size=20), extra=2, reviews=3, explained=0.5)
+    check("an explained share of the planted citations does not count, the gate counts all",
+          (half["cites"], half["cites_gate"]) == (4 + 6, 5 + 12))
+    check("a reviewed paper stays citing unless all its planted citations are explained",
+          half["citing"] == 10 + round(6 * 0.75 * (1 - 10 / 40)))
+    check("none explained is the plain coerced seat",
+          inject.coerce(seat(4, 10, papers=40, pc_size=20), extra=2, reviews=3,
+                        explained=0.0) == s)
 
 
 def test_fits_review_load():
     print("\n-- surplus within the review load --")
     seats = [{**seat(16, 4), "fit_papers": 3}, {**seat(16, 4), "fit_papers": 7},
              {**seat(31, 20), "fit_papers": 12}, {**seat(3, 3), "fit_papers": 1}]
-    fits = inject.fits_review_load(corpus({"p": seats}), reviews=3)
+    fits = inject.fits_review_load(corpus({"p": seats}), reviews=3, edges=[10, 20, 40])
     check("per bin: the share of seats whose fit_papers is within k = 6",
           fits == {"mild": (2, 0.5), "high": (1, 0.0)})
 
@@ -87,19 +96,23 @@ def test_draw():
 
 def test_run():
     print("\n-- the test --")
-    members = {f"m{i}": [seat(0, 0, edition=f"conf/a/{y}") for y in (2010, 2011, 2012)]
+    members = {f"m{i}": [seat(0, 0, edition=f"conf/a/{2010 + y}") for y in range(MIN_SEATS)]
                for i in range(200)}
-    base, results = inject.run(corpus(members), extras=[1, 10], seat_counts=[1, 3],
-                               n_members=5, seed=0, reviews=3)
+    base, results = inject.run(corpus(members), extras=[1, 10], seat_counts=[1, MIN_SEATS],
+                               n_members=5, seed=0, reviews=3, explained_shares=[0.0, 1.0])
     check("nobody is shortlisted without injection", all(not s for s in base.values()))
     check("one row per variant, extra and number of seats",
-          len(results) == len(inject.VARIANTS) * 4)
-    weak = [r for r in results if (r["extra"], r["seats"]) == (1, 1)]
-    strong = [r for r in results if (r["extra"], r["seats"]) == (10, 3)]
+          len(results) == len(inject.VARIANTS) * 4 * 2)
+    weak = [r for r in results if (r["explained"], r["extra"], r["seats"]) == (0.0, 1, 1)]
+    strong = [r for r in results
+              if (r["explained"], r["extra"], r["seats"]) == (0.0, 10, MIN_SEATS)]
+    gone = [r for r in results if r["explained"] == 1.0]
     check("six planted citations in one seat stay typical",
           all(r["shortlisted_ungated"] == 0 and r["median_injected"] == 6 for r in weak))
     check("sixty in every seat are shortlisted",
           all(r["shortlisted"] == r["members"] == 5 for r in strong))
+    check("all of them explained, nobody is shortlisted",
+          all(r["shortlisted_ungated"] == 0 and r["median_injected"] == 0 for r in gone))
 
 
 def main():

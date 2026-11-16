@@ -3,25 +3,21 @@ Builds the BBN corpus for the PC member citation case study from the front matte
 dblp and OpenCitations tables in the database, of every source in SOURCES (LNCS, ACM)
 together.
 
-    python bbn_extract.py --stage citations
-        Counts the citations to every cited work in the OpenCitations Index, or reads
-        them from bbn/index_counts.pkl when saved for the same works (--rescan counts
-        anew), and materialises SCHEMA.edition_map (volumes of one conference and year
-        that list the same committee are one edition), SCHEMA.well_known (the works
-        well known at an edition),
-        SCHEMA.citation (one row per citing paper, cited reference and author
-        of the cited work) and SCHEMA.paper (the papers with their reference
-        counts).
+    python bbn_extract.py --stage citations [--rescan]
+        Materialises SCHEMA.edition_map, well_known, citation and paper. The Index counts
+        are cached in bbn/index_counts.pkl; --rescan counts anew.
+    python bbn_extract.py --stage authors
+        Materialises SCHEMA.checkable and explained from the dblp dump, the OMID index and
+        the Index (CHECK_CITING_AUTHORS).
     python bbn_extract.py --stage seats
-        Writes bbn/seats.csv: one row per pc or senior_pc seat of a matched
-        member, with its citations, the member's expected citations, the surplus and
-        the depth (citations per citing paper over those expected).
+        Writes bbn/seats.csv: one row per pc or senior_pc seat of a matched member, with
+        its citations, expected citations, surplus and depth.
     python bbn_extract.py --stage publications
-        Writes bbn/publications.csv from the dblp dump: the publications of every
-        member in bbn/seats.csv per year.
+        Writes bbn/publications.csv from the dblp dump: the publications of every member
+        in bbn/seats.csv per year.
     python bbn_extract.py --stage corpus
-        Writes bbn/bbn_cs3_corpus.json from bbn/seats.csv and bbn/publications.csv:
-        the seats per member, each with the member's publications before its year.
+        Writes bbn/bbn_cs3_corpus.json: the seats per member, each with the member's
+        publications before its year.
 
 The last two need no database.
 """
@@ -45,10 +41,13 @@ from collections import Counter, defaultdict
 from multiprocessing import Pool
 from pathlib import Path
 
-from cs3_config import (BBN_DIR, DUMP_PATH, ENV_PATH, GATE_REFERENCES, MAX_SPAN,
-                        MIN_OFF_PAPERS, MIN_PC_SHARE, MIN_PC_SIZE, PC_SIZE_WINDOW, PUB_TYPES,
+from cs3_config import (BBN_DIR, CAREER_ROLES, CHECK_CITING_AUTHORS, DUMP_PATH, ENV_PATH,
+                        GATE_REFERENCES,
+                        INSERT_BATCH, MAX_SPAN, MIN_AUTHOR_PAPERS, MIN_OFF_PAPERS, MIN_PC_SHARE,
+                        MIN_PC_SIZE, PC_SIZE_WINDOW, PUB_TYPES,
                         RATE_PSEUDO_COUNT, RATE_WINDOW, ROLES, SAME_COMMITTEE, SCAN_PROCESSES,
-                        SCHEMA, SOURCES, WELL_KNOWN_MIN_WORKS, WELL_KNOWN_TOP)
+                        SCHEMA, SOURCES, WELL_KNOWN_AGE, WELL_KNOWN_GRACE, WELL_KNOWN_MIN_WORKS,
+                        WELL_KNOWN_TOP)
 
 
 def edition(column: str) -> str:
@@ -108,6 +107,18 @@ FROM {REFERENCE} r
 JOIN {ARTICLE} a ON a.doi = r.citing
 """
 
+# The year of publication in dblp of every cited work; the earliest of its DOIs.
+WORK_YEARS_SQL = rf"""
+SELECT r.cited_omid, min(substring(p.year::text from '^\d{{4}}')::int) AS year
+FROM (
+    SELECT DISTINCT cited_omid, unnest(string_to_array(cited_dois, ' ')) AS doi
+    FROM {REFERENCE} r
+    WHERE cited_dois IS NOT NULL
+) r
+JOIN dblp_dump.cited_publication p ON p.doi = r.doi
+GROUP BY 1
+"""
+
 # A cited work can have several DOIs; cited_dois holds all of them, cited only one.
 CITATION_SQL = rf"""
 CREATE TABLE "{SCHEMA}".citation AS
@@ -121,6 +132,7 @@ SELECT
     a.edition_key,
     ref.cited,
     ca.dblp_pid AS cited_pid,
+    min(ref.cited_omid) AS cited_omid,
     bool_or(aa.dblp_pid IS NOT NULL) AS is_self,
     bool_or(w.cited_omid IS NOT NULL) AS is_well_known
 FROM ref
@@ -150,7 +162,35 @@ INDEXES = {
     "well_known": [("edition_key", "cited_omid")],
     "citation": [("edition_key", "cited_pid"), ("cited_pid",), ("article_dblp_key",)],
     "paper": [("edition_key",), ("article_dblp_key",)],
+    "checkable": [("article_dblp_key",)],
+    "explained": [("article_dblp_key", "cited", "cited_pid")],
 }
+
+# The papers that count, with their authors.
+PAPER_AUTHORS_SQL = f"""
+SELECT p.article_dblp_key, p.edition_key, lower(a.doi) AS doi,
+       string_agg(DISTINCT aa.dblp_pid, ' ') AS authors
+FROM "{SCHEMA}".paper p
+JOIN {ARTICLE} a ON a.dblp_key = p.article_dblp_key
+LEFT JOIN {AUTHOR} aa ON aa.article_dblp_key = p.article_dblp_key AND aa.dblp_pid IS NOT NULL
+WHERE p.n_resolved > 0
+GROUP BY 1, 2, 3
+"""
+
+ARTICLE_EDITIONS_SQL = f"""
+SELECT lower(doi) AS doi, edition_key FROM {ARTICLE} a WHERE doi IS NOT NULL
+"""
+
+# With CHECK_CITING_AUTHORS, only the checkable papers and the unexplained citations count.
+CHECKED_PAPER = (f' AND p.article_dblp_key IN (SELECT article_dblp_key FROM "{SCHEMA}".checkable)'
+                 if CHECK_CITING_AUTHORS else "")
+CHECK_JOINS = (f"""
+    LEFT JOIN "{SCHEMA}".checkable k ON k.article_dblp_key = c.article_dblp_key
+    LEFT JOIN "{SCHEMA}".explained e
+        ON e.article_dblp_key = c.article_dblp_key AND e.cited = c.cited
+       AND e.cited_pid = c.cited_pid""" if CHECK_CITING_AUTHORS else "")
+CHECKED_CITATION = (" AND k.article_dblp_key IS NOT NULL AND e.article_dblp_key IS NULL"
+                    if CHECK_CITING_AUTHORS else "")
 
 VOLUMES_SQL = rf"""
 SELECT m.edition_key, min(stream) AS stream,
@@ -165,8 +205,8 @@ EDITIONS_SQL = rf"""
 SELECT v.edition_key, v.stream, v.year, v.core_rank, v.source, coalesce(p.papers, 0) AS papers
 FROM ({VOLUMES_SQL}) v
 LEFT JOIN (
-    SELECT edition_key, count(*) AS papers FROM "{SCHEMA}".paper
-    WHERE n_resolved > 0 GROUP BY 1
+    SELECT p.edition_key, count(*) AS papers FROM "{SCHEMA}".paper p
+    WHERE p.n_resolved > 0{CHECKED_PAPER} GROUP BY 1
 ) p ON p.edition_key = v.edition_key
 """
 
@@ -187,9 +227,9 @@ CITES_SQL = f"""
 WITH {MEMBERS},
 per_paper AS (
     SELECT c.edition_key, c.cited_pid, c.article_dblp_key, count(*) AS refs,
-           count(*) FILTER (WHERE NOT c.is_self AND NOT c.is_well_known) AS cites
+           count(*) FILTER (WHERE NOT c.is_self AND NOT c.is_well_known{CHECKED_CITATION}) AS cites
     FROM "{SCHEMA}".citation c
-    JOIN member m ON m.dblp_pid = c.cited_pid
+    JOIN member m ON m.dblp_pid = c.cited_pid{CHECK_JOINS}
     GROUP BY 1, 2, 3
 )
 SELECT edition_key, cited_pid AS dblp_pid, sum(cites)::int AS cites,
@@ -207,8 +247,17 @@ SELECT p.edition_key, aa.dblp_pid, count(DISTINCT p.article_dblp_key) AS own_pap
 FROM "{SCHEMA}".paper p
 JOIN {AUTHOR} aa ON aa.article_dblp_key = p.article_dblp_key
 JOIN member m ON m.dblp_pid = aa.dblp_pid
-WHERE p.n_resolved > 0
+WHERE p.n_resolved > 0{CHECKED_PAPER}
 GROUP BY 1, 2
+"""
+
+# The citations of members that could count: self-citations and well-known works left out.
+MEMBER_CITATIONS_SQL = f"""
+WITH {MEMBERS}
+SELECT c.article_dblp_key, c.cited, c.cited_pid, c.cited_omid
+FROM "{SCHEMA}".citation c
+JOIN member m ON m.dblp_pid = c.cited_pid
+WHERE NOT c.is_self AND NOT c.is_well_known
 """
 
 
@@ -228,14 +277,23 @@ def read_config(path) -> configparser.SectionProxy:
     return config["SECTION"]
 
 
+# The planner cannot estimate the rows of the union views and of the unnested DOIs and takes
+# nested loops; hash joins are several times faster. A parallel hash outgrows the shared
+# memory of the Docker container.
+SESSION_SETTINGS = ["SET enable_nestloop = off", "SET max_parallel_workers_per_gather = 0",
+                    "SET work_mem = '256MB'"]
+
+
 def connect(env_path):
-    """A Postgres handle built from the .env."""
+    """A Postgres handle built from the .env, every connection with SESSION_SETTINGS."""
     from database import Postgress      # here, so the other scripts run without pyodbc
     config = read_config(env_path)
-    return Postgress(server=config["POSTGRES_SERVER"],
-                     database=config["POSTGRES_DB"],
-                     user=config["POSTGRES_USER"],
-                     password=config["POSTGRES_PASSWORD"])
+    db = Postgress(server=config["POSTGRES_SERVER"],
+                   database=config["POSTGRES_DB"],
+                   user=config["POSTGRES_USER"],
+                   password=config["POSTGRES_PASSWORD"])
+    db.connection_string += f"ConnSettings={{{';'.join(SESSION_SETTINGS)}}};"
+    return db
 
 
 def build_table(db, table: str, sql: str) -> None:
@@ -333,8 +391,16 @@ class CitationCounts:
             for i in range(start + 1, start + self.span):
                 self.totals[i] += self.totals[i - 1]
 
+    @property
+    def last_year(self) -> int:
+        return self.first_year + self.span - 1
+
     def up_to(self, work: int, year: int) -> int:
         return self.totals[work * self.span + year - self.first_year]
+
+    def in_year(self, year: int) -> array:
+        """Every work's citations up to and including `year`, in work order."""
+        return self.totals[year - self.first_year::self.span]
 
 
 def top_threshold(values: list[int], top: float) -> int:
@@ -343,17 +409,28 @@ def top_threshold(values: list[int], top: float) -> int:
     return values[min(int(len(values) * (1 - top)), len(values) - 1)]
 
 
-def well_known_works(cited, editions, counts: CitationCounts, top=WELL_KNOWN_TOP,
-                     min_works=WELL_KNOWN_MIN_WORKS) -> set[tuple[str, int]]:
+def well_known_works(cited, editions, counts: CitationCounts, pub_year=None,
+                     top=WELL_KNOWN_TOP, min_works=WELL_KNOWN_MIN_WORKS,
+                     grace=WELL_KNOWN_GRACE) -> set[tuple[str, int]]:
     """The (edition, work) pairs of `cited` whose work is well known at the edition: its
-    citations up to the edition's year are in the top `top` of the works the stream cites
+    citations up to the judging year are in the top `top` of the works the stream cites
     that have a citation by then, or of the works of all streams when the stream has fewer
-    than `min_works` of those."""
+    than `min_works` of those. The judging year is the edition's year, or the year the work
+    is `grace` years old when that is later (`pub_year` maps work -> year of publication),
+    at most the last year of `counts`."""
+    pub_year = pub_year or {}
+
+    def judged(edition_key, work):
+        year = editions[edition_key]["year"]
+        if work in pub_year:
+            year = max(year, pub_year[work] + grace)
+        return editions[edition_key]["stream"], min(year, counts.last_year)
+
     works_of, years_of = defaultdict(set), defaultdict(set)
     for edition_key, work in cited:
-        stream = editions[edition_key]["stream"]
+        stream, year = judged(edition_key, work)
         works_of[stream].add(work)
-        years_of[stream].add(editions[edition_key]["year"])
+        years_of[stream].add(year)
     all_works = set().union(*works_of.values())
     pooled = {}
 
@@ -373,11 +450,32 @@ def well_known_works(cited, editions, counts: CitationCounts, top=WELL_KNOWN_TOP
             thresholds[(stream, year)] = value
     known = set()
     for edition_key, work in cited:
-        stream, year = editions[edition_key]["stream"], editions[edition_key]["year"]
+        stream, year = judged(edition_key, work)
         citations = counts.up_to(work, year)
         if citations and citations >= thresholds[(stream, year)]:
             known.add((edition_key, work))
     return known
+
+
+def crossing_ages(counts: CitationCounts, pub_year, top=WELL_KNOWN_TOP,
+                  age=WELL_KNOWN_AGE) -> list[int]:
+    """For every work of `pub_year` (work -> year of publication) that is in the top `top` of
+    all works at `age` years old, the age at which it first was."""
+    thresholds = {}
+
+    def known_at(work, year):
+        if year not in thresholds:
+            values = [citations for citations in counts.in_year(year) if citations]
+            thresholds[year] = top_threshold(values, top) if values else None
+        citations = counts.up_to(work, year)
+        return bool(citations) and thresholds[year] is not None and citations >= thresholds[year]
+
+    ages = []
+    for work, year in pub_year.items():
+        if counts.first_year <= year and year + age <= counts.last_year \
+                and known_at(work, year + age):
+            ages.append(next(a for a in range(age + 1) if known_at(work, year + a)))
+    return ages
 
 
 def scan_index(index_dir: Path, works: dict[str, int], counts: CitationCounts,
@@ -530,6 +628,20 @@ def on_power_editions(committee) -> dict[str, set[str]]:
     return dict(editions_of)
 
 
+def career_starts(committee, editions, roles=CAREER_ROLES) -> dict[str, int]:
+    """pid -> the first year in which they hold one of `roles`, in any stream: the year of
+    the edition, or the year in its key for an edition without volumes."""
+    starts = {}
+    for r in committee:
+        if r["role_category"] not in roles or not r["dblp_pid"]:
+            continue
+        edition = editions.get(r["edition_key"])
+        year = edition["year"] if edition else conference_year(r["edition_key"])
+        if year is not None:
+            starts[r["dblp_pid"]] = min(year, starts.get(r["dblp_pid"], year))
+    return starts
+
+
 def scored_seats(committee) -> dict[tuple[str, str], dict]:
     """(edition, pid) -> role and name, for every matched seat in ROLES. A member listed
     as both pc and senior_pc holds the senior_pc seat."""
@@ -549,13 +661,14 @@ class OffPower:
 
     `cites` maps pid -> edition -> citations (self and well-known works left out), `own`
     pid -> edition -> the member's own papers among the edition's papers. Only complete
-    main editions count.
+    main editions count, from the year in `starts` (pid -> the start of their career) on.
     """
 
     def __init__(self, editions, complete, on_power, cites, own, window=RATE_WINDOW,
-                 max_span=MAX_SPAN):
+                 max_span=MAX_SPAN, starts=None):
         self.editions, self.window, self.max_span = editions, window, max_span
         self.on_power, self.cites, self.own = on_power, cites, own
+        self.starts = starts or {}
         self.by_stream = defaultdict(list)
         for edition_key in complete:
             if is_main(edition_key):
@@ -570,9 +683,12 @@ class OffPower:
         another count over the same editions."""
         cites, own = (counts or self.cites).get(pid, {}), self.own.get(pid, {})
         by_distance = defaultdict(list)
+        start = self.starts.get(pid)
         for edition_key in self.by_stream.get(stream, ()):
-            if edition_key not in self.on_power.get(pid, ()):
-                by_distance[abs(self.editions[edition_key]["year"] - year)].append(edition_key)
+            edition_year = self.editions[edition_key]["year"]
+            if (edition_key not in self.on_power.get(pid, ())
+                    and (start is None or edition_year >= start)):
+                by_distance[abs(edition_year - year)].append(edition_key)
         off_cites = off_papers = span = 0
         for distance in sorted(by_distance):
             if distance > self.max_span or (distance > self.window and off_papers >= min_papers):
@@ -617,10 +733,7 @@ def seat_rows(seats, editions, cites, citing, gate_cites, own, pc_size, off: Off
     """One row per seat. `citing` maps pid -> edition -> the papers citing the member,
     `gate_cites` (edition, pid) -> the references to the member, `pc_size` edition -> its
     pc + senior_pc rows, `per_paper` (edition, pid) -> the cites per citing paper, most
-    first. Without enough off-power
-    papers the rate is that of the other seats of the edition, when there are at least
-    `min_peers`. The expected citations take the larger of the rate and that of the other
-    seats; the expected citing papers likewise."""
+    first. The peer rate needs at least `min_peers` other seats."""
     rows = []
     for (edition_key, pid), seat in sorted(seats.items()):
         ed = editions[edition_key]
@@ -738,6 +851,179 @@ def pubs_before(pubs_by_year: dict, year: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Citing authors (dblp dump, OMID index, OpenCitations Index)
+# ---------------------------------------------------------------------------
+
+P_DOI = "<https://dblp.org/rdf/schema#doi>"
+DOI_PREFIX = "<https://doi.org/"
+
+
+def author_records(lines, wanted, types=PUB_TYPES):
+    """(year, DOIs, its authors in `wanted`) of every record of one of `types` with such an
+    author. The triples of a record are contiguous in the dump."""
+    types = {f"<https://dblp.org/rdf/schema#{rdf_type}>" for rdf_type in types}
+    subject, is_pub, year, dois, authors = None, False, None, [], set()
+    for line in lines:
+        if not line.startswith(REC_PREFIX):
+            continue
+        record, predicate, obj = line.split(" ", 2)
+        if record != subject:
+            if is_pub and authors:
+                yield year, dois, authors
+            subject, is_pub, year, dois, authors = record, False, None, [], set()
+        if predicate == P_TYPE:
+            is_pub = is_pub or obj[:obj.find(">") + 1] in types
+        elif predicate == P_AUTHORED_BY and obj.startswith(PID_PREFIX):
+            pid = obj[len(PID_PREFIX):obj.find(">")]
+            if pid in wanted:
+                authors.add(pid)
+        elif predicate == P_YEAR:
+            year = int(obj[1:5])
+        elif predicate == P_DOI and obj.startswith(DOI_PREFIX):
+            dois.append(obj[len(DOI_PREFIX):obj.rfind(">")].lower())
+    if is_pub and authors:
+        yield year, dois, authors
+
+
+def author_papers(records, coauthors_wanted) -> tuple[dict, dict]:
+    """From author_records: DOI -> its authors, and (member, author) -> the first year they
+    have a record together, for the authors in coauthors_wanted[member]."""
+    by_doi, first = {}, {}
+    for year, dois, authors in records:
+        for doi in dois:
+            by_doi[doi] = tuple(sorted(authors.union(by_doi.get(doi, ()))))
+        if not year:
+            continue
+        for member in authors:
+            for author in authors & coauthors_wanted.get(member, set()):
+                if year < first.get((member, author), year + 1):
+                    first[(member, author)] = year
+    return by_doi, first
+
+
+def doi_omids(lines, dois) -> dict[str, str]:
+    """OMID -> DOI for the DOIs in `dois`, from lines of the OMID index:
+    'doi:10.1/x,omid:br/06...', several OMIDs separated by spaces."""
+    omids = {}
+    for line in lines:
+        if not line.startswith("doi:"):
+            continue
+        doi, _, line_omids = line.rstrip("\n").rpartition(",")
+        doi = doi[len("doi:"):].lower()
+        if doi in dois:
+            for omid in line_omids.strip('"').split():
+                omids[omid[len("omid:"):]] = doi
+    return omids
+
+
+def index_references(lines, papers, works) -> tuple[set, list]:
+    """(the OMIDs of `papers` that cite anything, the (paper, work) citations from one of
+    `papers` to one of `works`), from lines of the Index CSV."""
+    citing, pairs = set(), []
+    for line in lines:
+        parts = line.split(",", 3)
+        if len(parts) == 4 and parts[1][len("omid:"):] in papers:
+            paper, work = parts[1][len("omid:"):], parts[2][len("omid:"):]
+            citing.add(paper)
+            if work in works:
+                pairs.append((paper, work))
+    return citing, pairs
+
+
+_ref_papers = _ref_works = None
+
+
+def _init_references(papers, works):
+    global _ref_papers, _ref_works
+    _ref_papers, _ref_works = papers, works
+
+
+def _scan_references(zip_path: Path) -> tuple[set, list]:
+    return index_references(zip_lines(zip_path), _ref_papers, _ref_works)
+
+
+def scan_references(index_dir: Path, papers: set, works: set, processes=SCAN_PROCESSES):
+    """index_references per file of the Index."""
+    files = sorted(index_dir.glob("*.zip"))
+    if not files:
+        sys.exit(f"No OpenCitations Index zips in {index_dir.resolve()}; pass --index.")
+    start = time.time()
+    with Pool(processes, initializer=_init_references, initargs=(papers, works)) as pool:
+        for i, result in enumerate(pool.imap_unordered(_scan_references, files), 1):
+            logging.info(f"{i}/{len(files)} index files, {time.time() - start:.0f}s")
+            yield result
+
+
+def checkable_papers(paper_authors, paper_doi, by_doi, with_refs,
+                     min_papers=MIN_AUTHOR_PAPERS) -> set[str]:
+    """The papers with an author who has at least `min_papers` other publications in
+    `with_refs`, the DOIs with references in the Index; `by_doi` maps DOI -> its authors."""
+    n_refs = Counter(author for doi in with_refs for author in by_doi.get(doi, ()))
+    checkable = set()
+    for paper, authors in paper_authors.items():
+        doi = paper_doi.get(paper)
+        own = set(by_doi.get(doi, ())) if doi in with_refs else set()
+        if any(n_refs[author] - (author in own) >= min_papers for author in authors):
+            checkable.add(paper)
+    return checkable
+
+
+def explained_citations(citations, paper_authors, paper_doi, cites_of, by_doi, doi_edition,
+                        on_power) -> dict[tuple[str, str, str], str]:
+    """(paper, cited, pid) -> 'cites elsewhere' for the (paper, cited, pid, work) of
+    `citations` whose work an author of the paper cites in another publication
+    (`cites_of`: (author, work) -> DOIs) that the member did not write (`by_doi`: DOI -> its
+    authors) and that is not in an edition where the member holds a role. `doi_edition` maps
+    the DOIs of the corpus to their edition."""
+    explained = {}
+    for paper, cited, pid, work in citations:
+        roles = on_power.get(pid, ())
+        if any(doi != paper_doi.get(paper) and pid not in by_doi.get(doi, ())
+               and doi_edition.get(doi) not in roles
+               for author in paper_authors.get(paper, ())
+               for doi in cites_of.get((author, work), ())):
+            explained[(paper, cited, pid)] = "cites elsewhere"
+    return explained
+
+
+def coauthor_citations(citations, paper_authors, paper_year,
+                       coauthored) -> dict[tuple[str, str, str], str]:
+    """(paper, cited, pid) -> 'coauthor' for the citations of a member by a paper with an
+    author who has a record with the member in or before the paper's year (`coauthored`:
+    (member, author) -> the first year)."""
+    explained = {}
+    for paper, cited, pid, _ in citations:
+        year = paper_year[paper]
+        if any(coauthored.get((pid, author), year + 1) <= year
+               for author in paper_authors.get(paper, ())):
+            explained[(paper, cited, pid)] = "coauthor"
+    return explained
+
+
+def write_table(db, table: str, columns: list[str], rows: list[tuple],
+                batch=INSERT_BATCH) -> None:
+    """SCHEMA.table anew, text columns, `batch` rows per INSERT."""
+    db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
+    db.execute_query(f'CREATE TABLE "{SCHEMA}"."{table}" '
+                     f'({", ".join(f"{column} text" for column in columns)})')
+
+    def insert(n):
+        row = "(" + ", ".join("?" * len(columns)) + ")"
+        return f'INSERT INTO "{SCHEMA}"."{table}" VALUES ' + ", ".join([row] * n)
+
+    full = len(rows) - len(rows) % batch
+    if full:
+        db.execute_many(insert(batch), [tuple(value for row in rows[i:i + batch] for value in row)
+                                        for i in range(0, full, batch)])
+    if len(rows) > full:
+        db.execute_many(insert(len(rows) - full),
+                        [tuple(value for row in rows[full:] for value in row)])
+    for columns_of_index in INDEXES[table]:
+        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{table}" '
+                         f'({", ".join(columns_of_index)})')
+
+
+# ---------------------------------------------------------------------------
 # The corpus
 # ---------------------------------------------------------------------------
 
@@ -802,8 +1088,19 @@ def stage_citations(db, index_dir: Path, counts_path: Path, rescan: bool) -> Non
         scan_index(index_dir, works, counts)
         counts.accumulate()
         save_counts(counts_path, omids, counts)
+    pub_year = {works[r["cited_omid"]]: r["year"] for r in db.execute_query_result(WORK_YEARS_SQL)
+                if r["cited_omid"] in works and r["year"]}
+    logging.info(f"{len(pub_year)} of {len(omids)} cited works have a year in dblp")
     known = well_known_works([(edition_key, works[omid]) for edition_key, omid in pairs],
-                             editions, counts)
+                             editions, counts, pub_year)
+    ages = crossing_ages(counts, pub_year)
+    if ages:
+        quartiles = statistics.quantiles(ages, n=4) if len(ages) > 1 else [ages[0]] * 3
+        logging.info(f"{len(ages)} works in the top {WELL_KNOWN_TOP:.0%} of all works at "
+                     f"{WELL_KNOWN_AGE} years old; age at which they first were: quartiles "
+                     f"{' / '.join(f'{q:g}' for q in quartiles)}, by age "
+                     + " ".join(f"{age}:{pct(n, len(ages)).strip()}"
+                                for age, n in sorted(Counter(ages).items())))
     build_well_known(db, {(edition_key, omids[work]) for edition_key, work in known})
     build_table(db, "citation", CITATION_SQL)
     build_table(db, "paper", PAPER_SQL)
@@ -825,6 +1122,75 @@ def stage_citations(db, index_dir: Path, counts_path: Path, rescan: bool) -> Non
                  f"{float(citations['well_known_share']):.3f}")
     logging.info(f"paper: {papers['papers']} papers, {papers['in_oc']} with references in "
                  f"OpenCitations, {papers['resolved']} with a reference resolved to dblp")
+
+
+def stage_authors(db, dump: Path, omid_dir: Path, index_dir: Path) -> None:
+    start = time.time()
+    editions = read_editions(db, VOLUMES_SQL)
+    on_power = on_power_editions(db.execute_query_result(COMMITTEE_SQL))
+    paper_authors, paper_doi, paper_year = {}, {}, {}
+    for r in db.execute_query_result(PAPER_AUTHORS_SQL):
+        paper = r["article_dblp_key"]
+        paper_authors[paper] = set((r["authors"] or "").split())
+        paper_doi[paper] = r["doi"]
+        paper_year[paper] = editions[r["edition_key"]]["year"]
+    citations = [(r["article_dblp_key"], r["cited"], r["cited_pid"], r["cited_omid"])
+                 for r in db.execute_query_result(MEMBER_CITATIONS_SQL)]
+    doi_edition = {r["doi"]: r["edition_key"]
+                   for r in db.execute_query_result(ARTICLE_EDITIONS_SQL)}
+    logging.info(f"read in {time.time() - start:.0f}s: {len(paper_authors)} papers, "
+                 f"{len(citations)} citations of members")
+
+    coauthors_wanted, cites_wanted = defaultdict(set), defaultdict(set)
+    for paper, _, pid, work in citations:
+        coauthors_wanted[pid] |= paper_authors[paper]
+        cites_wanted[work] |= paper_authors[paper]
+    wanted = set().union(*paper_authors.values()) | set(coauthors_wanted)
+    if not dump.exists():
+        sys.exit(f"No dblp dump at {dump.resolve()}; pass --dump.")
+    with open(dump, encoding="utf-8", errors="replace", buffering=1 << 22) as f:
+        by_doi, coauthored = author_papers(author_records(with_progress(f), wanted),
+                                           coauthors_wanted)
+    del coauthors_wanted
+    logging.info(f"{len(by_doi)} publications with a DOI of {len(wanted)} authors, "
+                 f"{len(coauthored)} co-authorships of a member with a citing author")
+
+    omid_files = sorted(omid_dir.glob("meta_br*.zip"))
+    if not omid_files:
+        sys.exit(f"No OMID index zips in {omid_dir.resolve()}; pass --omid.")
+    omid_doi = doi_omids((line for path in omid_files for line in zip_lines(path)), by_doi)
+    logging.info(f"{len(set(omid_doi.values()))} of {len(by_doi)} DOIs have an OMID")
+
+    works = {work for *_, work in citations if work}
+    with_refs, cites_of = set(), defaultdict(set)
+    for citing, pairs in scan_references(index_dir, set(omid_doi), works):
+        with_refs.update(omid_doi[omid] for omid in citing)
+        for omid, work in pairs:
+            doi = omid_doi[omid]
+            for author in cites_wanted[work].intersection(by_doi[doi]):
+                cites_of[(author, work)].add(doi)
+    del cites_wanted
+    logging.info(f"{len(with_refs)} publications with references in the Index")
+
+    checkable = checkable_papers(paper_authors, paper_doi, by_doi, with_refs)
+    explained = {**explained_citations(citations, paper_authors, paper_doi, cites_of, by_doi,
+                                       doi_edition, on_power),
+                 **coauthor_citations(citations, paper_authors, paper_year, coauthored)}
+    write_table(db, "checkable", ["article_dblp_key"], [(paper,) for paper in sorted(checkable)])
+    write_table(db, "explained", ["article_dblp_key", "cited", "cited_pid", "reason"],
+                [(*key, reason) for key, reason in sorted(explained.items())])
+
+    counted = [c for c in citations if c[0] in checkable]
+    reasons = Counter(explained.get(c[:3], "unexplained") for c in counted)
+    print(f"\n=== CITING AUTHORS ({time.time() - start:.0f}s) ===")
+    print(f"  papers                               {len(paper_authors):>9}")
+    print(f"  ...checkable                         {len(checkable):>9}  "
+          f"({pct(len(checkable), len(paper_authors))})")
+    print(f"  citations of members                 {len(citations):>9}")
+    print(f"  ...from a checkable paper            {len(counted):>9}  "
+          f"({pct(len(counted), len(citations))})")
+    for reason in ("coauthor", "cites elsewhere", "unexplained"):
+        print(f"  ......{reason:<31}{reasons[reason]:>9}  ({pct(reasons[reason], len(counted))})")
 
 
 def print_seats_summary(rows, editions, pc_size, complete, n_unknown) -> None:
@@ -887,7 +1253,8 @@ def stage_seats(db, out_dir: Path) -> None:
     seats = scored_seats(committee)
     unknown = {key for key in seats if key[0] not in editions}
     seats = {key: seat for key, seat in seats.items() if key not in unknown}
-    off = OffPower(editions, complete, on_power_editions(committee), cites, own)
+    starts = career_starts(committee, editions)
+    off = OffPower(editions, complete, on_power_editions(committee), cites, own, starts=starts)
     rows = seat_rows(seats, editions, cites, citing, gate_cites, own, pc_size, off,
                      per_paper=per_paper)
 
@@ -935,7 +1302,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the CS3 PC member citation BBN corpus.")
     parser.add_argument("--stage", required=True,
-                        choices=["citations", "seats", "publications", "corpus"])
+                        choices=["citations", "authors", "seats", "publications", "corpus"])
     parser.add_argument("--out-dir", default=str(BBN_DIR), help="where the BBN files go")
     parser.add_argument("--env", default=None,
                         help=f"path to the .env with the POSTGRES_* values (default: {ENV_PATH})")
@@ -944,6 +1311,9 @@ def main() -> None:
     parser.add_argument("--index", default=None,
                         help="folder with the OpenCitations Index zips "
                              "(default: RAW_DATA/opencitations/index from the .env)")
+    parser.add_argument("--omid", default=None,
+                        help="folder with the OMID index zips "
+                             "(default: RAW_DATA/opencitations/omid from the .env)")
     parser.add_argument("--rescan", action="store_true",
                         help="count the Index anew instead of reading bbn/index_counts.pkl")
     args = parser.parse_args()
@@ -959,10 +1329,13 @@ def main() -> None:
         return
     env_path = Path(args.env) if args.env else ENV_PATH
     db = connect(env_path)
+    opencitations = Path(read_config(env_path)["RAW_DATA"]) / "opencitations"
+    index_dir = Path(args.index) if args.index else opencitations / "index"
     if args.stage == "citations":
-        index_dir = (Path(args.index) if args.index
-                     else Path(read_config(env_path)["RAW_DATA"]) / "opencitations" / "index")
         stage_citations(db, index_dir, Path(args.out_dir) / "index_counts.pkl", args.rescan)
+    if args.stage == "authors":
+        stage_authors(db, Path(args.dump) if args.dump else DUMP_PATH,
+                      Path(args.omid) if args.omid else opencitations / "omid", index_dir)
     if args.stage == "seats":
         stage_seats(db, Path(args.out_dir))
 

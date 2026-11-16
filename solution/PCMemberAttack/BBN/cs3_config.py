@@ -24,6 +24,10 @@ SCHEMA = "cs3_citation"      # the materialised citation and paper tables
 
 ROLES = ["pc", "senior_pc"]  # the role categories whose seats are scored
 
+# A member's career starts in the first year with one of CAREER_ROLES in any stream; only
+# editions from that year on are off-power.
+CAREER_ROLES = ["pc", "senior_pc", "pc_chair"]
+
 # Editions of one conference and year whose matched pc + senior_pc overlap by at least this
 # much (Jaccard) list the same committee in several volumes, and are taken as one edition.
 SAME_COMMITTEE = 0.8
@@ -42,8 +46,11 @@ RATE_PSEUDO_COUNT = 0.5      # added to the off-power citations
 # including the edition's year, the authors' own left out, are in the top WELL_KNOWN_TOP of
 # the works the stream cites that have a citation by then. A stream with fewer of those than
 # WELL_KNOWN_MIN_WORKS takes the works of all streams. References to a well-known work do not
-# count in cites.
-WELL_KNOWN_TOP = 0.05
+# count in cites. A work younger than WELL_KNOWN_GRACE years at the edition is judged in the
+# year it reaches that age, or the last year of the Index counts when that comes first.
+WELL_KNOWN_TOP = 0.10
+WELL_KNOWN_GRACE = 6
+WELL_KNOWN_AGE = 10          # the age at which --stage citations reports when works crossed
 WELL_KNOWN_MIN_WORKS = 1000
 SCAN_PROCESSES = 8           # parallel readers of the OpenCitations Index
 
@@ -60,6 +67,16 @@ GATE_REFERENCES = 10         # Westerbaan: a seat with more references than this
 # (not Informal, Reference, Data, Editorship or Withdrawn).
 PUB_TYPES = ["Article", "Inproceedings", "Incollection", "Book"]
 
+# A citation counts only when its paper is checkable and no author of the paper explains it.
+# Checkable: an author has at least MIN_AUTHOR_PAPERS other publications (PUB_TYPES) with
+# references in the OpenCitations Index. Explained: an author cites the work in another of
+# their publications outside the editions where the member holds a role, or co-authored with
+# the member in or before the edition's year. The papers of a seat and of its rates are the
+# checkable ones. False counts every citation and paper.
+CHECK_CITING_AUTHORS = True
+MIN_AUTHOR_PAPERS = 10
+INSERT_BATCH = 1000          # rows per INSERT statement
+
 # ---------------------------------------------------------------------------
 # The model (bbn_infer.py)
 # ---------------------------------------------------------------------------
@@ -67,7 +84,7 @@ PUB_TYPES = ["Article", "Inproceedings", "Incollection", "Book"]
 # Bins of the surplus, cites - expected: SURPLUS_EDGES are the lower edges, in citations, of
 # every bin after the first.
 STATES = ["typical", "mild", "high", "extreme"]
-SURPLUS_EDGES = [10, 20, 40]
+SURPLUS_EDGES = [5, 10, 20]
 # depth: citations per citing paper over the expected citations per citing paper. A seat in a
 # bin after typical with depth at least DEPTH_EDGE is deep.
 DEPTH_EDGE = 1.5
@@ -76,7 +93,7 @@ PROM_BANDS = [0.5, 2, 5, 15, 50]
 # A seat with the peer rate has bands of the member's publications instead.
 PUBS_BANDS = [15, 60, 180]
 
-MIN_SEATS = 3                # a member is scored with at least this many seats
+MIN_SEATS = 5                # a member is scored with at least this many seats
 
 PRIOR = 0.95                 # P(genuine)
 ALPHA = 0.50                 # share of a non-genuine member's seats with coerced citations
@@ -101,5 +118,9 @@ WATCH_PIDS = ["n/GonzaloNavarro"]   # always printed with their rank: Westerbaan
 REVIEWS_PER_PAPER = 3
 INJECT_EXTRA = [1, 2, 3, 5]
 INJECT_SEATS = [1, 2, 3]     # coerced seats per member
+# The planted citations count as unexplained (CHECK_CITING_AUTHORS), or are explained as often
+# as the real ones that no co-author explains: cites elsewhere / (cites elsewhere +
+# unexplained) in the summary of --stage authors.
+INJECT_EXPLAINED = [0.0, 0.54]
 INJECT_MEMBERS = 500         # drawn from the scored members that no variant shortlists
 INJECT_SEED = 1

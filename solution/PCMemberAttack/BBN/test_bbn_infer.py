@@ -28,6 +28,7 @@ def approx(a, b, tol=1e-9):
 
 
 ALPHA = 0.5
+EDGES = [10, 20, 40]
 MANIP = {"typical": 0.0, "mild": 0.2, "high": 0.4, "extreme": 0.4}
 N_STATES = len(infer.EVIDENCE_STATES)
 
@@ -46,7 +47,7 @@ def seat(cites, expected, stream="conf/a", core_rank="A", src="conference", edit
 
 
 def classified(*args, **kwargs):
-    return infer.classify(seat(*args, **kwargs))
+    return infer.classify(seat(*args, **kwargs), edges=EDGES)
 
 
 def corpus(members):
@@ -61,7 +62,7 @@ def corpus(members):
 
 def test_bins():
     print("\n-- surplus bins and bands --")
-    edges = [10, 20, 40]
+    edges = EDGES
     check("below the first edge is typical",
           infer.surplus_bin(9.99, edges) == "typical" and infer.surplus_bin(-3, edges) == "typical")
     check("an edge belongs to the bin above it",
@@ -92,11 +93,11 @@ def test_depth():
           approx(infer.seat_depth(s), (30 / 5) / (6.0 / 4.0)))
     check("no citing paper has no depth", infer.seat_depth(seat(0, 1.0)) is None)
     check("a bin after typical with depth at the edge is deep",
-          infer.seat_state(25, 1.5, depth_edge=1.5) == "high deep"
-          and infer.seat_state(25, 1.49, depth_edge=1.5) == "high")
-    check("typical is never deep", infer.seat_state(5, 3.0, depth_edge=1.5) == "typical")
-    check("without a depth a seat is not deep", infer.seat_state(25, None) == "high")
-    c = infer.classify(s, depth_edge=1.5)
+          infer.seat_state(25, 1.5, EDGES, depth_edge=1.5) == "high deep"
+          and infer.seat_state(25, 1.49, EDGES, depth_edge=1.5) == "high")
+    check("typical is never deep", infer.seat_state(5, 3.0, EDGES, depth_edge=1.5) == "typical")
+    check("without a depth a seat is not deep", infer.seat_state(25, None, EDGES) == "high")
+    c = infer.classify(s, EDGES, depth_edge=1.5)
     check("classify keeps the bin and the state apart",
           (c["bin"], c["state"], c["depth"]) == ("high", "high deep", 4.0))
     check("the evidence states are typical and every other bin, as is and deep",
