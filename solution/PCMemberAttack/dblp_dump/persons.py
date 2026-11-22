@@ -5,8 +5,8 @@ import logging
 import re
 from pathlib import Path
 
-from lncs_articles import value_of
-from lncs_volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
+from articles import value_of
+from volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
 
 TABLE = 'person_name'
 BATCH = 100000

@@ -5,10 +5,7 @@ import logging
 import re
 from pathlib import Path
 
-from lncs_volumes import DEFAULT_DUMP, SCHEMA, create_indexes, db, saver
-
-ARTICLE_TABLE = 'lncs_article'
-AUTHOR_TABLE = 'lncs_article_author'
+from volumes import DEFAULT_DUMP, SCHEMA, SOURCES, create_indexes, db, saver, volume_table
 
 RECORD_PREFIX = b'<https://dblp.org/rec/conf/'
 SIGNATURE_PREFIX = b'_:Sig_'
@@ -37,8 +34,8 @@ def value_of(obj: str) -> str:
     return obj.strip('<>')
 
 
-def get_volume_keys() -> set:
-    query = f'SELECT DISTINCT dblp_key FROM "{SCHEMA}"."lncs_volume"'
+def get_volume_keys(source: str) -> set:
+    query = f'SELECT DISTINCT dblp_key FROM "{SCHEMA}"."{volume_table(source)}"'
     return {r['dblp_key'] for r in db.execute_query_result(query)}
 
 
@@ -129,19 +126,21 @@ def to_rows(articles: list, source: str) -> tuple:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load the papers of the LNCS volumes in dblp_dump.lncs_volume from the dblp RDF dump")
+    parser = argparse.ArgumentParser(description="Load the papers of the volumes in dblp_dump.<source>_volume from the dblp RDF dump")
+    parser.add_argument('--source', choices=SOURCES, default='lncs')
     parser.add_argument('--dump', type=Path, default=DEFAULT_DUMP, help="dblp.nt or dblp.nt.gz")
     args = parser.parse_args()
 
-    articles = read_dump(args.dump, get_volume_keys())
+    articles = read_dump(args.dump, get_volume_keys(args.source))
     article_rows, author_rows = to_rows(articles, args.dump.name)
     logging.info(f"{len(article_rows)} papers, {len(author_rows)} authorships")
 
-    for table, rows in ((ARTICLE_TABLE, article_rows), (AUTHOR_TABLE, author_rows)):
+    article_table, author_table = f'{args.source}_article', f'{args.source}_article_author'
+    for table, rows in ((article_table, article_rows), (author_table, author_rows)):
         db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
         saver.save(SCHEMA, table, rows)
-    create_indexes(ARTICLE_TABLE, ('dblp_key', 'volume_dblp_key', 'doi'))
-    create_indexes(AUTHOR_TABLE, ('article_dblp_key', 'dblp_pid'))
+    create_indexes(article_table, ('dblp_key', 'volume_dblp_key', 'doi'))
+    create_indexes(author_table, ('article_dblp_key', 'dblp_pid'))
     logging.info("Done")
 
 

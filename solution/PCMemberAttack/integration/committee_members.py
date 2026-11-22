@@ -1,5 +1,7 @@
+import argparse
 import configparser
 import datetime
+import json
 import logging
 import re
 import unicodedata
@@ -10,11 +12,12 @@ from database import Postgress, Saver
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-SCHEMA = 'lncs_front_matter'
 TABLE = 'committee_member'
 BATCH = 100000
+SOURCES = ('lncs', 'acm')
 
-SOLUTION_DIR = Path(__file__).resolve().parents[3]
+SOLUTION_DIR = Path(__file__).resolve().parents[2]
+ACM_DATA_DIR = SOLUTION_DIR / 'PCMemberAttack' / 'ACM' / 'data'
 
 PROGRAM = r'(program+e?|technical\s+program+e?|scientific|pc)'
 COMMITTEE = r'(commit+e+s?|board|members?)'
@@ -22,7 +25,7 @@ COMMITTEE = r'(commit+e+s?|board|members?)'
 ROLE_CATEGORIES = [
     ('other', re.compile(r'preface|welcome|message|foreword', re.I)),
     ('pc_chair', re.compile(rf'\b{PROGRAM}\b.*\bchair|\bpc\s*(co-?)?chair|\bprogram+e?\s+(co-?)?chairs?\b', re.I)),
-    ('senior_pc', re.compile(r'\barea\s+chair|\btrack\s+chair|\bsenior\s+(program+e?\s+committee|pc)\b|\bmeta-?reviewer', re.I)),
+    ('senior_pc', re.compile(r'\barea\s+chair|\bassociated?\s+chairs?\b|\btrack\s+chair|\bsenior\s+(program+e?\s+committee|pc)\b|\bmeta-?reviewer', re.I)),
     ('pc', re.compile(rf'\b{PROGRAM}\s*{COMMITTEE}|\bpc\b|^track\b|^programme?\s*$', re.I)),
     ('reviewer', re.compile(r'review(er|ing)|referee|sub-?reviewer', re.I)),
 ]
@@ -88,18 +91,22 @@ def most_common(counter: Counter):
     return max(values)[1] if values else None
 
 
-def read_volumes() -> dict:
-    """filename -> volumes (a volume shared by two conferences has a row for each)."""
+def read_volumes(source: str) -> dict:
+    """front matter file -> volumes (a volume shared by two conferences has a row for each)."""
     volumes = defaultdict(list)
-    for r in db.execute_query_result("""
+    for r in db.execute_query_result(f"""
         SELECT DISTINCT dblp_key, stream, core_rank, core_acronym, year
-        FROM dblp_dump.lncs_volume
+               {', front_matter' if source == 'acm' else ''}
+        FROM dblp_dump.{source}_volume
     """):
-        volumes[r['dblp_key'].replace('/', '_') + '.pdf'].append(r)
+        filename = r.pop('front_matter') if source == 'acm' else r['dblp_key'].replace('/', '_') + '.pdf'
+        volumes[filename].append(r)
     return volumes
 
 
-def read_members() -> list:
+def read_members(source: str, acm_data: Path) -> list:
+    if source == 'acm':
+        return read_acm_members(acm_data)
     return db.execute_query_result("""
         SELECT f.filename, m.role, m.name, m.affiliation
         FROM lncs_front_matter.member m
@@ -107,6 +114,17 @@ def read_members() -> list:
         JOIN lncs_front_matter.file f ON f.id = s.file_id
         WHERE f.run_id = (SELECT MAX(run_id) FROM lncs_front_matter.file)
     """)
+
+
+def read_acm_members(data_dir: Path) -> list:
+    """The persons in the parsed ACM front matter, as delivered."""
+    members = []
+    for path in sorted(data_dir.glob('*.json')):
+        persons = json.loads(path.read_text(encoding='utf-8')).get('persons_of_interest')
+        for person in persons or []:
+            members.append({'filename': path.name, 'role': person.get('role'),
+                            'name': person.get('name'), 'affiliation': person.get('association')})
+    return members
 
 
 def without_country(key: str):
@@ -153,18 +171,20 @@ class NamePool:
         return {found} if isinstance(found, str) else found
 
 
-def read_dblp_names() -> tuple:
+def read_dblp_names(source: str) -> tuple:
     """
-    Persons by name per conference stream (the authors of its LNCS papers, as printed on the
-    paper) and over all of dblp (every primary and alias name). Also the primary name per person.
+    Persons by name per conference stream (the authors of its papers, as printed on the paper;
+    for ACM those of both sources, for LNCS those of LNCS) and over all of dblp (every primary
+    and alias name). Also the primary name per person.
     """
     stream_pool, dblp_pool, primary_name = NamePool(), NamePool(), {}
-    for r in db.execute_query_result("""
+    sources = ('lncs', 'acm') if source == 'acm' else ('lncs',)
+    for r in db.execute_query_result(" UNION ".join(f"""
         SELECT DISTINCT v.stream, a.dblp_pid, a.dblp_name
-        FROM dblp_dump.lncs_article_author a
-        JOIN dblp_dump.lncs_article p ON p.dblp_key = a.article_dblp_key
-        JOIN dblp_dump.lncs_volume v ON v.dblp_key = p.volume_dblp_key
-    """):
+        FROM dblp_dump.{s}_article_author a
+        JOIN dblp_dump.{s}_article p ON p.dblp_key = a.article_dblp_key
+        JOIN dblp_dump.{s}_volume v ON v.dblp_key = p.volume_dblp_key
+    """ for s in sources)):
         stream_pool.add(r['stream'], r['dblp_name'], r['dblp_pid'])
     with db.get_connection() as conn:
         cursor = conn.cursor()
@@ -201,8 +221,14 @@ def match(stream: str, key: str, stream_pool: NamePool, dblp_pool: NamePool) -> 
 
 
 def main():
-    volumes = read_volumes()
-    members = read_members()
+    parser = argparse.ArgumentParser(description="Build <source>_front_matter.committee_member from the parsed front matter and dblp")
+    parser.add_argument('--source', choices=SOURCES, default='lncs')
+    parser.add_argument('--acm-data', type=Path, default=ACM_DATA_DIR, help="the ACM front matter JSON files")
+    args = parser.parse_args()
+    schema = f'{args.source}_front_matter'
+
+    volumes = read_volumes(args.source)
+    members = read_members(args.source, args.acm_data)
     logging.info(f"{len(members)} parsed members")
 
     editions = {}
@@ -224,8 +250,9 @@ def main():
     logging.info(f"{len(editions)} members after deduplication per edition")
     del members
 
-    stream_pool, dblp_pool, primary_name = read_dblp_names()
+    stream_pool, dblp_pool, primary_name = read_dblp_names(args.source)
     timestamp = str(datetime.datetime.now())
+    source_table = 'lncs_front_matter.member' if args.source == 'lncs' else 'ACM front matter JSON'
     rows = []
     for (stream, edition_key, category, key), entry in editions.items():
         pid, status, rule = match(stream, key, stream_pool, dblp_pool)
@@ -247,15 +274,15 @@ def main():
             'match_rule': rule,
             'cnt_volumes': str(len(entry['files'])),
             '$_extract_dts': timestamp,
-            '$_rec_src': 'lncs_front_matter.member, dblp_dump',
+            '$_rec_src': f'{source_table}, dblp_dump',
         })
     logging.info(f"Match status: {Counter((r['match_status'], r['match_rule']) for r in rows)}")
 
-    db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{TABLE}"')
+    db.execute_query(f'DROP TABLE IF EXISTS "{schema}"."{TABLE}"')
     for start in range(0, len(rows), BATCH):
-        saver.save(SCHEMA, TABLE, rows[start:start + BATCH])
+        saver.save(schema, TABLE, rows[start:start + BATCH])
     for column in ('edition_key', 'stream', 'dblp_pid', 'name_key'):
-        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{TABLE}" ("{column}")')
+        db.execute_query(f'CREATE INDEX ON "{schema}"."{TABLE}" ("{column}")')
     logging.info("Done")
 
 

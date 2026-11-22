@@ -12,10 +12,12 @@ from database import Postgress, Saver
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 SCHEMA = 'opencitations_dump'
-TABLE = 'reference'
 BATCH = 100000
+# The papers whose citations are loaded, and the table they go to.
+SOURCES = {'lncs': ('dblp_dump.lncs_article', 'reference'),
+           'acm': ('dblp_dump.acm_article', 'acm_reference')}
 
-SOLUTION_DIR = Path(__file__).resolve().parents[3]
+SOLUTION_DIR = Path(__file__).resolve().parents[2]
 
 
 def read_config(path) -> configparser.SectionProxy:
@@ -37,8 +39,8 @@ db = Postgress(
 saver = Saver(db)
 
 
-def get_citing_dois() -> set:
-    query = "SELECT DISTINCT LOWER(doi) AS doi FROM dblp_dump.lncs_article WHERE doi IS NOT NULL"
+def get_citing_dois(article_table: str) -> set:
+    query = f"SELECT DISTINCT LOWER(doi) AS doi FROM {article_table} WHERE doi IS NOT NULL"
     return {r['doi'] for r in db.execute_query_result(query)}
 
 
@@ -102,15 +104,17 @@ def scan_index(index_dir: Path, citing_omids: set, processes: int) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load the OpenCitations citations made by the LNCS papers in dblp_dump.lncs_article")
+    parser = argparse.ArgumentParser(description="Load the OpenCitations citations made by the LNCS or ACM papers in dblp_dump")
+    parser.add_argument('--source', choices=SOURCES, default='lncs')
     parser.add_argument('--data-dir', type=Path, default=Path(config['RAW_DATA']) / 'opencitations')
     parser.add_argument('--processes', type=int, default=8)
     args = parser.parse_args()
     source = f"OpenCitations Index CSV ({args.data_dir / 'index'}), OMID index ({args.data_dir / 'omid'})"
 
-    citing_dois = get_citing_dois()
+    article_table, table = SOURCES[args.source]
+    citing_dois = get_citing_dois(article_table)
     doi_omids = read_omid_index(args.data_dir / 'omid', dois=citing_dois)
-    logging.info(f"{len(doi_omids)} of {len(citing_dois)} LNCS DOIs have an OMID")
+    logging.info(f"{len(doi_omids)} of {len(citing_dois)} citing DOIs have an OMID")
     omid_doi = {omid: doi for doi, omids in doi_omids.items() for omid in omids}
 
     citations = scan_index(args.data_dir / 'index', set(omid_doi), args.processes)
@@ -134,12 +138,12 @@ def main():
         '$_rec_src': source,
     } for oci, citing, cited, creation, timespan, journal_sc, author_sc in citations]
 
-    db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{TABLE}"')
+    db.execute_query(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
     for start in range(0, len(rows), BATCH):
-        saver.save(SCHEMA, TABLE, rows[start:start + BATCH])
+        saver.save(SCHEMA, table, rows[start:start + BATCH])
         logging.info(f"Saved {min(start + BATCH, len(rows))} of {len(rows)} citations")
     for column in ('citing', 'cited'):
-        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{TABLE}" ("{column}")')
+        db.execute_query(f'CREATE INDEX ON "{SCHEMA}"."{table}" ("{column}")')
     logging.info("Done")
 
 

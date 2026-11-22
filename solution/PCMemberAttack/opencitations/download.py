@@ -7,7 +7,7 @@ import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-SOLUTION_DIR = Path(__file__).resolve().parents[3]
+SOLUTION_DIR = Path(__file__).resolve().parents[2]
 
 # figshare article id -> version of the OpenCitations dumps used
 DATASETS = {

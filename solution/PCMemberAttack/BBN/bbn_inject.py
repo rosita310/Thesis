@@ -1,0 +1,151 @@
+"""
+Plants coerced citations in the seats of members that no variant of the model shortlists,
+and counts how many of them each variant shortlists then. Writes bbn_cs3_injection.csv
+beside the corpus.
+
+In a coerced seat each of the k reviewed papers (review_load) cites `extra` more of the
+member's works, and a share `explained` of these does not count. Also prints, per surplus
+bin, how often the surplus of a real seat fits in its k most citing papers.
+
+    python bbn_inject.py [--in bbn/bbn_cs3_corpus.json]
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import random
+import statistics
+from collections import defaultdict
+
+from bbn_infer import corpus_path_argument, load_corpus, rank_corpus, surplus_bin
+from cs3_config import (INJECT_EXPLAINED, INJECT_EXTRA, INJECT_MEMBERS, INJECT_SEATS,
+                        INJECT_SEED,
+                        REVIEWS_PER_PAPER, SHORTLIST_THRESHOLD, STATES, SURPLUS_EDGES)
+
+VARIANTS = {"depth": {}, "no depth": {"depth_edge": math.inf, "manip_deep": 0.0}}
+
+COLUMNS = ["variant", "explained", "extra", "seats", "members", "shortlisted", "shortlisted_ungated",
+           "others_shortlisted", "median_injected"]
+
+
+def review_load(seat, reviews=REVIEWS_PER_PAPER) -> int:
+    """reviews * papers / pc_size, rounded up, at most papers."""
+    return min(seat["papers"], math.ceil(reviews * seat["papers"] / seat["pc_size"]))
+
+
+def coerce(seat, extra, reviews=REVIEWS_PER_PAPER, explained=0.0) -> dict:
+    k = review_load(seat, reviews)
+    new_citing = round(k * (1 - explained ** extra) * (1 - seat["citing"] / seat["papers"]))
+    return {**seat, "cites": seat["cites"] + round(k * extra * (1 - explained)),
+            "citing": seat["citing"] + new_citing, "cites_gate": seat["cites_gate"] + k * extra}
+
+
+def inject(data, order, extra, n_seats, reviews=REVIEWS_PER_PAPER, explained=0.0) -> dict:
+    """The corpus with the first `n_seats` seats in `order` (pid -> seat indexes) of every
+    member in it coerced."""
+    members = dict(data["members"])
+    for pid, indexes in order.items():
+        member = members[pid]
+        seats = list(member["seats"])
+        for i in indexes[:n_seats]:
+            seats[i] = coerce(seats[i], extra, reviews, explained)
+        members[pid] = {**member, "seats": seats, "cites_gate_max": max(
+            member["cites_gate_max"], *(s["cites_gate"] for s in seats))}
+    return {**data, "members": members}
+
+
+def fits_review_load(data, reviews=REVIEWS_PER_PAPER,
+                     edges=SURPLUS_EDGES) -> dict[str, tuple[int, float]]:
+    """surplus bin -> (seats, the share whose surplus the review_load papers that cite the
+    member most can hold)."""
+    fits = defaultdict(list)
+    for member in data["members"].values():
+        for seat in member["seats"]:
+            fits[surplus_bin(seat["cites"] - seat["expected"], edges)].append(
+                seat["fit_papers"] <= review_load(seat, reviews))
+    return {state: (len(fits[state]), sum(fits[state]) / len(fits[state]))
+            for state in STATES[1:] if fits[state]}
+
+
+def shortlisted(rows, gated=True, threshold=SHORTLIST_THRESHOLD) -> set[str]:
+    return {r["pid"] for r in rows
+            if r["p_genuine"] < threshold and (r["passes_gate"] or not gated)}
+
+
+def draw(rows_of, seats_of, n_members=INJECT_MEMBERS, seed=INJECT_SEED) -> dict:
+    """pid -> a random order of their seats, for `n_members` members scored by every variant
+    and shortlisted, gated or not, by none."""
+    rng = random.Random(seed)
+    flagged = set().union(*(shortlisted(rows, gated=False) for rows in rows_of.values()))
+    pool = sorted(set.intersection(*({r["pid"] for r in rows} for rows in rows_of.values()))
+                  - flagged)
+    return {pid: rng.sample(range(len(seats_of[pid])), len(seats_of[pid]))
+            for pid in rng.sample(pool, min(n_members, len(pool)))}
+
+
+def run(data, variants=VARIANTS, extras=INJECT_EXTRA, seat_counts=INJECT_SEATS,
+        n_members=INJECT_MEMBERS, seed=INJECT_SEED, reviews=REVIEWS_PER_PAPER,
+        explained_shares=INJECT_EXPLAINED):
+    """(the shortlist of every variant without injection, one result row per explained
+    share, extra, number of coerced seats and variant)."""
+    base = {name: rank_corpus(data, **kwargs) for name, kwargs in variants.items()}
+    order = draw(base, {pid: m["seats"] for pid, m in data["members"].items()}, n_members, seed)
+    loads = [review_load(data["members"][pid]["seats"][indexes[0]], reviews)
+             for pid, indexes in order.items()]
+    results = []
+    for explained in explained_shares:
+        for extra in extras:
+            for n_seats in seat_counts:
+                injected = inject(data, order, extra, n_seats, reviews, explained)
+                for name, kwargs in variants.items():
+                    rows = rank_corpus(injected, **kwargs)
+                    gated, ungated = shortlisted(rows), shortlisted(rows, gated=False)
+                    results.append({
+                        "variant": name, "explained": explained, "extra": extra,
+                        "seats": n_seats, "members": len(order),
+                        "shortlisted": len(gated & order.keys()),
+                        "shortlisted_ungated": len(ungated & order.keys()),
+                        "others_shortlisted": len(gated - order.keys()),
+                        "median_injected": (round(statistics.median(loads) * extra
+                                                  * (1 - explained), 1) if loads else 0),
+                    })
+    return {name: shortlisted(rows) for name, rows in base.items()}, results
+
+
+def print_results(base, results) -> None:
+    for name, shortlist in base.items():
+        print(f"{name}: {len(shortlist)} shortlisted without injection")
+    print(f"\n{'variant':<9} {'explained':>9} {'extra':>5} {'seats':>5} {'injected':>8} "
+          f"{'shortlisted':>16} {'ungated':>16} {'others':>6}")
+    for r in results:
+        n = r["members"]
+        print(f"{r['variant']:<9} {r['explained']:>9g} {r['extra']:>5} {r['seats']:>5} {r['median_injected']:>8g} "
+              f"{r['shortlisted']:>5} ({r['shortlisted'] / n:>6.1%}) "
+              f"{r['shortlisted_ungated']:>5} ({r['shortlisted_ungated'] / n:>6.1%}) "
+              f"{r['others_shortlisted']:>6}")
+
+
+def main():
+    in_path = corpus_path_argument("CS3 injection test of the PC member citation BBN.")
+    data = load_corpus(in_path)
+    base, results = run(data)
+    print(f"{INJECT_MEMBERS} members, seed {INJECT_SEED}, {REVIEWS_PER_PAPER} reviews per "
+          f"paper; injected: the median planted citations that count in a coerced seat")
+    print_results(base, results)
+    loads = [review_load(seat) for member in data["members"].values() for seat in member["seats"]]
+    print(f"\nreview load: median {statistics.median(loads):g}, "
+          f"{sum(k == 1 for k in loads) / len(loads):.1%} of the seats 1")
+    print("seats whose surplus fits in the review load (the papers that cite the member most):")
+    for state, (n, share) in fits_review_load(data).items():
+        print(f"  {state:<8} {n:>7} seats  {share:6.1%}")
+    out_path = in_path.resolve().parent / "bbn_cs3_injection.csv"
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nWrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()
