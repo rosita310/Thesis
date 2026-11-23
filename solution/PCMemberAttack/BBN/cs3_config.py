@@ -3,6 +3,7 @@ Settings of the PC member citation BBN pipeline, grouped by the script that uses
 them. The scripts take only paths on the command line.
 """
 
+import math
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -124,3 +125,44 @@ INJECT_SEATS = [1, 2, 3]     # coerced seats per member
 INJECT_EXPLAINED = [0.0, 0.54]
 INJECT_MEMBERS = 500         # drawn from the scored members that no variant shortlists
 INJECT_SEED = 1
+
+# ---------------------------------------------------------------------------
+# The sensitivity analysis (bbn_report.py)
+# ---------------------------------------------------------------------------
+# One setting changed at a time: per group, a label and the rank_corpus arguments that differ
+# from the run. Every other setting stays as above.
+SENSITIVITY_VARIANTS = {
+    "prior": [
+        ("pi 0.98", {"prior": 0.98}),
+        ("pi 0.99", {"prior": 0.99}),
+    ],
+    "alpha": [
+        ("alpha 0.30", {"alpha": 0.30}),
+        ("alpha 0.40", {"alpha": 0.40}),
+        ("alpha 0.60", {"alpha": 0.60}),
+        ("alpha 0.70", {"alpha": 0.70}),
+    ],
+    "m(t)": [
+        ("towards mild .40/.40/.20",
+         {"manip": {"typical": 0.0, "mild": 0.40, "high": 0.40, "extreme": 0.20}}),
+        ("towards extreme .10/.30/.60",
+         {"manip": {"typical": 0.0, "mild": 0.10, "high": 0.30, "extreme": 0.60}}),
+    ],
+    "deep share": [
+        ("deep share 0.50", {"manip_deep": 0.50}),
+        ("deep share 0.90", {"manip_deep": 0.90}),
+        ("no depth", {"depth_edge": math.inf, "manip_deep": 0.0}),
+    ],
+    "surplus edges": [
+        ("edges 4/8/16", {"edges": [4, 8, 16]}),
+        ("edges 6/12/24", {"edges": [6, 12, 24]}),
+    ],
+    "depth edge": [
+        ("depth edge 1.25", {"depth_edge": 1.25}),
+        ("depth edge 2", {"depth_edge": 2.0}),
+    ],
+    "n_min": [
+        ("n_min 3", {"min_seats": 3}),
+        ("n_min 10", {"min_seats": 10}),
+    ],
+}

@@ -29,6 +29,7 @@ the editions where the member had no role. The editions of both publishers are t
 | `bbn_extract.py --stage corpus`     | `bbn/bbn_cs3_corpus.json`                                   |
 | `bbn_infer.py`                      | `bbn/bbn_cs3_ranking.csv` (gated), `bbn_cs3_ranking_ungated.csv`, `bbn_cs3_scored.json` |
 | `bbn_inject.py`                     | `bbn/bbn_cs3_injection.csv`: how many planted coerced members are shortlisted |
+| `bbn_report.py`                     | prints the shortlist under every variant of `SENSITIVITY_VARIANTS`, one setting changed at a time |
 
 `citations` caches the Index counts in `bbn/index_counts.pkl`; pass `--rescan` after a new Index
 dump. `citations`, `authors` and `seats` need the database. With `CHECK_CITING_AUTHORS` off,
@@ -36,4 +37,5 @@ dump. `citations`, `authors` and `seats` need the database. With `CHECK_CITING_A
 
 ## Tests
 
-`test_bbn_extract.py`, `test_bbn_infer.py` and `test_bbn_inject.py` run without data.
+`test_bbn_extract.py`, `test_bbn_infer.py`, `test_bbn_inject.py` and `test_bbn_report.py` run
+without data.
