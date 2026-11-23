@@ -56,7 +56,7 @@ FALLBACK_MIN_N = 30.0        # N_min: post-exclusion load a fallback level needs
 RECENT_FROM = 2025
 
 CONDITION_ON_CAREER_STAGE = False   # also condition the genuine baseline on career stage
-INOUT_GATE = True            # rank only editors who pass Westerbaan's in/out gate (fig. 8.7)
+INOUT_GATE = True            # rank only editors who pass Westerbaan's in/out gate (fig. 8.7, x > y)
 MIN_SUSPECT_PAPERS = 5       # rank only editors with at least this many suspect papers
 SHORTLIST_THRESHOLD = 0.50   # P(genuine) below this is shortlisted
 

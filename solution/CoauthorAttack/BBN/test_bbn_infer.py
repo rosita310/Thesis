@@ -500,8 +500,12 @@ def test_records():
 
 def test_inout_gate():
     print("\n-- the in/out boundary (figure 8.7) --")
-    check("a year exactly on the diagonal passes",
-          infer.passes_inout_gate([{"year": 2010, "x": 3, "y": 3}]))
+    check("a year exactly on the diagonal does not pass (Westerbaan's x > y)",
+          not infer.passes_inout_gate([{"year": 2010, "x": 3, "y": 3}]))
+    check("one more co-author inside than outside passes",
+          infer.passes_inout_gate([{"year": 2010, "x": 4, "y": 3}]))
+    check("a year with one co-author inside and none outside passes",
+          infer.passes_inout_gate([{"year": 2010, "x": 1, "y": 0}]))
     check("one red year carries an editor whose other years are blameless",
           infer.passes_inout_gate([{"year": 2010, "x": 1, "y": 9},
                                    {"year": 2011, "x": 4, "y": 2}]))
