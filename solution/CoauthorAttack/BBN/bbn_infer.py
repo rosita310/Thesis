@@ -382,9 +382,9 @@ def state_shares(nodes):
 # ---------------------------------------------------------------------------
 
 def passes_inout_gate(points) -> bool:
-    """At least one year on a board with x >= y (co-authors in the journals the editor
-    edits that year vs. elsewhere), and x at least 1."""
-    return bool(points) and any(p["x"] >= max(p["y"], 1) for p in points)
+    """At least one year on a board with x > y: more co-authors in the journals the editor
+    edits that year than elsewhere."""
+    return bool(points) and any(p["x"] > p["y"] for p in points)
 
 
 def reddest_point(points):
@@ -573,7 +573,7 @@ def main():
           "judged against recent ones" if RECENT_FROM is not None
           else "No split into recent and earlier co-authorships")
     print(f"Ranked {len(rows)} editors ("
-          + ("gate: in >= out, " if INOUT_GATE else "")
+          + ("gate: in > out, " if INOUT_GATE else "")
           + f">= {MIN_SUSPECT_PAPERS} suspect papers)"
           + f"; {len(shortlist)} below threshold {SHORTLIST_THRESHOLD}.")
 

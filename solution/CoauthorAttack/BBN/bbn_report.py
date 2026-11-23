@@ -40,6 +40,12 @@ YEARS_PRINT_FROM = 2018     # first years before this one are printed together
 NO_ADJUSTMENT = math.inf    # a boundary no co-author reaches: the plain tie model
 
 
+def passes_with_ties(points) -> bool:
+    """The gate widened to the diagonal: a year with x >= y and x >= 1 also passes.
+    Only a sensitivity check; the run uses Westerbaan's x > y (`passes_inout_gate`)."""
+    return bool(points) and any(p["x"] >= max(p["y"], 1) for p in points)
+
+
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
@@ -83,13 +89,13 @@ def print_gate(rows):
     passing = [r for r in plotted if r["passes_inout_gate"]]
     print(f"  editors plotted {len(plotted)} of {len(rows)}; "
           f"points (editor x year on a board) {len(points)}")
-    print(f"  points in the red region x >= y  {len(red):>6}"
+    print(f"  points in the red region x > y   {len(red):>6}"
           f"  ({pct(len(red), len(points))})")
     print(f"  editors with >= 1 red point      {len(passing):>6}"
           f"  ({pct(len(passing), len(plotted))})")
-    strict = [r for r in plotted if any(p["x"] > p["y"] for p in r["inout_points"])]
-    print(f"  ...with Westerbaan's strict x > y: {sum(p['x'] > p['y'] for p in points)} "
-          f"points, {len(strict)} editors")
+    ties = [r for r in plotted if passes_with_ties(r["inout_points"])]
+    print(f"  ...with ties on the diagonal included, x >= y and x >= 1: "
+          f"{sum(passes_with_ties([p]) for p in points)} points, {len(ties)} editors")
     print(f"  passing editors: median "
           f"{statistics.median(r['n_suspect_papers'] for r in passing)} suspect papers, "
           f"{sum(r['n_suspect_papers'] >= MIN_SUSPECT_PAPERS for r in passing)} "
@@ -543,11 +549,11 @@ def print_entry_conditions(everyone, base_pos):
     """Who is ranked, not how they are scored: the gate and a minimum record.
     `everyone` is the ranking with neither."""
     gated = [r for r in everyone if r["passes_inout_gate"]]
-    strict = [r for r in everyone if any(p["x"] > p["y"] for p in r["inout_points"] or [])]
+    ties = [r for r in everyone if passes_with_ties(r["inout_points"])]
     print(f"\n=== ENTRY CONDITIONS: who is ranked, not how they are scored "
-          f"(the run: gate x >= y, >= {MIN_SUSPECT_PAPERS} suspect papers) ===")
-    report_stability("gate x >= y (the run)", at_least(gated, MIN_SUSPECT_PAPERS), base_pos)
-    report_stability("gate x > y (Westerbaan)", at_least(strict, MIN_SUSPECT_PAPERS),
+          f"(the run: gate x > y, >= {MIN_SUSPECT_PAPERS} suspect papers) ===")
+    report_stability("gate x > y (the run)", at_least(gated, MIN_SUSPECT_PAPERS), base_pos)
+    report_stability("gate x >= y (ties included)", at_least(ties, MIN_SUSPECT_PAPERS),
                      base_pos)
     report_stability("no gate", at_least(everyone, MIN_SUSPECT_PAPERS), base_pos)
     for n_min in MIN_RECORD_SWEEP:

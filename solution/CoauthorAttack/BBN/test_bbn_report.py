@@ -50,7 +50,7 @@ def corpus():
     """Three editors in one journal, on the production states. E1 is venue-
     locked, E2 repeats with one group, E3 has an outside tie in a venue E3 also
     edits (so it is `outside_1` by default and `single` under the strict reading).
-    E1 and E2 pass the in/out gate; E3's board seat lies below the diagonal."""
+    E1 passes the in/out gate; E2's board seat lies on the diagonal and E3's below it."""
     seats = {"E1": (3, 1), "E2": (2, 2), "E3": (1, 4)}
     nodes = {
         "E1||J||a": node("E1", "a", "single", 1.0),
@@ -126,10 +126,15 @@ def test_gate_report():
     out = captured(report.print_gate, report.rank_corpus(data, inout_gate=False))
     check("the gate is reported over every scored editor, not only the passing ones",
           "editors plotted 3 of 3" in out)
-    check("the seats on or above the diagonal are counted as red",
-          "points in the red region x >= y       2" in out)
+    check("only the seat above the diagonal is counted as red",
+          "points in the red region x > y        1" in out)
     check("an editor with one red seat passes",
-          "editors with >= 1 red point           2" in out)
+          "editors with >= 1 red point           1" in out)
+    check("the tie on the diagonal is reported as a widening of the gate",
+          "x >= y and x >= 1: 2 points, 2 editors" in out)
+    check("the widened gate still refuses a year with no co-author at all",
+          not report.passes_with_ties([{"year": 2010, "x": 0, "y": 0}])
+          and report.passes_with_ties([{"year": 2010, "x": 2, "y": 2}]))
 
 
 def test_publishers():
